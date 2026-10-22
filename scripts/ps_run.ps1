@@ -10,6 +10,7 @@ if (-not $env:SSBU_OS_CONSOLE_CORES) { $env:SSBU_OS_CONSOLE_CORES = '1' }
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "$repo\build\work\tomodachi_native.exe"
 $psi.Arguments = "`"$repo\build\dump\exefs\main.elf`" $Seconds"
+$psi.WorkingDirectory = "$repo\build\work"     # Set-Location does not move the process directory: the exe needs build\work for ../cache and ../dump
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true

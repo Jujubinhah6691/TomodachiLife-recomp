@@ -625,10 +625,31 @@ static void set_swizzle(GLenum tg, const uint8_t *swz) {
     glTexParameteriv(tg, GL_TEXTURE_SWIZZLE_RGBA_, v);
 }
 
+static volatile LONG64 g_handles_live, g_tex_live;       /* resident bindless handles and GL textures alive now (nvn_perf) */
+/* Render targets the game finalized, kept with their views, handles and framebuffers for the next texture of the same shape:
+ * Tomodachi Life makes its render targets anew every frame (a dozen a frame in the island), and deleting and recreating
+ * their GL objects each frame crashed the driver in glDeleteTextures after some 2400 frames. Only GPU-written textures
+ * (CPU_NO_ACCESS pools) are kept: nothing is ever uploaded into them, so stale texels are what the pool memory holds too. */
+#define SPARE_KEY (offsetof(TexBuilder, layout))        /* flags .. has_layout, swz: what tex_realize makes the storage from */
+static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[96];
+static int g_spare_n;
+static LONG64 g_spare_hits, g_spare_kept, g_spare_full;
+static int tex_take_spare(Tex *t) {
+    if (!t->gpu_written || g_rb == &rb_vk) return 0;
+    for (int i = g_spare_n - 1; i >= 0; i--) {
+        if (memcmp(&g_spare[i].b, &t->b, SPARE_KEY)) continue;
+        t->o = g_spare[i].o; t->views = g_spare[i].views; t->glevels = g_spare[i].glevels;
+        memmove(&g_spare[i], &g_spare[i + 1], sizeof g_spare[0] * (size_t)(g_spare_n - 1 - i)); g_spare_n--;
+        g_spare_hits++;
+        return 1;
+    }
+    return 0;
+}
 static void tex_realize(Tex *t) {
     static int nlog, nbad;
     Fmt f;
     TexBuilder *b = &t->b;
+    if (tex_take_spare(t)) return;
     if (!fmt_get(b->format, &f)) {
         g_st.unknown_fmt++;
         logf_limited(&nbad, 20, "nvn_gl: texture format 0x%x is not mapped; using RGBA8\n", b->format);
@@ -643,6 +664,7 @@ static void tex_realize(Tex *t) {
     t->glevels = levels;
     while (glGetError()) {}
     glGenTextures(1, &t->o.gl);
+    InterlockedIncrement64(&g_tex_live);
     glBindTexture(tg, t->o.gl);
     switch (tg) {
     case GL_TEXTURE_1D: glTexStorage1D(tg, levels, f.internal, w); break;
@@ -876,6 +898,10 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
     static int nlog;
     n->e = e; n->next = t->views; t->views = n;
     if (!fmt_get(e.format, &f)) fmt_get(t->b.format, &f);
+    {   /* a software-decoded format (ASTC: no desktop GPU support) is stored as its decoded format: the view must name that one */
+        const TexFormat *tf = tex_format(t->b.format);
+        if (tf && tf->sw_decode && tf->gl_sw_internal) { const TexFormat *vf = e.format ? tex_format(e.format) : NULL; f.internal = vf && vf->sw_decode && vf->gl_sw_internal ? vf->gl_sw_internal : tf->gl_sw_internal; }
+    }
     GLenum tg = gl_target(e.target, t->b.samples);
     while (glGetError()) {}
     glGenTextures(1, &n->o.gl);
@@ -885,10 +911,36 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
         logf_limited(&nlog, 30, "nvn_gl: view (target %d format 0x%x levels %d+%d layers %d+%d) of texture (target %d format 0x%x %dx%d) refused: GL error 0x%x\n",
                      e.target, e.format, e.lvl0, e.nlvl, e.lay0, e.nlay, t->b.target, t->b.format, t->b.width, t->b.height, err);
         glDeleteTextures(1, &n->o.gl);
+        /* A compressed format the driver cannot view (ASTC: no view class), the view keeping the texture's shape, so only the
+         * swizzle or the depth-stencil mode differs: a copy of the texture carries the view's parameters. Static assets:
+         * the copy is not refreshed if the texture is uploaded again. */
+        int same_shape = e.target == base.target && e.lvl0 == 0 && e.nlvl == base.nlvl && e.lay0 == 0 && e.nlay == base.nlay && (!e.format || e.format == base.format);
+        if (f.kind == 4 && same_shape && t->b.samples <= 1 && (tg == GL_TEXTURE_2D || tg == GL_TEXTURE_2D_ARRAY_ || tg == GL_TEXTURE_CUBE_MAP_) && gl_has(glCopyImageSubData, "glCopyImageSubData")) {
+            static int ncopy;
+            int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1, layers = tex_layers(&t->b);
+            while (glGetError()) {}
+            glGenTextures(1, &n->o.gl);
+            glBindTexture(tg, n->o.gl);
+            if (tg == GL_TEXTURE_2D_ARRAY_) glTexStorage3D(tg, e.nlvl, f.internal, w, hgt, layers); else glTexStorage2D(tg, e.nlvl, f.internal, w, hgt);
+            GLenum e1 = glGetError(), e2 = 0;
+            for (int l = 0; l < e.nlvl && !e2; l++) { glCopyImageSubData(t->o.gl, tg, l, 0, 0, 0, n->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(hgt, l), tg == GL_TEXTURE_2D ? 1 : layers); e2 = glGetError(); if (e2) logf_limited(&ncopy, 6, "nvn_gl:   level %d (%dx%d) copy: GL error 0x%x\n", l, lvl(w, l), lvl(hgt, l), e2); }
+            if (!e1 && !e2) {
+                logf_limited(&ncopy, 6, "nvn_gl:   the view is a copy of the texture with the view's swizzle (%d %d %d %d)\n", e.swz[0], e.swz[1], e.swz[2], e.swz[3]);
+                glTexParameteri(tg, GL_TEXTURE_MIN_FILTER, e.nlvl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
+                glTexParameteri(tg, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                set_swizzle(tg, e.swz);
+                InterlockedIncrement64(&g_tex_live);
+                g_st.views++;
+                return &n->o;
+            }
+            logf_limited(&ncopy, 6, "nvn_gl:   the copy failed: storage GL error 0x%x, copy 0x%x (internal 0x%x, %d levels)\n", e1, e2, f.internal, e.nlvl);
+            glDeleteTextures(1, &n->o.gl);
+        } else logf_limited(&nlog, 30, "nvn_gl:   no copy: kind %d same shape %d target 0x%x (view target %d base %d, levels %d/%d, layers %d/%d)\n", f.kind, same_shape, tg, e.target, base.target, e.nlvl, base.nlvl, e.nlay, base.nlay);
         n->o.gl = t->o.gl; n->o.alias = 1;
         return &n->o;
     }
     glBindTexture(tg, n->o.gl);
+    InterlockedIncrement64(&g_tex_live);
     if (tg != GL_TEXTURE_2D_MULTISAMPLE_ && tg != GL_TEXTURE_2D_MULTISAMPLE_ARRAY_) {
         glTexParameteri(tg, GL_TEXTURE_MIN_FILTER, e.nlvl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
         glTexParameteri(tg, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -899,17 +951,57 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
     return &n->o;
 }
 
-static void texobj_free(TexObj *o) {
-    for (int i = 0; i < o->nh; i++) glMakeTextureHandleNonResidentARB(o->h[i].h);
+static int g_texfree_skip = -1;                        /* TOMO_TEXFREE=<bits> (diagnosis): 1 keep base textures, 2 keep views, 4 keep handles resident */
+static void texobj_free(TexObj *o, int is_view) {
+    if (g_texfree_skip < 0) { const char *e = getenv("TOMO_TEXFREE"); g_texfree_skip = e ? atoi(e) : 0; }
+    HS_IN("texture free (handles non-resident)", o->gl);
+    if (!(g_texfree_skip & 4)) for (int i = 0; i < o->nh; i++) glMakeTextureHandleNonResidentARB(o->h[i].h);
+    HS_OUT();
+    InterlockedExchangeAdd64(&g_handles_live, -(LONG64)o->nh);
+    if (o->gl && !o->alias) InterlockedDecrement64(&g_tex_live);
     free(o->h);
     o->h = NULL; o->nh = 0;
-    if (o->gl && !o->alias) { fbo_purge(o->gl); glDeleteTextures(1, &o->gl); }
+    if (o->gl && !o->alias && !(g_texfree_skip & (is_view ? 2 : 1))) { HS_IN("texture free (framebuffers, glDeleteTextures)", o->gl); fbo_purge(o->gl); glDeleteTextures(1, &o->gl); HS_OUT(); }
     o->gl = 0;
 }
+static struct { GLuint gl; int target, format, w, h, d, levels, nh, views, gpu; uint32_t flags; char vinfo[160]; } g_freed[16];
+static unsigned g_freed_n;
+void nvn_front_crash_notes(FILE *out) {                   /* hostrt.c: the textures freed last (the driver crashed in glDeleteTextures once) */
+    fprintf(out, "  textures freed last (newest first):\n");
+    for (unsigned k = 0; k < 16 && k < g_freed_n; k++) {
+        unsigned i = (g_freed_n - 1 - k) % 16;
+        fprintf(out, "    gl %u target %d format 0x%x %dx%dx%d levels %d flags 0x%x handles %d views %d%s\n", g_freed[i].gl, g_freed[i].target, g_freed[i].format, g_freed[i].w, g_freed[i].h, g_freed[i].d,
+                g_freed[i].levels, g_freed[i].flags, g_freed[i].nh, g_freed[i].views, g_freed[i].gpu ? " gpu-written" : "");
+        if (g_freed[i].vinfo[0]) fprintf(out, "      views:%s\n", g_freed[i].vinfo);
+    }
+}
 static void tex_free_gl(Tex *t) {
-    for (VNode *n = t->views, *next; n; n = next) { next = n->next; texobj_free(&n->o); free(n); }
+    {   unsigned i = g_freed_n % 16; int nv = 0;
+        for (VNode *n = t->views; n; n = n->next) nv++;
+        g_freed[i].gl = t->o.gl; g_freed[i].target = t->b.target; g_freed[i].format = t->b.format; g_freed[i].w = t->b.width; g_freed[i].h = t->b.height; g_freed[i].d = t->b.depth;
+        g_freed[i].levels = t->glevels; g_freed[i].flags = (uint32_t)t->b.flags; g_freed[i].nh = t->o.nh; g_freed[i].views = nv; g_freed[i].gpu = t->gpu_written;
+        g_freed[i].vinfo[0] = 0;
+        for (VNode *n = t->views; n; n = n->next) {
+            size_t k = strlen(g_freed[i].vinfo);
+            if (k + 60 >= sizeof g_freed[i].vinfo) break;
+            snprintf(g_freed[i].vinfo + k, sizeof g_freed[i].vinfo - k, " [gl %u%s target %d fmt 0x%x lvl %d+%d lay %d+%d swz %d%d%d%d ds %d h %d]", n->o.gl, n->o.alias ? " alias" : "", n->e.target, n->e.format,
+                     n->e.lvl0, n->e.nlvl, n->e.lay0, n->e.nlay, n->e.swz[0], n->e.swz[1], n->e.swz[2], n->e.swz[3], n->e.dsmode, n->o.nh);
+        }
+        g_freed_n++;
+    }
+    if (t->gpu_written && t->o.gl && !t->o.alias && g_rb != &rb_vk) {
+        if (g_spare_n < (int)(sizeof g_spare / sizeof g_spare[0])) {
+            g_spare[g_spare_n].b = t->b; g_spare[g_spare_n].o = t->o; g_spare[g_spare_n].views = t->views; g_spare[g_spare_n].glevels = t->glevels;
+            g_spare_n++; g_spare_kept++;
+            memset(&t->o, 0, sizeof t->o); t->views = NULL;
+            tex_release_packaged(t);
+            return;
+        }
+        g_spare_full++;
+    }
+    for (VNode *n = t->views, *next; n; n = next) { next = n->next; texobj_free(&n->o, 1); free(n); }
     t->views = NULL;
-    texobj_free(&t->o);
+    texobj_free(&t->o, 0);
     tex_release_packaged(t);
 }
 
@@ -994,7 +1086,7 @@ static uint64_t handle_make(Tex *t, View v, SamplerParams p, int have_sampler, u
     glMakeTextureHandleResidentARB(h);
     o->h = realloc(o->h, sizeof *o->h * (size_t)(o->nh + 1));
     o->h[o->nh].smp = smp; o->h[o->nh++].h = h;
-    g_st.handles++;
+    g_st.handles++; InterlockedIncrement64(&g_handles_live);
     if (gputime_ms() && (t->b.target == 8 || t->b.target == 9 || (v.set & 0xa0) == 0xa0)) {     /* TOMO_GPUTIME: cube handles and target-changing views */
         static int nlog;
         logf_limited(&nlog, 60, "gputime: handle %llx (nvn %llx) = texture target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u, view set 0x%x target %d lvl %d+%d lay %d+%d format 0x%x -> gl %u%s, sampler %u\n",
@@ -1033,23 +1125,25 @@ static int resolve_names(TexPool *tp, SamplerPool *sp, uint64_t nh, GLuint *tex,
 /* ---------------------------------------------------------------- framebuffers */
 static void bl_bind(void);                            /* below: the bindless handle table of TEX.B */
 typedef struct { GLuint color[8], depth; int n, dkind; int layer[8], level[8], dlayer, dlevel; } FboKey;   /* layer -1: the whole texture (or a view) */
-static struct { FboKey k; GLuint fbo; int w, h, used; } g_fbos[256];
+#define NFBO 1024
+static struct { FboKey k; GLuint fbo; int w, h, used; } g_fbos[NFBO];
 static int g_fbo_next;
+static void fbo_drop_bound(GLuint fbo);
 static void fbo_purge(GLuint tex) {
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < NFBO; i++) {
         if (!g_fbos[i].used) continue;
         int hit = g_fbos[i].k.depth == tex;
         for (int j = 0; j < 8; j++) hit |= g_fbos[i].k.color[j] == tex;
-        if (hit) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].used = 0; }
+        if (hit) { fbo_drop_bound(g_fbos[i].fbo); glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].used = 0; }
     }
 }
 static int g_fbo_bad_last;                         /* set by fbo_get for an incomplete framebuffer: set_targets then names the textures */
 static GLuint fbo_get(const FboKey *k) {
     static int nlog;
-    for (int i = 0; i < 256; i++) if (g_fbos[i].used && !memcmp(&g_fbos[i].k, k, sizeof *k)) return g_fbos[i].fbo;
+    for (int i = 0; i < NFBO; i++) if (g_fbos[i].used && !memcmp(&g_fbos[i].k, k, sizeof *k)) return g_fbos[i].fbo;
     int slot = -1;
-    for (int i = 0; i < 256 && slot < 0; i++) if (!g_fbos[i].used) slot = i;
-    if (slot < 0) { slot = g_fbo_next++ & 255; glDeleteFramebuffers(1, &g_fbos[slot].fbo); }
+    for (int i = 0; i < NFBO && slot < 0; i++) if (!g_fbos[i].used) slot = i;
+    if (slot < 0) { slot = g_fbo_next++ & (NFBO - 1); fbo_drop_bound(g_fbos[slot].fbo); glDeleteFramebuffers(1, &g_fbos[slot].fbo); }
     GLuint fbo = 0;
     GLenum bufs[8];
     glGenFramebuffers(1, &fbo);
@@ -1969,7 +2063,7 @@ static void prec_load(void) {                      /* render thread, once (shd_i
     if (g_prec_off) return;
     snprintf(path, sizeof path, "%s/pairs.txt", g_shd_dir);
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) { printf("nvn_gl: no pair list at %s (first run here, or the exe was not started from build/work)%c", path, 10); InterlockedExchange(&g_pw_listed_done, 1); return; }
     while (fgets(line, sizeof line, f)) {
         unsigned long long vh, fh; unsigned vl, fl, mask;
         if (sscanf(line, "%llx %x %llx %x %x", &vh, &vl, &fh, &fl, &mask) == 5 && !prec_has(vh, vl, fh, fl, mask, 1)) {
@@ -2277,6 +2371,7 @@ static struct {
     uint8_t ms[24]; unsigned ms_ext;              /* the bound multisample state, and which of its extensions are on in OpenGL */
     int sc0[4], render_off, debug_depth, sample_shading;
 } S;
+static void fbo_drop_bound(GLuint fbo) { if (S.have_fbo && S.fbo == fbo) { S.have_fbo = 0; glBindFramebuffer(GL_FRAMEBUFFER_, 0); } }
 
 static GLenum nvn_func(unsigned f) { return GL_NEVER + (f >= 1 && f <= 8 ? f - 1 : 7); }
 static GLenum blend_func(unsigned f) {
@@ -3982,6 +4077,10 @@ static void pf_frame_mark(LONG64 frame) {
                 wsnap[i] = g_wj[i].ticks; wsnapn[i] = g_wj[i].n;
             }
             static LONG64 bsnap[16], bsnapn[16];
+            printf("\nnvn_perf: alive: %lld GL textures, %lld resident handles, %d dead objects pending; spare render targets %d (%lld reused, %lld kept, %lld not kept: full)", (long long)g_tex_live, (long long)g_handles_live, g_dead_n,
+                   g_spare_n, (long long)g_spare_hits, (long long)g_spare_kept, (long long)g_spare_full);
+            { int mx = 0; for (int i = 0; i < g_spare_n; i++) { int nh = g_spare[i].o.nh; for (VNode *n = g_spare[i].views; n; n = n->next) nh += n->o.nh; if (nh > mx) mx = nh; }
+              printf("; %d samplers, %lld framebuffers made, most handles on one spare %d", g_sampler_count, (long long)g_st.fbo_made, mx); }
             printf("\nnvn_perf: barriers by caller:");
             for (int i = 0; i < 16 && g_bar[i].who; i++) {
                 if (g_bar[i].n - bsnapn[i]) printf(" %s %.2f (%.1f)", g_bar[i].who, (double)(g_bar[i].ticks - bsnap[i]) * 1000.0 / (double)freq / 300.0, (double)(g_bar[i].n - bsnapn[i]) / 300.0);

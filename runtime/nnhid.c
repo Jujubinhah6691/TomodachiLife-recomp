@@ -429,6 +429,8 @@ static DWORD WINAPI synth_get_state(DWORD slot, XState *out) {
         g.rt = seq_key('S') ? 255 : 0;
         g.lx = (SHORT)((seq_key(VK_RIGHT) - seq_key(VK_LEFT)) * 32767);
         g.ly = (SHORT)((seq_key(VK_UP) - seq_key(VK_DOWN)) * 32767);
+        g.rx = (SHORT)((seq_key('H') - seq_key('F')) * 32767);      /* SSBU_SEQ / SSBU_SCRIPT: T F G H = the right stick (Tomodachi Life's camera) */
+        g.ry = (SHORT)((seq_key('T') - seq_key('G')) * 32767);
         if (memcmp(&g, &g_xs[0].st.pad, sizeof g)) { g_xs[0].st.pad = g; g_xs[0].st.packet++; }
         g_xs[0].connected = 1;
     }
@@ -603,7 +605,8 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
         for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (key_for(id, map[i].vk, map[i].bit)) buttons |= 1ull << map[i].bit;
         lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
         ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
-        if (sdl_on()) { rx = (key_for(id, 0, 22) - key_for(id, 0, 20)) * STICK_MAX; ry = (key_for(id, 0, 21) - key_for(id, 0, 23)) * STICK_MAX; }
+        rx = (key_for(id, 'H', 22) - key_for(id, 'F', 20)) * STICK_MAX;     /* T F G H: the right stick of the test scripts (Tomodachi Life's camera) */
+        ry = (key_for(id, 'T', 21) - key_for(id, 'G', 23)) * STICK_MAX;
     }
     int slot = g_source[id];
     if (sdl_on()) {

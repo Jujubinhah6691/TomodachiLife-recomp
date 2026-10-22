@@ -997,7 +997,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
                mod ? (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)mod) : 0ull);
         { const char *nvn_front_thread_kind(unsigned long); const char *tn = guest_thread_name_of(GetCurrentThreadId()), *hk = nvn_front_thread_kind(GetCurrentThreadId());
           printf("  on thread: %s (id %lu)\n", tn ? tn : hk ? hk : "main thread (or a host thread)", (unsigned long)GetCurrentThreadId()); }
-        { extern volatile const char *g_hitch_rt; const char *nvn_front_cur_op(void); printf("  render thread: in %s, last command %s\n", g_hitch_rt ? (const char *)g_hitch_rt : "-", nvn_front_cur_op()); }
+        { extern volatile const char *g_hitch_rt; extern volatile uint64_t g_hitch_rt_arg; const char *nvn_front_cur_op(void); void nvn_front_crash_notes(FILE *);
+          printf("  render thread: in %s (%llu), last command %s\n", g_hitch_rt ? (const char *)g_hitch_rt : "-", (unsigned long long)g_hitch_rt_arg, nvn_front_cur_op());
+          nvn_front_crash_notes(stdout); fflush(stdout); }
         fflush(stdout);                             /* a log file keeps this even if the rest of the report faults */
     }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
