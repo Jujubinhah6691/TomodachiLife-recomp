@@ -39,6 +39,9 @@ def main():
     os.makedirs(obj_dir, exist_ok=True)
     newest = max(os.path.getmtime(os.path.join(RUNTIME, h)) for h in HEADERS)
     sources = sorted(n for n in os.listdir(gen) if n.endswith('.c'))
+    for n in os.listdir(obj_dir):                  # objects of files a new lift no longer writes: they would be linked
+        if n.endswith('.obj') and n[:-4] + '.c' not in sources:
+            os.remove(os.path.join(obj_dir, n))
     todo = [n for n in sources if not os.path.exists(os.path.join(obj_dir, n[:-2] + '.obj'))
             or os.path.getmtime(os.path.join(obj_dir, n[:-2] + '.obj')) < max(newest, os.path.getmtime(os.path.join(gen, n)))]
     todo.sort(key=lambda n: -os.path.getsize(os.path.join(gen, n)))          # biggest first: they set the total time

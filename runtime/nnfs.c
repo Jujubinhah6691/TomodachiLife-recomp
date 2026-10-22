@@ -653,6 +653,8 @@ static void fs_MountRom(Ctx *c) {                        /* (name, cache buffer,
 static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, const Uid &) */
     char dir[MAX_PATH];
     save_dir(dir, "save");
+    /* Tomodachi Life never calls EnsureSaveData: the system makes the save data its control data asks for at launch */
+    if (!save_exists() && g_game_build == GAME_OTHER) CreateDirectoryA(dir, NULL);
     if (!save_exists()) { trace_printf("     fs mount save data \"%s\": no save data (EnsureSaveData was not called)\n", STR(0)); RET(RESULT_TARGET_NOT_FOUND); return; }
     journal_recover(dir);
     uint32_t r = mount_add(STR(0), MK_SAVE, dir);

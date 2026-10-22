@@ -977,6 +977,32 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
         printf("  (the placeholder address of the run-time host function %d, %s, +%llu, used as data)\n", (int)((er->ExceptionInformation[1] - HOSTFN_BASE) / 16),
                g_hostfn[(er->ExceptionInformation[1] - HOSTFN_BASE) / 16].name, (unsigned long long)((er->ExceptionInformation[1] - HOSTFN_BASE) % 16));
     dump_guest_registers();
+    {   /* the first host stack words with their module offsets: a fault inside a small helper (rd64, an -O0 build's
+         * accessors) is placed by its caller's return address, which is one of these */
+        const uint64_t *s = (const uint64_t *)(uintptr_t)ep->ContextRecord->Rsp;
+        printf("host stack:");
+        for (int i = 0; i < 6; i++) {
+            HMODULE m = NULL;
+            uint64_t v = s[i];
+            if (v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)v, &m) && m)
+                printf(" [%d] +0x%llx", i, (unsigned long long)(v - (uint64_t)(uintptr_t)m));
+        }
+        printf("\n");
+    }
+    {   /* SSBU_PEEK=<hex address>[,...]: the 64-bit words there (a function-pointer global, an object field) */
+        const char *pk = getenv("SSBU_PEEK");
+        for (const char *p = pk; p && *p;) {
+            uint64_t a = strtoull(p, (char **)&p, 16);
+            MEMORY_BASIC_INFORMATION mi;
+            if (a && VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi) && mi.State == MEM_COMMIT) {
+                uint64_t v = rd64(a);
+                printf("peek %llx = %llx%s%s\n", (unsigned long long)a, (unsigned long long)v,
+                       v >= HOSTFN_BASE && v < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16 ? " = run-time host function " : "",
+                       v >= HOSTFN_BASE && v < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16 ? g_hostfn[(v - HOSTFN_BASE) / 16].name : "");
+            }
+            while (*p == ',' || *p == ' ') p++;
+        }
+    }
     printf("guest call stack (innermost first):\n");
     CONTEXT ctx = *ep->ContextRecord;
     uint64_t last = 0;

@@ -460,7 +460,6 @@ static void os_AllocateMemoryBlockHeap(Ctx *c) {         /* (uintptr_t *out, siz
     RET(p ? 0 : 0x1003);
 }
 static void os_FreeMemoryBlockHeap(Ctx *c) { VirtualFree(P(0), 0, MEM_RELEASE); g_heap_used -= A1 < g_heap_used ? A1 : g_heap_used; }
-static void stdalloc_ctor_init(Ctx *c) { stdalloc_Initialize(c); }      /* StandardAllocator(void *, size_t) */
 
 /* ---- nn::mii::detail layout helpers.
  * BufferAllocator { void *current; size_t remaining; }: the game reads `current` directly
@@ -569,8 +568,6 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ret0},
     {"_ZN2nn7friends17NotificationQueue8FinalizeEv", ret0},
     {"_ZN2nn3mem17StandardAllocator10InitializeEPvm", stdalloc_Initialize},
-    {"_ZN2nn3mem17StandardAllocator10InitializeEPvmb", stdalloc_Initialize},
-    {"_ZN2nn3mem17StandardAllocatorC1EPvm", stdalloc_ctor_init},
     {"_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE", os_QueryMemoryInfo},
     {"_ZN2nn2os17SetMemoryHeapSizeEm", os_SetMemoryHeapSize},
     {"_ZN2nn2os19AllocateMemoryBlockEPmm", os_AllocateMemoryBlockHeap},

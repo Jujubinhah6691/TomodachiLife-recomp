@@ -305,7 +305,13 @@ static void ios_base_destroy(Ctx *c, uint64_t ios) {
     }
     c->x[0] = ios + 0x30; call_handler(c, "_ZNSt3__16localeD1Ev");
     static const int arrays[4] = {0x38, 0x40, 0x58, 0x70};
-    for (int i = 0; i < 4; i++) { c->x[0] = rd64(ios + (uint64_t)arrays[i]); if (c->x[0]) call_guest(c, GA(0x710392e590ULL)); }   /* free(NULL) does nothing */
+    for (int i = 0; i < 4; i++) {                       /* free(NULL) does nothing; SSBU: its own free [0x710392e590]; another game: the free its main defines, else the host free */
+        c->x[0] = rd64(ios + (uint64_t)arrays[i]);
+        if (!c->x[0]) continue;
+        if (g_game_build != GAME_OTHER) call_guest(c, GA(0x710392e590ULL));
+        else if (main_export("free")) call_guest(c, main_export("free"));
+        else call_handler(c, "free");
+    }
 }
 static void ios_dtor(Ctx *c) { uint64_t self = A0; ios_base_destroy(c, self); RET(self); }
 static void sbuf_dtor(Ctx *c) {

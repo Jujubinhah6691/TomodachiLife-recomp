@@ -501,7 +501,7 @@ int main(int argc, char **argv) {
                    g_main_ctx->in_import ? g_main_ctx->in_import : "guest code", (unsigned long long)g_main_ctx->import_from);
             for (int i = 19; i < 29; i++) printf("  x%d %016llx%s", i, (unsigned long long)g_main_ctx->x[i], i % 3 == 0 ? "\n" : "");
             printf("\n");
-            {   /* the global std::map at 0x710593c3c0 the main thread walks: header and first nodes */
+            if (g_game_build != GAME_OTHER) {   /* SSBU only: the global std::map at 0x710593c3c0 the main thread walks: header and first nodes */
                 uint64_t m = GA(0x710593c3c0ULL);
                 printf("map header: [+0]=%llx [+8]=%llx [+10]=%llx  size=%llx\n", (unsigned long long)rd64(m),
                        (unsigned long long)rd64(m + 8), (unsigned long long)rd64(m + 16), (unsigned long long)rd64(m + 24));

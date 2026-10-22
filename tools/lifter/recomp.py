@@ -300,6 +300,10 @@ class Fn:
             return 'c->tpidr = %s;' % X(bits(w, 4, 0))
         if (w & 0xffffffe0) == 0xd53b00e0:
             return SET(bits(w, 4, 0), 1, '0x10ULL')     # dczid_el0: DC ZVA prohibited
+        if (w & 0xffffffe0) == 0xd53b0020:
+            return SET(bits(w, 4, 0), 1, '0x8444c004ULL')   # ctr_el0: 64-byte cache lines (Cortex-A57), as the SDK's cache loops read it
+        if (w & 0xfff80000) == 0xd5080000:
+            return ';'                                   # sys: dc / ic cache maintenance (host caches are coherent)
         if (w & 0xffffffe0) in (0xd53b4400, 0xd53b4420):
             return SET(bits(w, 4, 0), 1, '0ULL')        # fpcr / fpsr read
         if (w & 0xffffffe0) in (0xd51b4400, 0xd51b4420):
@@ -973,11 +977,20 @@ class Env:
         words = [w for (w,) in struct.iter_unpack('<I', text)]
 
         def table_base(i, reg):
-            """The address made at i is the base of a jump table (`adr x9, base; ldrb w10, [..]; add x9, x9, x10, lsl #2;
-            br x9`, clang's compact switch): a br through the same register follows within six instructions. Such a base
-            is a label inside the function, not a function entry; taking it as one split the function there, and the
-            table's targets after it were left outside the lifted body (Tomodachi Life; SSBU's main has none)."""
-            return any(words[k] == 0xd61f0000 | (reg << 5) for k in range(i + 1, min(i + 7, len(words))))
+            """The address made at i is the base of a jump table (`adr x9, base; ldrh w10, [..]; add x9, x9, x10, lsl #2;
+            ... br x9`, clang's compact switch; the shape tools/nro/recomp_nro.py is_jump_table_adr knows): an add of a
+            register shifted by 2 to it, then a br through the sum. Such a base is a label inside the function, not a
+            function entry; taking it as one split the function there, and the table's targets after it were left outside
+            the lifted body (Tomodachi Life; SSBU's main has none). The br can follow the add by a dozen instructions;
+            a br through the register itself within twelve instructions counts too (other add forms)."""
+            if any(words[k] == 0xd61f0000 | (reg << 5) for k in range(i + 1, min(i + 13, len(words)))):
+                return True
+            for k in range(i + 1, min(i + 17, len(words))):
+                x = words[k]
+                if ((x & 0xffe0fc00) == 0x8b000800 or (x & 0xffe01c00) == 0x8b200800) and (x >> 5) & 31 == reg:
+                    br = 0xd61f0000 | ((x & 31) << 5)
+                    return any(words[j] == br for j in range(k + 1, min(k + 33, len(words))))
+            return False
         for i, w in enumerate(words):
             if (w & 0x9f000000) == 0x90000000:                       # adrp
                 imm = sext((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3), 21)

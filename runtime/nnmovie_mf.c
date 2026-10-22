@@ -2042,7 +2042,7 @@ static void aout_flush_hook(Ctx *c, void *user) {
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 static void aout_hooks(void) {
     static int done; if (done++) return;
-    if (getenv("SSBU_MOVIE_NO_FLUSH_GUARD")) return;
+    if (getenv("SSBU_MOVIE_NO_FLUSH_GUARD") || g_game_build == GAME_OTHER) return;      /* the guarded Flush is an SSBU function */
     g_mtx_lock = import_lookup("_ZNSt3__15mutex4lockEv"); g_mtx_unlock = import_lookup("_ZNSt3__15mutex6unlockEv");
     int id = hook_install(GA(0x71036f6070ULL), aout_flush_hook, NULL, &g_orig_aout_flush);
     if (!id || !g_mtx_lock || !g_mtx_unlock) printf("movie: WARNING the audio output Flush guard is not installed (hook %d, mutex %d)\n", id, g_mtx_lock && g_mtx_unlock);

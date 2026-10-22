@@ -836,7 +836,7 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
     if (v->set & 2) { e.lay0 = v->lay0; e.nlay = v->nlay; }
     if ((v->set & 4) && v->format) e.format = v->format;
     if (v->set & 8) memcpy(e.swz, v->swz, 4);
-    if (v->set & 16) e.dsmode = v->dsmode;
+    if (v->set & 16) e.dsmode = (v->set >> 6) & 1;
     if (v->set & 32) e.target = v->target;
     if (e.lvl0 < 0 || e.lvl0 >= base.nlvl) e.lvl0 = 0;
     if (e.nlvl <= 0 || e.lvl0 + e.nlvl > base.nlvl) e.nlvl = base.nlvl - e.lvl0;
@@ -2139,7 +2139,13 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
             memcpy(sx, c->x, sizeof sx); memcpy(sv, c->v, sizeof sv);
             cb->in_callback = 1;
             c->x[1] = 0; c->x[2] = (use + 0xff) & ~0xffull; c->x[3] = cb->callback_data;
+            uint64_t fp0 = c->x[29], sp0 = c->x[31];
             call_guest(c, cb->callback);
+            if (c->x[29] != fp0 || c->x[31] != sp0) {
+                static int said;
+                if (said++ < 5) printf("nvn_gl: the command memory callback %llx changed x29 %llx -> %llx, sp %llx -> %llx\n", (unsigned long long)cb->callback,
+                                       (unsigned long long)fp0, (unsigned long long)c->x[29], (unsigned long long)sp0, (unsigned long long)c->x[31]);
+            }
             cb->in_callback = 0;
             memcpy(c->x, sx, sizeof sx); memcpy(c->v, sv, sizeof sv);
             if (cb->len + need > cb->cap) { cb->cap = (cb->cap + need) * 2 + 4096; cb->data = realloc(cb->data, cb->cap); }
@@ -4112,7 +4118,7 @@ static void prog_set_shaders_(Ctx *c) {
         dump_stage_all(p->serial, i, control, data);
         /* V1 session 6: a program made by FUN_71000382a0 (13.0.4; the caller's return address lies in it) comes from a variation
          * of a "BNSH" container; that function keeps its third argument, the variation's program inside the file, in x20 */
-        if (g_rb == &rb_vk && i == 0 && c->x[30] - GA(0x71000382a0ull) < 2884) { LONG64 tb = pf_now(); nvn_vk_container_seen(control, c->x[20]); nvn_setsh_part[1] += pf_now() - tb; }
+        if (g_rb == &rb_vk && i == 0 && g_game_build != GAME_OTHER && c->x[30] - GA(0x71000382a0ull) < 2884) {   /* SSBU's program set-up function */ LONG64 tb = pf_now(); nvn_vk_container_seen(control, c->x[20]); nvn_setsh_part[1] += pf_now() - tb; }
         {   static int diag = -1; static LONG nd;      /* SSBU_SHADER_SRC_LOG=<n>: where the first n heap-held stages come from (guest return addresses, the memory around the control section) */
             if (diag < 0) diag = getenv("SSBU_SHADER_SRC_LOG") ? atoi(getenv("SSBU_SHADER_SRC_LOG")) : 0;
             if (diag && (control >> 28) != 0x710 && InterlockedIncrement(&nd) <= diag) {
@@ -4357,12 +4363,13 @@ static void tex_write_texels(Ctx *c) {                 /* (texture, view, region
 static void tex_flush_texels(Ctx *c) { Tex *t = hobj(A0, K_TEX); if (t) t->dirty = 1; }
 
 #define TV ((View *)P(A0))
+_Static_assert(sizeof(View) == 16, "View must fit the 16-byte NVNtextureView of NVN 55");
 static void view_defaults(Ctx *c) { memset(P(A0), 0, sizeof(View)); TV->set = 0x80; }
 static void view_levels(Ctx *c) { TV->lvl0 = (int16_t)A1; TV->nlvl = (int16_t)A2; TV->set |= 0x81; }
 static void view_layers(Ctx *c) { TV->lay0 = (int16_t)A1; TV->nlay = (int16_t)A2; TV->set |= 0x82; }
 static void view_format(Ctx *c) { TV->format = (uint16_t)A1; TV->set |= 0x84; }
 static void view_swizzle(Ctx *c) { TV->swz[0] = (uint8_t)A1; TV->swz[1] = (uint8_t)A2; TV->swz[2] = (uint8_t)A3; TV->swz[3] = (uint8_t)A4; TV->set |= 0x88; }
-static void view_dsmode(Ctx *c) { TV->dsmode = (uint8_t)A1; TV->set |= 0x90; }
+static void view_dsmode(Ctx *c) { TV->set = (uint8_t)((TV->set & ~0x40) | (A1 ? 0x40 : 0) | 0x90); }
 static void view_target(Ctx *c) { TV->target = (uint8_t)A1; TV->set |= 0xa0; }
 
 static void tpool_initialize(Ctx *c) {                 /* (pool, memoryPool, offset, numDescriptors) */
@@ -5295,7 +5302,7 @@ static void view_get_levels(Ctx *c) { if (A1) wr32(A1, (uint32_t)TV->lvl0); if (
 static void view_get_layers(Ctx *c) { if (A1) wr32(A1, (uint32_t)TV->lay0); if (A2) wr32(A2, (uint32_t)TV->nlay); RET((TV->set & 0x82) == 0x82); }
 static void view_get_format(Ctx *c) { if (A1) wr32(A1, TV->format); RET((TV->set & 0x84) == 0x84); }
 static void view_get_swizzle(Ctx *c) { for (int i = 0; i < 4; i++) if (c->x[1 + i]) wr32(c->x[1 + i], TV->swz[i]); RET((TV->set & 0x88) == 0x88); }
-static void view_get_dsmode(Ctx *c) { if (A1) wr32(A1, TV->dsmode); RET((TV->set & 0x90) == 0x90); }
+static void view_get_dsmode(Ctx *c) { if (A1) wr32(A1, (TV->set >> 6) & 1); RET((TV->set & 0x90) == 0x90); }
 static void view_get_target(Ctx *c) { if (A1) wr32(A1, TV->target); RET((TV->set & 0xa0) == 0xa0); }
 static void view_compare(Ctx *c) { RET(A0 && A1 && !memcmp(P(A0), P(A1), sizeof(View))); }
 static void tpool_finalize(Ctx *c) {

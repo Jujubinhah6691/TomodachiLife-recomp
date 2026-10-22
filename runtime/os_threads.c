@@ -647,6 +647,15 @@ static void mq_tryreceive(Ctx *c) { RET(mq_get(obj(A1), A0, 0)); }
 static void mq_timedreceive(Ctx *c) { RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
 
 /* ---------------------------------------------------------------- SDK 20 additions (Tomodachi Life) */
+/* The SDK's internal nn::os::SdkMutexType / SdkRecursiveMutexType / SdkConditionVariableType (tomo.c cuts them out of the
+ * lifted SDK code): the same host objects, keyed by the guest address, as nn::os::MutexType and ConditionVariableType. */
+void os_sdk_mutex_lock(uint64_t m) { EnterCriticalSection(&obj(m)->cs); }
+void os_sdk_mutex_unlock(uint64_t m) { LeaveCriticalSection(&obj(m)->cs); }
+int os_sdk_mutex_trylock(uint64_t m) { return TryEnterCriticalSection(&obj(m)->cs) ? 1 : 0; }
+int os_sdk_mutex_mine(uint64_t m) { return os_mutex_owner(m) == GetCurrentThreadId(); }
+int os_sdk_cv_wait(uint64_t cv, uint64_t m, int64_t ns) { return SleepConditionVariableCS(&obj(cv)->cv, &obj(m)->cs, ns < 0 ? INFINITE : ns_to_ms(ns)) ? 1 : 0; }
+void os_sdk_cv_signal(uint64_t cv, int all) { if (all) WakeAllConditionVariable(&obj(cv)->cv); else WakeConditionVariable(&obj(cv)->cv); }
+void os_sdk_obj_reset(uint64_t key) { obj_reset(key); }
 static void sem_release_n(Ctx *c) {                   /* ReleaseSemaphore(sem, count) */
     Obj *o = obj(A0);
     EnterCriticalSection(&o->cs);

@@ -246,7 +246,43 @@ static const ImportDef tomo_imports[] = {
     {"_ZN2nn5prepo30GetOverSaveFrequencyLimitEventEv", prepo_limit_event},
 };
 
+/* ---- SDK-internal locks, cut out of the lifted SDK code (sdklift_roots.txt): their console code ends in kernel calls */
+void os_sdk_mutex_lock(uint64_t m); void os_sdk_mutex_unlock(uint64_t m); int os_sdk_mutex_trylock(uint64_t m);
+int os_sdk_mutex_mine(uint64_t m); int os_sdk_cv_wait(uint64_t cv, uint64_t m, int64_t ns); void os_sdk_cv_signal(uint64_t cv, int all);
+void os_sdk_obj_reset(uint64_t key);                     /* os_threads.c */
+static void smx_init(Ctx *c) { os_sdk_obj_reset(A0); }
+static void smx_lock(Ctx *c) { os_sdk_mutex_lock(A0); }
+static void smx_unlock(Ctx *c) { os_sdk_mutex_unlock(A0); }
+static void smx_trylock(Ctx *c) { RET(os_sdk_mutex_trylock(A0)); }
+static void smx_mine(Ctx *c) { RET(os_sdk_mutex_mine(A0)); }
+static void scv_wait(Ctx *c) { os_sdk_cv_wait(A0, A1, -1); }
+static void scv_timedwait(Ctx *c) { RET(os_sdk_cv_wait(A0, A1, (int64_t)A2)); }    /* ConditionVariableStatus: 0 timeout, 1 signalled */
+static void scv_signal(Ctx *c) { os_sdk_cv_signal(A0, 0); }
+static void scv_broadcast(Ctx *c) { os_sdk_cv_signal(A0, 1); }
+static const ImportDef sdk_lock_overrides[] = {
+    {"_ZN2nn2os12SdkMutexType10InitializeEv", smx_init}, {"_ZN2nn2os12SdkMutexType4LockEv", smx_lock},
+    {"_ZN2nn2os12SdkMutexType6UnlockEv", smx_unlock}, {"_ZN2nn2os12SdkMutexType7TryLockEv", smx_trylock},
+    {"_ZNK2nn2os12SdkMutexType23IsLockedByCurrentThreadEv", smx_mine},
+    {"_ZN2nn2os21SdkRecursiveMutexType10InitializeEv", smx_init}, {"_ZN2nn2os21SdkRecursiveMutexType4LockEv", smx_lock},
+    {"_ZN2nn2os21SdkRecursiveMutexType6UnlockEv", smx_unlock}, {"_ZN2nn2os21SdkRecursiveMutexType7TryLockEv", smx_trylock},
+    {"_ZNK2nn2os21SdkRecursiveMutexType23IsLockedByCurrentThreadEv", smx_mine},
+    {"_ZN2nn2os24SdkConditionVariableType10InitializeEv", smx_init},
+    {"_ZN2nn2os24SdkConditionVariableType4WaitERNS0_12SdkMutexTypeE", scv_wait},
+    {"_ZN2nn2os24SdkConditionVariableType4WaitERNS0_21SdkRecursiveMutexTypeE", scv_wait},
+    {"_ZN2nn2os24SdkConditionVariableType9TimedWaitERNS0_12SdkMutexTypeENS_8TimeSpanE", scv_timedwait},
+    {"_ZN2nn2os24SdkConditionVariableType9TimedWaitERNS0_21SdkRecursiveMutexTypeENS_8TimeSpanE", scv_timedwait},
+    {"_ZN2nn2os24SdkConditionVariableType6SignalEv", scv_signal},
+    {"_ZN2nn2os24SdkConditionVariableType9BroadcastEv", scv_broadcast},
+    /* rumble: dropped for now (nnhid.c's SDL rumble could take these) */
+    {"_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", keep},
+    {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", keep},
+    {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", keep},
+};
+void sdk_host_override(const char *name, ImportFn fn);   /* sdklift_rt.c */
+
 void register_tomo_imports(void) {
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);
+    for (size_t i = 0; i < sizeof sdk_lock_overrides / sizeof sdk_lock_overrides[0]; i++)
+        sdk_host_override(sdk_lock_overrides[i].name, sdk_lock_overrides[i].fn);
 }

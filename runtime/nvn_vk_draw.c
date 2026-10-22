@@ -928,7 +928,7 @@ static void eview_of(Tex *t, VTex *vt, const View *v, EView *e) {
     if (v->set & 2) { e->lay0 = v->lay0; e->nlay = v->nlay; }
     if ((v->set & 4) && v->format) e->format = v->format;
     if (v->set & 8) memcpy(e->swz, v->swz, 4);
-    if (v->set & 16) e->dsmode = v->dsmode;
+    if (v->set & 16) e->dsmode = (v->set >> 6) & 1;   /* View: the mode is bit 6 of set (nvn_front.h) */
     if (v->set & 32) e->target = v->target;
     if (e->lvl0 < 0 || e->lvl0 >= base.nlvl) e->lvl0 = 0;
     if (e->nlvl <= 0 || e->lvl0 + e->nlvl > base.nlvl) e->nlvl = base.nlvl - e->lvl0;

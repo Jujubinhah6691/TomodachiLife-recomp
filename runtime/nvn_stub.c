@@ -123,8 +123,41 @@ static void obj_debug_id(Ctx *c) { RET(A0); }
 static void pool_builder_storage(Ctx *c) { log_call(c); NvnObj *b = nobj(A0); b->memory = A1; b->size = A2; }   /* (builder, memory, size) */
 static void pool_builder_flags(Ctx *c) { nobj(A0)->flags = A1; }                                               /* (builder, flags) */
 void nvn_front_pool_made(uint64_t memory, uint64_t size);      /* nvn_gl.c: V1 session 6, a pool laid over the code section of a shader container announces the container */
-static void pool_initialize(Ctx *c) { log_call(c); NvnObj *p = nobj(A0), *b = nobj(A1); p->memory = b->memory; p->size = b->size; p->flags = b->flags; nvn_front_pool_made((uint64_t)p->memory, (uint64_t)p->size); RET(1); }
-static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }
+static void pool_initialize(Ctx *c) {
+    log_call(c);
+    NvnObj *p = nobj(A0), *b = nobj(A1);
+    p->memory = b->memory; p->size = b->size; p->flags = b->flags;
+    /* Tomodachi Life: a virtual pool (flag 0x200) has no storage of its own; it gets zeroed host memory that pool_map_virtual fills */
+    if ((p->flags & 0x200) && !p->memory) {             /* bit 30 (not an NVN flag): this memory is ours to free */
+        p->memory = (uint64_t)(uintptr_t)VirtualAlloc(NULL, (SIZE_T)p->size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        p->flags |= 0x40000000u;
+    }
+    nvn_front_pool_made((uint64_t)p->memory, (uint64_t)p->size);
+    RET(1);
+}
+/* shortcut: nvnMemoryPoolMapVirtual COPIES each mapped range of the physical pool into the virtual pool's own memory at the
+ * time of the call (see the note below for what real aliasing needs); writes to the physical pool after the mapping are not
+ * seen through the virtual pool. Upgrade to section-backed aliasing (MapViewOfFile3 over placeholders) if a game writes later. */
+static void pool_map_virtual(Ctx *c) {                   /* (virtual pool, count, const NVNmappingRequest *) */
+    NvnObj *v = nobj(A0);
+    static int said;
+    for (int i = 0; i < (int)A1; i++) {
+        uint64_t r = A2 + (uint64_t)i * 0x28, phys = rd64(r), poff = rd64(r + 8), voff = rd64(r + 0x10), size = rd64(r + 0x18);
+        if (said++ < 20) printf("nvn: MapVirtual pool %llx: virtual +%llx size %llx <- pool %llx +%llx class %x\n", (unsigned long long)A0, (unsigned long long)voff,
+                                (unsigned long long)size, (unsigned long long)phys, (unsigned long long)poff, rd32(r + 0x20));
+        if (!v->memory || voff + size > v->size) continue;
+        if (phys && nobj(phys)->memory && voff == 0 && size == v->size) {     /* the whole virtual pool shows one physical range: a true alias */
+            if (v->flags & 0x40000000) VirtualFree((void *)(uintptr_t)v->memory, 0, MEM_RELEASE);
+            v->memory = nobj(phys)->memory + poff;
+            v->flags &= ~0x40000000u;
+            continue;
+        }
+        if (phys && nobj(phys)->memory) memcpy((void *)(uintptr_t)(v->memory + voff), (void *)(uintptr_t)(nobj(phys)->memory + poff), (size_t)size);
+        else memset((void *)(uintptr_t)(v->memory + voff), 0, (size_t)size);      /* a request without a pool unmaps */
+    }
+    RET(1);
+}
+static void pool_flags(Ctx *c) { RET(nobj(A0)->flags & ~0x40000000ull); }
 /* nvnMemoryPoolMapVirtual(pool, numRequests, const NVNmappingRequest *requests) [sdk 0x41ec70]: takes the NVN lock and calls the
  * pool's method +0x60. Which class a pool is, is decided at nvnMemoryPoolInitialize by flag bit 9 (0x200, "virtual")
  * [0x41eae0 .. 0x41eb00 -> 0x41eda0]:
@@ -181,7 +214,7 @@ static ImportFn pick(const char *name) {
     if (strcmp(name, "nvnDeviceGetInteger") == 0) return nvn_get_integer;
     static const struct { const char *name; ImportFn fn; } special[] = {
         {"nvnMemoryPoolBuilderSetStorage", pool_builder_storage}, {"nvnMemoryPoolInitialize", pool_initialize},
-        {"nvnMemoryPoolMap", pool_map}, {"nvnMemoryPoolGetSize", pool_size},
+        {"nvnMemoryPoolMap", pool_map}, {"nvnMemoryPoolGetSize", pool_size}, {"nvnMemoryPoolMapVirtual", pool_map_virtual},
         {"nvnBufferBuilderSetStorage", buffer_builder_storage}, {"nvnBufferInitialize", buffer_initialize},
         {"nvnBufferMap", buffer_map}, {"nvnBufferGetAddress", buffer_address}, {"nvnBufferGetSize", buffer_size},
         {"nvnMemoryPoolGetBufferAddress", pool_map},         /* GPU address of the pool: same as its memory for now */
