@@ -47,6 +47,7 @@ static struct {
     la_from_hdc_t from_hdc; la_set_t smoothing, interp, pixoff; la_xy_t translate, scale; la_rot_t rotate; la_draw_t draw; la_del_t del; la_reset_t reset;
     void *kong, *arm, *back;
     int on;                                /* window thread: painting (timer running) */
+    int textonly;                          /* no pictures beside the exe: the note alone, centred (the shader preparation screen) */
     RECT last;                             /* the client part painted last (bottom-right; the timer repaints it) */
     HFONT font; int font_h;
     LARGE_INTEGER t0;
@@ -112,7 +113,7 @@ static void la_start(HWND h, int visible) {
         wcscpy(p + n, L"loading_arm.png"); if (load(p, &LA.arm)) LA.arm = NULL;
         wcscpy(p + n, L"loading_kong_back.png"); if (load(p, &LA.back)) LA.back = NULL;
     }
-    if (!LA.kong || !LA.arm || !LA.back) { printf("display: loading animation off: loading_kong.png / loading_arm.png / loading_kong_back.png not beside the exe\n"); InterlockedExchange(&g_la_off, 1); return; }
+    if (!LA.kong || !LA.arm || !LA.back) { printf("display: loading animation: text only (loading_kong.png / loading_arm.png / loading_kong_back.png not beside the exe)\n"); LA.textonly = 1; }
     if (g_la_off) return;                  /* (a present already) */
     LA.on = 1;
     SetTimer(h, LA_TIMER, 33, NULL);       /* about 30 pictures a second */
@@ -120,10 +121,50 @@ static void la_start(HWND h, int visible) {
 }
 
 /* window thread: one picture into the bottom-right corner (WM_PAINT) */
+static void la_paint_text(HWND h, HDC dc, int cw, int ch) {    /* text only: black, the note centred, "Tomodachi Life (native)" above it */
+    int fh = ch / 22 < 16 ? 16 : ch / 22;
+    if (fh != LA.font_h) {
+        if (LA.font) DeleteObject(LA.font);
+        LA.font = CreateFontA(-fh, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+        LA.font_h = fh;
+    }
+    RECT all = {0, 0, cw, ch};
+    LA.last = all;
+    HDC m = CreateCompatibleDC(dc);
+    HBITMAP bm = CreateCompatibleBitmap(dc, cw, ch), old = (HBITMAP)SelectObject(m, bm);
+    FillRect(m, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    char note[sizeof g_la_note];
+    AcquireSRWLockShared(&g_la_note_lock); memcpy(note, g_la_note, sizeof note); ReleaseSRWLockShared(&g_la_note_lock);
+    HFONT of = (HFONT)SelectObject(m, LA.font);
+    SetBkMode(m, TRANSPARENT);
+    RECT tr = {0, ch / 2 - fh * 2, cw, ch / 2};
+    SetTextColor(m, RGB(120, 120, 120));
+    DrawTextA(m, "Tomodachi Life: Living the Dream (native)", -1, &tr, DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+    if (note[0]) {
+        RECT nr = {0, ch / 2 + fh / 2, cw, ch / 2 + fh * 3};
+        SetTextColor(m, RGB(220, 220, 220));
+        DrawTextA(m, note, -1, &nr, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        const char *of_ = strstr(note, " of ");                        /* "preparing shaders: 123 of 1109": a bar under it */
+        if (of_ && strchr(note, ':')) {
+            long long done = atoll(strchr(note, ':') + 1), total = atoll(of_ + 4);
+            if (total > 0) {
+                int bw = cw / 2, bx = cw / 4, by = ch / 2 + fh * 3 + fh / 2, bh = fh / 3 < 6 ? 6 : fh / 3;
+                RECT frame = {bx, by, bx + bw, by + bh}, fill = {bx, by, bx + (int)((long long)bw * (done > total ? total : done) / total), by + bh};
+                HBRUSH dim = CreateSolidBrush(RGB(60, 60, 60)), lit = CreateSolidBrush(RGB(230, 170, 40));
+                FillRect(m, &frame, dim); FillRect(m, &fill, lit);
+                DeleteObject(dim); DeleteObject(lit);
+            }
+        }
+    }
+    SelectObject(m, of);
+    BitBlt(dc, 0, 0, cw, ch, m, 0, 0, SRCCOPY);
+    SelectObject(m, old); DeleteObject(bm); DeleteDC(m);
+}
 static void la_paint(HWND h, HDC dc) {
     RECT cr; GetClientRect(h, &cr);
     int cw = cr.right, ch = cr.bottom;
     if (cw < 64 || ch < 64) return;
+    if (LA.textonly) { la_paint_text(h, dc, cw, ch); return; }
     float s = (float)ch * LA_SIZE / LA_KONG_H;               /* pixels per SVG unit */
     int margin = (int)((float)ch * LA_MARGIN), ih = (int)(LA_KONG_H * s) + 1, iw = (int)(LA_KONG_W * s) + 1;
     int fh = ch / 36 < 13 ? 13 : ch / 36;

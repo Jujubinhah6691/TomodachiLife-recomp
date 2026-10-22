@@ -485,6 +485,22 @@ int main(int argc, char **argv) {
     display_init();
     int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */
     /* the lifted code uses the host stack for every guest call: give it plenty */
+    {   /* The shader pairs of earlier runs (pairs.txt / progs.txt) are compiled before the game starts, with a note and a bar on
+         * the window: done while the game runs, the first frames are held for seconds and look like a hang. SSBU_PREPARE=0 skips it. */
+        long long nvn_front_warm_pending(long long *total); void display_title_note(const char *);
+        const char *e = getenv("SSBU_PREPARE");
+        if (!(e && e[0] == '0')) {
+            long long total = 0, left, last = -1;
+            ULONGLONG t0 = GetTickCount64();
+            display_title_note("preparing shaders");
+            while ((left = nvn_front_warm_pending(&total)) != 0 && GetTickCount64() - t0 < 900000) {
+                if (left > 0 && left != last) { char n[96]; snprintf(n, sizeof n, "preparing shaders: %lld of %lld", total - left, total); display_title_note(n); last = left; }
+                Sleep(left < 0 ? 20 : 100);
+            }
+            printf("shaders: %lld known programs made ready before the game started (%.1f s)\n", total, (double)(GetTickCount64() - t0) / 1000.0);
+            display_title_note("starting the game");
+        }
+    }
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("SSBU_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
     { void prof15_start(void); prof15_start(); }         /* prof15.c: SSBU_PROF15, every busy thread (test only; nothing without the variable) */

@@ -455,7 +455,7 @@ static void os_SetMemoryHeapSize(Ctx *c) {
     RET(0);
 }
 static void os_AllocateMemoryBlockHeap(Ctx *c) {         /* (uintptr_t *out, size) */
-    void *p = g_heap_used + A1 <= g_heap_size ? VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL;
+    void *p = g_heap_used + A1 <= g_heap_size ? VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) : NULL;   /* write watch: nvn_gl.c skips hashing unwritten textures */
     if (p) { wr64(A0, (uint64_t)(uintptr_t)p); g_heap_used += A1; }
     RET(p ? 0 : 0x1003);
 }

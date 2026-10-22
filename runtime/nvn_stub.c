@@ -174,6 +174,7 @@ static void pool_flags(Ctx *c) { RET(nobj(A0)->flags & ~0x40000000ull); }
  * So the name stays without a handler (MISSING: a call stops with the function's name), also for ordinary pools, where the
  * answer would be 0. */
 /* For nvn_gl.c: where a memory pool's storage is. */
+uint64_t nvn_pool_flags_of(uint64_t pool) { return nobj(pool)->flags & ~0x40000000ull; }      /* nvn_gl.c: NVN_MEMORY_POOL_FLAGS_* of a pool */
 int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
     NvnObj *p = nobj(pool);
     *mem = p->memory; *size = p->size;

@@ -32,7 +32,7 @@ typedef struct {
     int fail; char why[200], failop[40];
     uint32_t cbufs, in_attr, out_attr, tex_units, clip_out, ssbos;
     uint8_t regs[256], preds[8], in_comp[32], in_mode[32];
-    int uses_gmem, uses_gstore, uses_cc, uses_layer_out, uses_vp_out, uses_psize, uses_lmem, insns, blocks, any_jump, uses_alpha;
+    int uses_gmem, uses_gstore, uses_cc, uses_layer_out, uses_vp_out, uses_psize, uses_lmem, insns, blocks, any_jump, uses_alpha, uses_bl, uses_red, uses_shfl;
     uint8_t *reach, *leader;
     const uint8_t *base;                      /* instruction word 0 (a scheduling word) */
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
@@ -342,11 +342,25 @@ static const char *tv_decl(int is_int, int sint) { return is_int ? (sint ? "ivec
 
 /* TEX (bound): coords at Ra, then [lod/bias] [offset] [dref] from Rb */
 static int brx_targets(Mx *e, unsigned pc, uint64_t i, unsigned *out, int max);
-static void op_tex(Mx *e, uint64_t i) {
+/* TEX.B: the texture handle (nvnDeviceGetTextureHandle's value: texture id | sampler id << 20) is in the register Rb, the
+ * lod / offset / dref registers follow it; the GL bindless handle comes from the table mx_bl the back end keeps per (id, id). */
+static const char *SMPB(Mx *e, const char *h, const char *base, int shadow) {
+    e->uses_bl = 1;
+    return S(e, "sampler%s%s(mx_bl(%s))", base, shadow ? "Shadow" : "", h);
+}
+static void op_tex(Mx *e, uint64_t i, int bindless) {
     unsigned t = MXB(i, 28, 3), mask = MXB(i, 31, 4), dc = MXB(i, 50, 1), aoffi = MXB(i, 54, 1), blod = MXB(i, 55, 3), meta = MXB(i, 20, 8);
-    int unit = tex_unit(e, i), dim;
-    if (unit < 0) return;
-    if (MXB(i, 58, 1)) { fail(e, "TEX.LC", "TEX with LOD clamp"); return; }
+    int unit = -1, dim;
+    const char *hreg = NULL;
+    if (bindless) {
+        if (e->in->target == 1) { fail(e, "TEX.B", "bindless texture handle in a register (Vulkan)"); return; }
+        hreg = X(e, meta); meta++;
+        aoffi = MXB(i, 36, 1); blod = MXB(i, 37, 3);
+    } else {
+        unit = tex_unit(e, i);
+        if (unit < 0) return;
+    }
+    /* bit 58: TEX.LC, a lod clamp; ignored (yuzu does the same), the clamp register is not among the operands we read */
     if (blod == 4 || blod == 5 || !k_tex_base[t]) { fail(e, "TEX", "TEX type %u lod mode %u", t, blod); return; }
     const char *coords = tex_coords(e, t, MXB(i, 8, 8), &dim), *lod = NULL, *off = NULL, *dref = NULL;
     if (blod >= 2) lod = FR(e, meta++);
@@ -354,7 +368,7 @@ static void op_tex(Mx *e, uint64_t i) {
     if (dc) dref = FR(e, meta++);
     int explicit_lod = blod == 1 || blod == 3 || blod == 7, bias = blod == 2 || blod == 6, is_int = tex_is_int(e, unit, dc);
     if (e->in->stage != MX_FRAGMENT && !explicit_lod) { explicit_lod = 1; bias = 0; lod = NULL; }
-    const char *lodv = blod == 1 || !lod ? "0.0" : lod, *smp = SMP(e, unit, k_tex_base[t], dc), *call;
+    const char *lodv = blod == 1 || !lod ? "0.0" : lod, *smp = bindless ? SMPB(e, hreg, k_tex_base[t], dc) : SMP(e, unit, k_tex_base[t], dc), *call;
     if (dc) {
         const char *p = shadow_coords(e, t, coords, dim, dref);
         if (t == 7 && (explicit_lod || off || bias)) { fail(e, "TEX", "shadow cube array with lod/offset/bias"); return; }
@@ -1248,13 +1262,39 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         }
         break;
     }
+    case MXOP_FSWZADD: {                       /* FSWZADD Rd, Ra, Rb, swz: (a * ma[k]) + (b * mb[k]), k = the lane's 2 bits of swz (quad derivatives) */
+        unsigned swz = MXB(i, 28, 8);
+        e->uses_shfl = 1;
+        emit(e, "uint k = (%uu >> ((gl_SubGroupInvocationARB & 3u) << 1u)) & 3u; float ma = k == 0u ? -1.0 : k == 1u ? 1.0 : k == 2u ? -1.0 : 0.0; float mb = k == 2u ? 1.0 : -1.0;", swz);
+        emit(e, " %s = U(F(%s) * ma + F(%s) * mb);", DST, A8, R20);
+        break;
+    }
+    case MXOP_RED: {                           /* RED.E.<op>.<type> [Ra + off], Rd: an atomic on global memory, no result (yuzu's field layout) */
+        unsigned type = MXB(i, 20, 3), oper = MXB(i, 23, 3);
+        int off = (int)(MXB(i, 28, 20) << 12) >> 12;
+        if (MXB(i, 8, 8) == 255) { fail(e, "RED (absolute)", "global atomic at an absolute address"); break; }
+        if (type > 1 || oper > 2) { fail(e, "RED", "RED operation %u type %u", oper, type); break; }
+        e->uses_gmem = 1; e->uses_gstore = 1; e->uses_red = 1;
+        emit(e, "uint ad = %s + 0x%08xu; mx_red(ad, %s, %uu, %uu);", A8, (uint32_t)off, X(e, MXB(i, 0, 8)), oper, type);
+        break;
+    }
+    case MXOP_SHFL: {                          /* SHFL.<mode> Rd, Pp, Ra, b, c: a lane exchange across the warp (NV_shader_thread_shuffle), width 32 */
+        unsigned mode = MXB(i, 30, 2), pp = MXB(i, 48, 3);
+        const char *b = MXB(i, 28, 1) ? S(e, "%uu", (unsigned)MXB(i, 20, 5)) : R20;
+        static const char *const fn[4] = {"shuffleNV", "shuffleUpNV", "shuffleDownNV", "shuffleXorNV"};
+        e->uses_shfl = 1;
+        emit(e, "%s = %s(%s, %s, 32u);", DST, fn[mode], A8, b);
+        if (pp != 7) emit(e, " %s = true;", PD(e, pp));
+        break;
+    }
     case MXOP_KIL:
         if (e->in->stage != MX_FRAGMENT) { fail(e, "KIL", "KIL outside a fragment shader"); break; }
         emit(e, "if (%s) discard;", FLOW(e, MXB(i, 0, 5)));
         break;
 
     /* ---- textures */
-    case MXOP_TEX: op_tex(e, i); break;
+    case MXOP_TEX: op_tex(e, i, 0); break;
+    case MXOP_TEX_b: op_tex(e, i, 1); break;
     case MXOP_TEXS: op_texs(e, i); break;
     case MXOP_TLD: op_tld(e, i); break;
     case MXOP_TLDS: op_tlds(e, i); break;
@@ -1592,6 +1632,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         else
         emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
+        if (e->uses_shfl) emit(&h, "#extension GL_NV_shader_thread_shuffle : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
@@ -1656,6 +1697,15 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (e->uses_lmem) emit(&h, "uint lmem[%u];\n", e->lmem_words);
         for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1) emit(&h, "layout(std430, %sbinding = %u) %sbuffer SB%u { uint s%u[]; };\n", set0, in->ssbo_base + k, e->uses_gstore ? "" : "readonly ", k, k);
         if (e->uses_gstore && in->track_writes) emit(&h, "layout(std430, %sbinding = %u) buffer WM { uint mx_wm; };\n", set0, in->wmask_binding);
+        if (e->uses_bl) emit(&h, "layout(std430, binding = 39) readonly buffer MXBL { uvec4 mx_blt[]; };\n"
+                                 "uvec2 mx_bl(uint h) { uint k = (h * 2654435761u) >> 16u; for (int i = 0; i < 32; i++) { uvec4 e = mx_blt[k]; if (e.x == h) return e.yz; if (e.w == 0u) break; k = (k + 1u) & 65535u; } return mx_blt[65536].yz; }\n");
+        if (e->uses_red) {
+            emit(&h, "void mx_red(uint ad, uint v, uint op, uint ty) { uint o = (ad & 0x07ffffffu) >> 2; switch (ad >> 27) {\n");
+            for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1)
+                emit(&h, " case %uu: if (op == 0u) atomicAdd(s%u[o], v); else if (ty == 1u) { if (op == 1u) atomicMin(s%u[o], int(v)); else atomicMax(s%u[o], int(v)); } else { if (op == 1u) atomicMin(s%u[o], v); else atomicMax(s%u[o], v); }%s break;\n",
+                     k + 1, k, k, k, k, k, in->track_writes ? S(e, " atomicOr(mx_wm, %uu);", 1u << k) : "");
+            emit(&h, " } }\n");
+        }
         if (e->uses_gmem) {
             emit(&h, "uint mx_ldg(uint ad) { uint o = (ad & 0x07ffffffu) >> 2; switch (ad >> 27) {\n");
             for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1) emit(&h, " case %uu: return s%u[o];\n", k + 1, k);
@@ -1694,7 +1744,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         free(h.s);
     }
     out->glsl = res;
-    out->cbufs = e->cbufs; out->in_attr = e->in_attr; out->out_attr = e->out_attr; out->tex_units = e->tex_units;
+    out->cbufs = e->cbufs | (e->uses_bl ? 0x80000000u : 0u); out->in_attr = e->in_attr; out->out_attr = e->out_attr; out->tex_units = e->tex_units;
     out->int_dep = in->stage == MX_VERTEX ? (e->in_attr & 0xffffu) | (e->in_attr << 16) : e->tex_units;      /* vertex: bit 16 + n = attribute n's SNORM decode (int_attrs) */
     out->ssbos = e->ssbos; out->ssbo_written = e->uses_gstore ? e->ssbos : 0;
     out->images = e->images; out->images_read = e->images_read; out->images_written = e->images_written;
