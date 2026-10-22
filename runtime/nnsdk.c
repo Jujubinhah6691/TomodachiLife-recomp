@@ -443,7 +443,12 @@ static void stdalloc_GetTotalFreeSize(Ctx *c) { RET(g_std_alloc_size); }
  * AllocateMemoryBlock for the malloc region, StandardAllocator::Initialize(region, size, cache)). Blocks are committed
  * host pages; the heap size is only a limit the game asked for. */
 static uint64_t g_heap_size, g_heap_used;
-#define APP_MEMORY 0xcd500000ull                         /* what a normal application gets (3.2 GiB on a retail console) */
+/* What the application may use. A retail console gives a normal application 0xcd500000 (3.2 GiB); this game carves its heaps
+ * from what is left after each step ("the rest of the parent"), and the rest varies with the order its loader threads run
+ * in: with the console's budget a scene-local heap (WorldMapMgr, 11 MB) once got 9 MB and the game aborted. The default
+ * here is 4.5 GiB, TOMO_APP_MEMORY=<MiB> sets it; the blocks are committed host memory, touched only where used. */
+static uint64_t app_memory(void) { static uint64_t v; if (!v) { const char *e = getenv("TOMO_APP_MEMORY"); v = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 20 : 0x120000000ull; } return v; }
+#define APP_MEMORY app_memory()
 static void os_QueryMemoryInfo(Ctx *c) {                 /* MemoryInfo: available, used, heap size, heap allocated, program, stacks, threads */
     uint64_t m = A0;
     wr64(m, APP_MEMORY); wr64(m + 8, g_heap_used + 0x4000000); wr64(m + 16, g_heap_size); wr64(m + 24, g_heap_used);

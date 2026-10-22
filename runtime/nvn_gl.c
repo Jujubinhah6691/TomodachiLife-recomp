@@ -1258,6 +1258,9 @@ static uint64_t sh_hash(uint64_t h, const void *data, size_t n) {
  *   turns it off (every stage is then compiled with glCreateShaderProgramv, as before). */
 static LONG64 g_shd_loaded, g_shd_saved, g_shd_refused;
 static volatile LONG64 g_shw_queued, g_shw_done, g_shw_compiled, g_shw_present, g_shw_failed;
+static DWORD g_shw_tid[8];
+/* hostrt.c, the crash report: which of this file's host threads a thread id is, or NULL */
+const char *nvn_front_thread_kind(unsigned long tid) { static char b[32]; if (tid == g_render_tid) return "render thread"; for (int i = 0; i < 8; i++) if (g_shw_tid[i] && g_shw_tid[i] == tid) { snprintf(b, sizeof b, "shader worker %d", i); return b; } return NULL; }
 static volatile LONG g_pw_listed_done;                      /* the start-up queueing of pairs.txt is over (boot.c waits for the workers then) */
 /* boot.c: how many worker jobs are still pending, and how many were queued in all; -1 until the start-up queueing is over */
 long long nvn_front_warm_pending(long long *total) { *total = g_shw_queued; return g_pw_listed_done ? g_shw_queued - g_shw_done : -1; }
@@ -1734,7 +1737,7 @@ static void shd_workers_start(void) {
     for (int i = 0; i < 64; i++) InitializeCriticalSection(&g_pw_stripe[i]);
     if (!getenv("SSBU_NO_SHADER_VARIANTS")) shv_load();
     g_shw_sem = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL);
-    for (int i = 0; i < g_shw_n; i++) CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, NULL));
+    for (int i = 0; i < g_shw_n; i++) { DWORD tid = 0; CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, &tid)); if (i < 8) g_shw_tid[i] = tid; }
 }
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
