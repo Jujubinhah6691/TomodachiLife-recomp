@@ -1,0 +1,6 @@
+build/
+# made from the game binary: never committed
+tools/lifter/difftest_gen.c
+tools/lifter/difftest_*.json
+tools/lifter/eh_main_tables.json
+__pycache__/
