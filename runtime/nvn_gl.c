@@ -550,6 +550,7 @@ void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
 void nvn_label_drop(uint64_t obj);
 static int g_origin_mode = 1, g_depth_mode = 1;        /* what the game asks for; applied by the render thread */
+static volatile LONG g_clip_dirty;                   /* a mode changed after the GL start-up: job_submit applies it */
 
 /* ---------------------------------------------------------------- Tegra block-linear layout
  * Rules, storage sizes and de-swizzling come from tex_decode.c (tex_layout / tex_deswizzle_level), which was
@@ -2489,6 +2490,7 @@ static int draw_prepare(void) {
         printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
                vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, glIsEnabled(GL_DEPTH_TEST), dfunc,
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
+        if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format);
         for (int s = 0; s < 2; s++) {
             printf("  %s buffers:", k_stage_name[s]);
             for (int n = 0; n < 16; n++) if (S.ubo[s][n].addr) printf(" c%d=%llx+%llu", n, (unsigned long long)S.ubo[s][n].addr, (unsigned long long)S.ubo[s][n].size);
@@ -2545,6 +2547,12 @@ static int draw_prepare(void) {
             if (!(a & 0xff)) continue;
             printf("  attr %d: format 0x%x stream %d offset %u stride %u buffer %llx+%llu", i, a & 0xff, stream, a >> 14, S.vstream[stream].stride, (unsigned long long)S.vbuf[stream].addr, (unsigned long long)S.vbuf[stream].size);
             if (S.vbuf[stream].addr && S.vbuf[stream].size >= (a >> 14) + 16) { const float *f = (const float *)((const uint8_t *)P(S.vbuf[stream].addr) + (a >> 14)); printf("  first: %g %g %g %g", f[0], f[1], f[2], f[3]); }
+            if (S.vbuf[stream].addr && (a & 0xff) == 0x29) {          /* RGBA16F: the first four vertices as half floats */
+                const uint16_t *h = (const uint16_t *)((const uint8_t *)P(S.vbuf[stream].addr) + (a >> 14));
+                printf("  halves:");
+                for (int v = 0; v < 4 && (uint64_t)(v * S.vstream[stream].stride + 8) <= S.vbuf[stream].size; v++, h = (const uint16_t *)((const uint8_t *)h + S.vstream[stream].stride))
+                    printf(" (%g %g %g %g)", half_to_f32(h[0]), half_to_f32(h[1]), half_to_f32(h[2]), half_to_f32(h[3]));
+            }
             { int k = S.vbuf[stream].addr ? crange_hit(S.vbuf[stream].addr, S.vbuf[stream].size) : -1; if (k >= 0) printf("  <- storage %d written by compute program #%d (%llx+%llu)", g_crange[k].n, g_crange[k].prog, (unsigned long long)g_crange[k].addr, (unsigned long long)g_crange[k].size); }
             printf("\n");
         }
@@ -3506,6 +3514,10 @@ static void replay(uint64_t handle, int depth) {
 static void job_submit(void *arg) {
     SubmitJob *j = arg;
     static int nlog;
+    if (g_clip_dirty && InterlockedExchange(&g_clip_dirty, 0)) {
+        glClipControl(g_origin_mode ? GL_UPPER_LEFT_ : GL_LOWER_LEFT_, g_depth_mode ? GL_ZERO_TO_ONE_ : GL_NEGATIVE_ONE_TO_ONE_);
+        printf("nvn_gl: window origin mode %d, depth mode %d (set by the game)\n", g_origin_mode, g_depth_mode);
+    }
     g_serial++;
     g_arena_gen++;                               /* guest memory may have changed since the last batch */
     LONG64 pf0 = pf_now();
@@ -3702,6 +3714,16 @@ static void job_present(void *arg) {
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_FRAMEBUFFER_SRGB_);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, 0);
+    if (t && getenv("TOMO_ALIASLOG")) {              /* diagnosis: textures laid over the presented window texture's memory */
+        static int said;
+        if (said++ < 3) {
+            printf("aliaslog: window texture gl %u mem %p %dx%dx%d format 0x%x target %d flags 0x%x levels %d samples %d\n", t->o.gl, (void *)t->mem,
+                   t->b.width, t->b.height, t->b.depth, t->b.format, t->b.target, (unsigned)t->b.flags, t->b.levels, t->b.samples);
+            for (Tex *o = g_all_tex; o; o = o->all_next)
+                if (o != t && !o->dead && o->mem && o->mem < t->mem + 1920 * 1080 * 4 && o->mem + 16 > t->mem)
+                    printf("aliaslog:   gl %u mem %p (%+lld) %dx%d format 0x%x flags 0x%x\n", o->o.gl, (void *)o->mem, (long long)(o->mem - t->mem), o->b.width, o->b.height, o->b.format, (unsigned)o->b.flags);
+        }
+    }
     if (t && !t->dead && t->o.gl) {
         int sr[4] = {0, 0, t->b.width, t->b.height};
         if (j->win->crop[2] > 0 && j->win->crop[3] > 0) memcpy(sr, j->win->crop, sizeof sr);
@@ -3995,8 +4017,10 @@ static void n_true(Ctx *c) { RET(1); }
 static void n_zero(Ctx *c) { RET(0); }
 
 /* ---- device */
-static void dev_origin_mode(Ctx *c) { g_origin_mode = (int)A1; }
-static void dev_depth_mode(Ctx *c) { g_depth_mode = (int)A1; }
+/* the clip control is set at the GL start-up; a mode the game sets later (Tomodachi Life does, after the device exists) is
+ * applied by the render thread before its next batch (job_submit): until then the start-up's modes flipped its winding */
+static void dev_origin_mode(Ctx *c) { g_origin_mode = (int)A1; InterlockedExchange(&g_clip_dirty, 1); }
+static void dev_depth_mode(Ctx *c) { g_depth_mode = (int)A1; InterlockedExchange(&g_clip_dirty, 1); }
 /* The real values (close5; until then this port gave textureID | samplerID << 32 and the bare ID for the other three):
  *   nvnDeviceGetTextureHandle [sdk 0x41bc80]         sign-extended 32-bit (textureID | samplerID << 20), then bit 32 set
  *   nvnDeviceGetTexelFetchHandle [0x41bc70]          sign-extended textureID, bit 32 set

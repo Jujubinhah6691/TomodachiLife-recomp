@@ -13,7 +13,7 @@ export IMGUI_ROOT=$(cygpath -w "$D/imgui") FFMPEG_ROOT=$(cygpath -w "$D/ffmpeg")
 [ "$3" = dll ] && "$PY" build.py gamedll | tail -1
 "$PY" build.py host > host_build.log 2>&1 || { tail -20 host_build.log; exit 1; }
 tail -1 host_build.log
-export SSBU_ROMFS=$(cygpath -w ../dump/romfs) SSBU_ERROR_DIALOG=0 SSBU_RENDERER=${SSBU_RENDERER:-gl}   # the Vulkan back end lacks counters (nvnCommandBufferReportCounter) so far
+export SSBU_ROMFS=$(cygpath -w ../dump/romfs) SSBU_ERROR_DIALOG=0 SSBU_RENDERER=${SSBU_RENDERER:-gl} SSBU_OS_CONSOLE_CORES=${SSBU_OS_CONSOLE_CORES:-1}   # console core model: the game sizes heaps from free memory and races without it; the Vulkan back end lacks counters (nvnCommandBufferReportCounter) so far
 set +e
 timeout $(( ${2:-40} + 60 )) ./ssbu_native.exe "$(cygpath -w ../dump/exefs/main.elf)" "${2:-40}" > "$1" 2>&1
 echo "exit $?"
