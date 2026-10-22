@@ -44,8 +44,44 @@ The lifter is a copy of `ssbu-recomp/tools/lifter/recomp.py` and `recomp_eh.py` 
 - Not tested yet: running any lifted function. The mid-entry change has the same shape as the landing pads SSBU runs,
   but nothing has executed it in this game yet.
 
+## Steps 2-4: SDK lift, runtime, boot (2026-10-21/22)
+
+The whole SSBU runtime and build tooling are forked into this tree (`runtime/`, `tools/`, `scripts/`); the game-specific
+answers live in `runtime/tomo.c`. What works:
+
+- **The game boots and runs its frame loop at 30 fps for as long as it is left running** (tested 4 minutes): nninitStartup,
+  4,599 static constructors, nnMain, 40 game threads, NVN device / queue / window, the RomFS (66,343 files), fonts, the
+  audio renderer (a silent one: wave buffers are consumed at the sample rate, nothing is mixed yet), save data, controller.
+- **It draws its own loading screen** (the yellow pattern with the cycling food icon) with the OpenGL back end
+  (`SSBU_RENDERER=gl`, the default of `scripts/dev_run.sh`; the Vulkan back end lacks `nvnCommandBufferReportCounter`).
+- Lifter: jump-table bases are no longer taken for function starts; DT_RELR relocations; `ctr_el0`, cache maintenance.
+- NVN 55 differences handled: API version 55.15, 16-byte `NVNtextureView`, `Bind*Deferred`, `MemoryPoolMapVirtual`
+  (whole-pool aliases; partial mappings are copied: a shortcut), window origin / depth mode set after start-up, command
+  memory modelled at 4 bytes per command, texture storage from the runtime's own layout.
+- SDK 20 services: light semaphores / message queues, timer events, the nn::os memory heap, SdkMutex / SdkConditionVariable
+  cut to host locks, ~300 pure SDK functions lifted (prepo, mii values, vibration, png/jpeg, the nn::audio client).
+
+**Where it stops:** the loading screen never ends. After the game has read its RSDB tables (215 file opens) it asks for no
+more files; no actor pack (`Pack/Actor`, 2,693 files) and no message archive (`Mals/`) is ever opened. Nothing is blocked
+at the OS level: every thread is idle on its queue or loops per frame (the "Scene Prepare Thread" re-runs its three
+preparation tasks, which complete, then waits on a per-frame event). The game's own logic does not advance to the next
+loading phase. Checked and ruled out: controller input (A every 2 s), the language (ja, en-GB, en-US), heap exhaustion
+(`TOMO_HEAPLOG`), the audio renderer's update answers (now accepted by the SDK client), Mii database Initialize (returns
+success now), time init. Not checked: the game's scene state machine itself (what condition it polls each frame).
+
+Diagnostics added for this: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at
+exit), `TOMO_EVLOG=1` (events waited on for over 2 s and who signals them), `TOMO_TASKLOG=1` (scene task states),
+`TOMO_HEAPLOG=1|<heap name>`, `TOMO_ALIASLOG=1`, `SSBU_PEEK=<addr,...>` in the crash report, `tools/debug/*.py`
+(disassemble main or sdk by address / name, callers, relocation of a slot, cross-references, host code at a DLL RVA).
+
 ## Reproduce
 
+Everything below is in `scripts/dev_run.sh` (rebuild what changed and run for N seconds):
+```
+sh scripts/regen_sdk.sh                     # after a change of tools/lifter/sdklift_roots.txt
+sh scripts/dev_run.sh run.log 60 dll        # dll = relink the game DLL too; log in build/work/run.log
+```
+First build from the dump:
 ```
 set SSBU_PROD_KEYS=<your prod.keys>
 python ..\ssbu-recomp\tools\extract\dump_folder.py <game.nsp> <game.nsp> build\dump --exefs-only
@@ -67,8 +103,8 @@ The keys must cover key generation 0x0f or newer, since this game is newer than 
 
 ## Next steps
 
-1. ~~Handle the remaining SIMD encodings in the lifter, then do a full lift of `main` and compile it.~~ Done, see above.
-2. Lift the game's own `sdk` module (SDK 20) with `sdklift.py` in place of SSBU's 13.x one.
-3. Runtime: reuse the SSBU runtime's NVN-to-Vulkan, fs, hid, os and thread layers; write `nn::audio` (AudioRenderer)
-   new, because SSBU never used it; stub `prepo`, `ngc`, `pctl`, `ssl`.
-4. Boot to the first frame: `sead::GameFrameworkNx` start-up, then the RomFS (full `dump_folder.py` without `--exefs-only`).
+1. Find the condition the loading scene polls (hook the main thread's per-frame scene update, `0x71005e3288` and the
+   function at `0x7101d7c270` that waits for the three preparation tasks; `TOMO_SAMPLE` names the hot functions).
+2. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
+3. The Vulkan back end: `nvnCommandBufferReportCounter`.
+4. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).

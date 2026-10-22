@@ -396,9 +396,18 @@ static void heaplog_install(void) {
     printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");
 }
 
+static void ret7(Ctx *c) { RET(7); }
+/* answers that replace the SSBU runtime's do-nothing ones: a do-nothing handler leaves `this` in x0, which this game reads
+ * as a failed Result (nn::mii::Database::Initialize) or as a core mask */
+static const ImportDef tomo_overrides[] = {
+    {"_ZN2nn3mii8Database10InitializeEv", ret0},
+    {"_ZN2nn4time13IsInitializedEv", ret1},
+    {"_ZN2nn2os26GetThreadAvailableCoreMaskEv", ret7},
+};
 void register_tomo_imports(void) {
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);
+    register_imports(tomo_overrides, (int)(sizeof tomo_overrides / sizeof tomo_overrides[0]));
     for (size_t i = 0; i < sizeof sdk_lock_overrides / sizeof sdk_lock_overrides[0]; i++)
         sdk_host_override(sdk_lock_overrides[i].name, sdk_lock_overrides[i].fn);
     heaplog_install();
