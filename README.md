@@ -37,6 +37,12 @@ The lifter is a copy of `ssbu-recomp/tools/lifter/recomp.py` and `recomp_eh.py` 
   their `case` and label).
 - Lift: 111,510 functions, 807 files. The game has no C++ exceptions (no `__cxa_throw` import, 0 LSDAs).
 - `tools/lifter/compile_main.py` compiles the lift with clang 9 -O1 (falls back to -O0 for a file over 15 minutes).
+  **All 809 files compile at -O1** (530 s, 12 jobs, 216 MB of objects; no file needed -O0).
+- Link check (`lld-link -dll -noentry -force:unresolved`): a 158 MB DLL whose only unresolved symbols are the C math
+  and memory functions (`memcpy`, `floor`, `fma`, ...) and the runtime's `call_indirect`, `host_import`, `guest_trap`,
+  `guest_unimpl`, `stx_diag`. The SSBU runtime provides all of them. The 779 SDK imports go through `host_import`.
+- Not tested yet: running any lifted function. The mid-entry change has the same shape as the landing pads SSBU runs,
+  but nothing has executed it in this game yet.
 
 ## Reproduce
 
