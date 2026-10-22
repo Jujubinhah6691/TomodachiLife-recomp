@@ -108,6 +108,14 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
     e->cbufs |= 1u << b;
     return S(e, "c%u[%uu]", b, w);
 }
+/* A video operand (VMNMX ...): chunk = 0 selects byte `byte_height` of the register, otherwise type 0 / 1 = the low / high
+ * 16 bits, 2 = the whole register; signed operands are sign-extended. NULL for the invalid type. */
+static const char *vop(Mx *e, const char *r, unsigned chunk, unsigned sgn, unsigned type, unsigned byte_height) {
+    if (!chunk) return sgn ? S(e, "uint(bitfieldExtract(int(%s), %u, 8))", r, byte_height * 8) : S(e, "bitfieldExtract(%s, %u, 8)", r, byte_height * 8);
+    if (type == 2) return r;
+    if (type > 2) return NULL;
+    return sgn ? S(e, "uint(bitfieldExtract(int(%s), %u, 16))", r, type * 16) : S(e, "bitfieldExtract(%s, %u, 16)", r, type * 16);
+}
 static const char *I20(Mx *e, uint64_t i) { uint32_t v = MXB(i, 20, 19); if (MXB(i, 56, 1)) v |= 0xfff80000u; return S(e, "0x%08xu", v); }
 static const char *F20(Mx *e, uint64_t i) { return S(e, "0x%08xu", (MXB(i, 20, 19) << 12) | (MXB(i, 56, 1) << 31)); }
 static const char *I32(Mx *e, uint64_t i) { return S(e, "0x%08xu", MXB(i, 20, 32)); }
@@ -941,6 +949,27 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         else emit(e, "uint res = %s ? min(%s, %s) : max(%s, %s);", p, A8, b, A8, b);
         emit(e, " %s = res;", DST);
         if (MXB(i, 47, 1)) setcc_int(e, "res");
+        break;
+    }
+    case MXOP_VMNMX: {                         /* video min/max (yuzu video.cpp): a, b as 8/16/32-bit lanes, then merged / combined with Rc */
+        unsigned ta = MXB(i, 36, 2), ca = MXB(i, 38, 1), tb = MXB(i, 28, 2), cb = MXB(i, 30, 1), sa = MXB(i, 48, 1), sb = MXB(i, 49, 1);
+        unsigned regb = MXB(i, 50, 1), oper = MXB(i, 51, 3), ds = MXB(i, 54, 1), mx = MXB(i, 56, 1);
+        const char *a = vop(e, A8, ca, sa, ta, MXB(i, 36, 2)), *bb, *cc = X(e, MXB(i, 39, 8));
+        if (regb) bb = vop(e, R20, cb, sb, tb, MXB(i, 28, 2));
+        else { uint32_t v = MXB(i, 20, 16); if (sb && (v & 0x8000)) v |= 0xffff0000u; bb = S(e, "0x%08xu", v); }
+        if (!a || !bb) { fail(e, "VMNMX", "VMNMX operand type %u / %u", ta, tb); break; }
+        if (sa && sb) emit(e, "uint v = uint(%s(int(%s), int(%s)));", mx ? "max" : "min", a, bb);
+        else emit(e, "uint v = %s(%s, %s);", mx ? "max" : "min", a, bb);
+        switch (oper) {
+        case 0: emit(e, " v = bitfieldInsert(%s, v, 16, 16);", cc); break;
+        case 1: emit(e, " v = bitfieldInsert(%s, v, 0, 16);", cc); break;
+        case 2: emit(e, " v = bitfieldInsert(%s, v, 0, 8);", cc); break;
+        case 3: emit(e, " v = bitfieldInsert(%s, v, 16, 8);", cc); break;
+        case 4: emit(e, " v = v + %s;", cc); break;
+        case 5: case 6: if (ds) emit(e, " v = uint(%s(int(v), int(%s)));", oper == 5 ? "min" : "max", cc); else emit(e, " v = %s(v, %s);", oper == 5 ? "min" : "max", cc); break;
+        default: break;
+        }
+        emit(e, " %s = v;", DST);
         break;
     }
     case MXOP_ISET_reg: case MXOP_ISET_cbuf: case MXOP_ISET_imm: {

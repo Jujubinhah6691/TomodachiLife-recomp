@@ -61,9 +61,13 @@ answers live in `runtime/tomo.c`. What works:
 - SDK 20 services: light semaphores / message queues, timer events, the nn::os memory heap, SdkMutex / SdkConditionVariable
   cut to host locks, ~300 pure SDK functions lifted (prepo, mii values, vibration, png/jpeg, the nn::audio client).
 
-**Where it stops (2026-10-22, later):** the loading screen is passed. The game shows its first real screen, a dialog
-"Save data from the demo version of Tomodachi Life: Living the Dream has been detected" with an OK button, at a steady
-30 fps for as long as it runs (tested 75 s). Three host bugs had held it:
+**Where it is (2026-10-22, evening): in the game world.** The loading screen, the "demo save data detected" dialog
+(OK), "transfer the demo save?" (Don't Transfer, then its confirmation) and the date-and-time check (Yes, Proceed) are
+passed; the game loads its world and shows the island in the sea with the "take a look around the island" prompt,
+at 14 fps while its shaders are first prepared, 30 fps on the dialogs. The scripted path:
+`SSBU_SEQ="900:Z 500:l 60:Z 500:r 60:Z 800:Z 500:Z"` (poll-counted presses, nnhid.c) with `scripts/ps_run.ps1`.
+
+Host bugs fixed on the way, each one a hang:
 
 - **Lost event wake-up** (`os_threads.c`): the scene start-up signals a manual-clear light event and clears it at once
   (`SignalLightEvent` / `ClearLightEvent` in the task-group step at 0x71005e1f40). The host event woke the waiter, which
@@ -79,11 +83,14 @@ answers live in `runtime/tomo.c`. What works:
   one-layer array view, a layered attachment next to the plain 2D depth target (GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS):
   now a 2D view of that level and layer (`rt_view`); 3D textures attach by layer. A draw that samples the texture it
   renders to samples a refreshed copy (`feedback_guard`).
+- **A mutex born locked** (`os_threads.c`): the game destroys its GPU memory pools while holding their mutex
+  (0x71002ab68c); the host object keyed by that address kept the lock, and the next pool made at the same address
+  started locked by a thread that had moved on: the world load hung in 0x7100329cc4. `InitializeMutex` /
+  `FinalizeMutex` (and the SDK mutex resets) drop such a lock.
 
-The dialog waits for input; answering it (A on OK) and the save-data answers behind it (the game believes a demo save
-exists) are the next thing. Open renderer gaps seen so far: fragment shaders with `TEX (b)` (bindless texture handle in
-a register, programs #6562/#6590) and one with `VMNMX` (#5392) are not translated; views of ASTC textures are refused
-by the driver (sampled as the plain texture).
+Open renderer gaps: fragment shaders with `TEX (b)` (bindless texture handle in a register) are not translated; `VMNMX`
+is (video min/max, yuzu's field layout, unverified against hardware); views of ASTC textures are refused by the driver
+(sampled as the plain texture). Not touched yet: audio output, rumble, the Vulkan back end.
 
 Diagnostics: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at exit, and a
 thread / wait report after 3 s without a present), `TOMO_GPUTIME=<ms>` (every draw and dispatch finished and timed; with
@@ -122,10 +129,10 @@ The keys must cover key generation 0x0f or newer, since this game is newer than 
 
 ## Next steps
 
-1. Answer the "demo save data" dialog: press A on OK (`SSBU_PRESS`), then follow the save-data flow (the fs / save
-   answers in tomo.c decide whether a demo save and a main save exist).
+1. Play from the island prompt on (cursor and camera; the game believes a demo save exists, which the fs / save
+   answers in tomo.c decide) and look at what the world is missing visually.
 2. Translate `TEX (b)` (bindless handle in a register: a table from NVN handle to GL bindless handle, filled by
-   nvnDeviceGetTextureHandle) and `VMNMX`.
+   nvnDeviceGetTextureHandle).
 3. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
 4. The Vulkan back end: `nvnCommandBufferReportCounter`.
 5. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).
