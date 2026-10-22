@@ -143,6 +143,76 @@ static void audio_stop(Ctx *c) {
 }
 static void audio_close(Ctx *c) { audio_stop(c); Renderer *r = ren_of(A0); if (r) r->event = 0; }
 static void audio_work_size(Ctx *c) { RET(0x100000); }
+/* RequestUpdateAudioRenderer(handle, const AudioRendererConfig *): the service renders one audio frame per update and reports
+ * it in the config's output; the elapsed frame count the SDK reads back [sdk 0x2182f0] is the 64-bit word *(config + 0x40).
+ * The game's audio framework waits on it before it runs its queued work (no mixing yet). */
+/* The audren update, as the console's service answers it (layouts: Eden audio_core, renderer/behavior/info_updater.cpp).
+ * Input (config +0x48, the SDK's own serialization): header 0x40 {revision, behaviour, memory pools, voices, voice
+ * resources, effects, mixes, sinks, performance, splitter, render info sizes; total at +0x3c}, then the sections in that
+ * order. Output (config +0x58, capacity +0x60): header 0x40 with the output sizes, then memory pools (0x10 each), voices
+ * (0x10), effects (0x10 / 0x90 from revision 9), sinks (0x20), performance (0x10), behaviour (0xb0), render info (0x10).
+ * The client [sdk 0x22116c..0x221238] checks every section size and that the total equals the capacity.
+ * A SILENT renderer: no mixing; a playing voice consumes its wave buffers at its sample rate (240 samples a frame at
+ * 48 kHz) so the game's streaming and sound-state logic run as on the console. */
+typedef struct { uint64_t played; uint32_t consumed, popped, pos, last_index, seen; } SilentVoice;
+static SilentVoice g_sv[1024];
+static void audio_update(Ctx *c) {
+    static int said;
+    uint64_t cfg = A1;
+    if (!cfg) { if (said++ < 3) printf("audio: update with no config (handle %llu)\n", (unsigned long long)A0); RET(0); return; }
+    uint64_t in = rd64(cfg + 0x48), out = rd64(cfg + 0x58), cap = rd64(cfg + 0x60), frames = rd64(cfg + 0x40);
+    if (!in || !out) { RET(0); return; }
+    uint32_t rev = (rd32(in) >> 24) - '0';
+    uint32_t vsz = rev >= 15 ? 0x188 : 0x170, esz_out = rev >= 9 ? 0x90 : 0x10;
+    uint32_t npool = rd32(in + 8) / 0x20, nvoice = rd32(in + 0xc) / vsz, neffect = rd32(in + 0x14) / 0xc0, nsink = rd32(in + 0x1c) / 0x140;
+    uint64_t ip = in + 0x40 + rd32(in + 4);              /* memory pools follow the behaviour parameter */
+    uint64_t iv = ip + rd32(in + 8) + rd32(in + 0x10);   /* voices follow the voice channel resources */
+    uint64_t ie = iv + rd32(in + 0xc);
+    uint64_t total = 0x40 + npool * 0x10 + nvoice * 0x10 + neffect * esz_out + nsink * 0x20 + 0x10 + 0xb0 + 0x10;
+    if (total > cap) { if (said++ < 3) printf("audio: update output needs %llu bytes, the buffer holds %llu\n", (unsigned long long)total, (unsigned long long)cap); RET(0x5299); return; }
+    if (total != cap && said++ < 3) printf("audio: update output %llu bytes, buffer %llu (revision %u, %u pools %u voices %u effects %u sinks)\n", (unsigned long long)total, (unsigned long long)cap, rev, npool, nvoice, neffect, nsink);
+    memset((void *)(uintptr_t)out, 0, (size_t)cap);
+    uint64_t op = out + 0x40;
+    for (uint32_t i = 0; i < npool; i++, op += 0x10) {   /* RequestAttach -> Attached, RequestDetach -> Detached */
+        uint32_t s = rd32(ip + i * 0x20 + 0x10);
+        wr32(op, s == 4 ? 5 : s == 2 ? 3 : s);
+    }
+    wr32(out + 8, npool * 0x10);
+    for (uint32_t i = 0; i < nvoice; i++, op += 0x10) {
+        uint64_t v = iv + i * vsz;
+        uint32_t id = rd32(v), in_use = rd8(v + 9), play = rd8(v + 0xa), rate = rd32(v + 0xc), is_new = rd8(v + 8);
+        uint32_t count = rev >= 15 ? rd32(v + 0x54) : rd32(v + 0x3c), index = rev >= 15 ? rd32(v + 0x58) : rd16(v + 0x40);
+        uint64_t wb = v + (rev >= 15 ? 0x78 : 0x60);
+        SilentVoice *s = &g_sv[id < 1024 ? id : 0];
+        if (is_new || !s->seen) { memset(s, 0, sizeof *s); s->seen = 1; s->last_index = index; }
+        if (in_use && play == 0 && !is_new) {
+            s->popped += (index - s->last_index) & 3;    /* the client released that many buffers since the last update */
+            s->last_index = index;
+            uint32_t pending = s->consumed - s->popped, avail = count > pending ? count - pending : 0;
+            uint32_t n = rate ? rate / 200 : 240;
+            while (n && avail) {
+                uint64_t b = wb + ((index + pending) & 3) * 0x38;
+                uint32_t len = rd32(b + 0x14) - rd32(b + 0x10), left = len > s->pos ? len - s->pos : 0;
+                if (left > n) { s->pos += n; s->played += n; n = 0; break; }
+                s->played += left; n -= left; s->pos = 0;
+                if (rd8(b + 0x18)) continue;             /* a looping buffer plays again */
+                s->consumed++; pending++; avail--;
+            }
+        }
+        wr64(op, is_new ? 0 : s->played);
+        wr32(op + 8, is_new ? 0 : s->consumed);
+    }
+    wr32(out + 0xc, nvoice * 0x10);
+    for (uint32_t i = 0; i < neffect; i++, op += esz_out) wr8(op, rd8(ie + i * 0xc0 + 2) ? 3 : 2);   /* enabled: Used, else Initialized */
+    wr32(out + 0x14, neffect * esz_out);
+    op += nsink * 0x20; wr32(out + 0x1c, nsink * 0x20);
+    op += 0x10; wr32(out + 0x20, 0x10);                  /* performance: no history */
+    op += 0xb0; wr32(out + 4, 0xb0);                     /* behaviour: no errors */
+    wr64(op, frames + 1); wr32(out + 0x28, 0x10);
+    wr32(out + 0x3c, (uint32_t)total);
+    wr32(out, rd32(in));
+    RET(0);
+}
 static void ret_float1(Ctx *c) { c->v[0].d[0] = 0; c->v[0].d[1] = 0; c->v[0].f[0] = 1.0f; }
 static void audio_device_list(Ctx *c) {                  /* (AudioDeviceName *out, int count) -> count written; a name is 256 bytes */
     if ((int)A1 < 1) { RET(0); return; }
@@ -158,7 +228,7 @@ static const ImportDef tomo_imports[] = {
     {"_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", audio_start},
     {"_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", audio_stop},
     {"_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", audio_close},
-    {"_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE", ret0},
+    {"_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE", audio_update},
     {"_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE", audio_work_size},
     {"_ZN2nn5audio34GetAudioRendererVoiceDropParameterENS0_19AudioRendererHandleE", ret_float1},
     {"_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", audio_device_list},
@@ -274,9 +344,9 @@ static const ImportDef sdk_lock_overrides[] = {
     {"_ZN2nn2os24SdkConditionVariableType6SignalEv", scv_signal},
     {"_ZN2nn2os24SdkConditionVariableType9BroadcastEv", scv_broadcast},
     /* rumble: dropped for now (nnhid.c's SDL rumble could take these) */
-    {"_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", keep},
-    {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", keep},
-    {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", keep},
+    {"_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", ret0},
+    {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", ret0},
+    {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", ret0},
 };
 void sdk_host_override(const char *name, ImportFn fn);   /* sdklift_rt.c */
 
@@ -304,7 +374,24 @@ static void heaplog_try_alloc(Ctx *c, void *user) {
     printf("heaplog: %.40s (heap %llx) could not give 0x%llx bytes (alignment %d), called from %llx\n", name,
            (unsigned long long)heap, (unsigned long long)size, (int)(int32_t)A2, (unsigned long long)from);
 }
+/* TOMO_TASKLOG=1 (diagnosis): the scene start-up's task step [game 0x71005e1ffc] (task): every change of a task's state
+ * (+0x10) or sub-state (+0x68), with its method table */
+static ImportFn g_task_step;
+static void tasklog_step(Ctx *c, void *user) {
+    (void)user;
+    uint64_t t = A0;
+    g_task_step(c);
+    static struct { uint64_t t; uint32_t s, s2; } seen[32];
+    uint32_t s = rd32(t + 0x10), s2 = rd32(t + 0x68);
+    int i = 0;
+    while (i < 32 && seen[i].t && seen[i].t != t) i++;
+    if (i == 32) return;
+    if (seen[i].t == t && seen[i].s == s && seen[i].s2 == s2) return;
+    seen[i].t = t; seen[i].s = s; seen[i].s2 = s2;
+    printf("tasklog: task %llx (method table %llx) state %u sub %u\n", (unsigned long long)t, (unsigned long long)rd64(t), s, s2);
+}
 static void heaplog_install(void) {
+    if (getenv("TOMO_TASKLOG")) printf("tasklog: hook %s\n", hook_install(0x71005e1ffcull, tasklog_step, NULL, &g_task_step) ? "installed" : "NOT installed");
     if (!getenv("TOMO_HEAPLOG")) return;
     printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");
 }

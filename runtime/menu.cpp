@@ -952,7 +952,7 @@ static int ra_build(void) {
 #else
 static DWORD WINAPI osk_code_thread(LPVOID) {             /* the room code from the desktop's text prompt (it blocks: not on the render thread) */
     char out[256] = "";
-    int r = text_prompt("Room code (SSBU native)", "The code the host's game shows (like 1A2B3-C4D5E)", O.join, out, sizeof out);
+    int r = text_prompt("Room code (Tomodachi Life native)", "The code the host's game shows (like 1A2B3-C4D5E)", O.join, out, sizeof out);
     if (r == 1) { utf8_cut(out, 32); snprintf(g_osk_text, sizeof g_osk_text, "%s", out); }
     InterlockedExchange(&g_osk_done, r == 1 ? 1 : 2);
     InterlockedExchange(&g_osk_busy, 0);
@@ -962,7 +962,7 @@ static char g_osk_name[64];
 static volatile LONG g_osk_name_done;
 static DWORD WINAPI osk_name_thread(LPVOID arg) {          /* the player's name from the desktop's text prompt */
     char out[256] = "";
-    int r = text_prompt("Your name (SSBU native)", "The name other players see", (const char *)arg, out, sizeof out);
+    int r = text_prompt("Your name (Tomodachi Life native)", "The name other players see", (const char *)arg, out, sizeof out);
     if (r == 1) { utf8_cut(out, 32); snprintf(g_osk_name, sizeof g_osk_name, "%s", out); }
     InterlockedExchange(&g_osk_name_done, r == 1 ? 1 : 2);
     InterlockedExchange(&g_osk_busy, 0);
@@ -1502,11 +1502,11 @@ static void sec_rooms(void) {
 
 static void sec_about(void) {
 #ifdef _WIN32
-    ImGui::Text("SSBU native: Super Smash Bros. Ultimate, statically recompiled for Windows");
+    ImGui::Text("Tomodachi Life native: Tomodachi Life: Living the Dream, statically recompiled for Windows");
 #elif defined(__APPLE__)
-    ImGui::Text("SSBU native: Super Smash Bros. Ultimate, statically recompiled for macOS");
+    ImGui::Text("Tomodachi Life native: Tomodachi Life: Living the Dream, statically recompiled for macOS");
 #else
-    ImGui::Text("SSBU native: Super Smash Bros. Ultimate, statically recompiled for Linux");
+    ImGui::Text("Tomodachi Life native: Tomodachi Life: Living the Dream, statically recompiled for Linux");
 #endif
     ImGui::Text("Runtime built %s %s (study tree)", __DATE__, __TIME__);
     ImGui::Text("Renderer: Vulkan on %s", nvn_vk_device_name());
@@ -1541,7 +1541,7 @@ static void exit_game(void) {                              /* F1 -> Exit game: t
 }
 static void draw_menu(int cw, int ch) {
     if (ImGui::BeginMainMenuBar()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f), "SSBU native");
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f), "Tomodachi Life native");
         for (int i = 0; i < SEC_N; i++) if (ImGui::MenuItem(k_sections[i], NULL, g_section == i)) g_section = i;
         ImGui::TextDisabled("   F1 / Home: close   L / R: section");
         ImGui::EndMainMenuBar();

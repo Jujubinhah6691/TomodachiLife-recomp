@@ -232,7 +232,52 @@ static Ctx *new_ctx(uint64_t stack_top) {
 static struct { Obj *o; Ctx *c; int stale; } g_threads[256];      /* (R3 lwr) stale: an older run of the same thread object (started again) */
 static volatile LONG g_threads_n;
 
+/* TOMO_SAMPLE=1 (diagnosis): every millisecond the function each guest thread last entered is counted (not inside imports);
+ * the report lists each thread's 12 most frequent ones: where a thread that never blocks spends its time */
+#define SMP_FN 512
+static struct { uint64_t fn[SMP_FN]; unsigned n[SMP_FN]; } g_smp[64];
+static Ctx *g_smp_main;                              /* boot.c: the main thread's context (slot 63) */
+void os_sample_main(Ctx *c) { g_smp_main = c; }
+static DWORD WINAPI sampler(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(1);
+        for (int i = 0; i < 64; i++) {
+            Ctx *c = i == 63 ? g_smp_main : i < g_threads_n ? g_threads[i].c : NULL;
+            if (!c || c->in_import) continue;
+            uint64_t f = c->fn;
+            unsigned h = (unsigned)((f >> 2) * 2654435761u) % SMP_FN;
+            for (int k = 0; k < SMP_FN; k++, h = (h + 1) % SMP_FN)
+                if (g_smp[i].fn[h] == f || !g_smp[i].fn[h]) { g_smp[i].fn[h] = f; g_smp[i].n[h]++; break; }
+        }
+    }
+    return 0;
+}
+static void sampler_start(void) {
+    static int on = -1;
+    if (on < 0) { on = getenv("TOMO_SAMPLE") != NULL; if (on) CloseHandle(CreateThread(NULL, 0, sampler, NULL, 0, NULL)); }
+}
+static void sample_report(FILE *out) {
+    if (!getenv("TOMO_SAMPLE")) return;
+    for (int i = 0; i < 64; i++) {
+        Obj *o = i == 63 ? NULL : i < g_threads_n ? g_threads[i].o : NULL;
+        if (i != 63 && i >= g_threads_n) continue;
+        unsigned tot = 0;
+        for (int k = 0; k < SMP_FN; k++) tot += g_smp[i].n[k];
+        if (tot < 50) continue;
+        fprintf(out, "sample: %s (%u samples):", i == 63 ? "main thread" : o && o->name ? (const char *)(uintptr_t)o->name : "?", tot);
+        for (int top = 0; top < 12; top++) {
+            int b = -1;
+            for (int k = 0; k < SMP_FN; k++) if (g_smp[i].n[k] && (b < 0 || g_smp[i].n[k] > g_smp[i].n[b])) b = k;
+            if (b < 0) break;
+            fprintf(out, " %llx:%u", (unsigned long long)g_smp[i].fn[b], g_smp[i].n[b]);
+            g_smp[i].n[b] = 0;
+        }
+        fprintf(out, "\n");
+    }
+}
 void dump_guest_threads(FILE *out) {
+    sample_report(out);
     fprintf(out, "\nguest threads (last function entered, link register):\n");
     for (int i = 0; i < g_threads_n && i < 256; i++) {
         Obj *o = g_threads[i].o;
@@ -363,6 +408,7 @@ void os_thread_report(FILE *out) {
     fprintf(out, "nn::os threads of this run (priority 0 highest .. 31 lowest; cores 0..2 exist on the console):\n%.*s", (int)g_oslog_n, g_oslog);
 }
 static void os_StartThread(Ctx *c) {
+    sampler_start();                                  /* TOMO_SAMPLE */
     Obj *o = obj(A0);
     oslog("  start  %-28s entry %llx priority %2d ideal core %d mask %llx stack 0x%llx (called from %llx)\n", o->name ? (const char *)(uintptr_t)o->name : "?",
           (unsigned long long)o->fn, o->priority, o->ideal_core, (unsigned long long)o->core_mask, (unsigned long long)o->stack_size, (unsigned long long)c->x[30]);
@@ -531,10 +577,18 @@ static void pmtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); RET(0); }
 static void pmtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 0 : 16); }   /* EBUSY */
 
 /* ---------------------------------------------------------------- events (Event, LightEvent, SystemEvent) */
+/* TOMO_EVLOG=1 (diagnosis): an event waited for over 2 s is named (thread, caller), and so is every later signal of it */
+static uint64_t g_evlog_keys[64];
+static volatile LONG g_evlog_n;
+static int evlog_on(void) { static int on = -1; if (on < 0) on = getenv("TOMO_EVLOG") != NULL; return on; }
 /* nn::os::EventClearMode: 0 = ManualClear, 1 = AutoClear */
 static void ev_init(Ctx *c) { obj_reset(A0); Obj *o = obj(A0); o->signaled = (int)(A1 & 1); o->autoclear = A2 == 1; }
 static void ev_signal(Ctx *c) {
     L1O("event SIGNAL", A0);
+    if (evlog_on()) for (LONG i = 0; i < g_evlog_n && i < 64; i++) if (g_evlog_keys[i] == A0) {
+        const char *n = guest_thread_name_of(GetCurrentThreadId());
+        printf("evlog: %s signals the waited event %llx (from %llx)\n", n ? n : "?", (unsigned long long)A0, (unsigned long long)c->x[30]);
+    }
     Obj *o = obj(A0);
     EnterCriticalSection(&o->cs);
     o->signaled = 1;
@@ -561,7 +615,21 @@ static int ev_wait_ms(Obj *o, DWORD ms) {
     LeaveCriticalSection(&o->cs);
     return ok;
 }
-static void ev_wait(Ctx *c) { L1O("event wait >", A0); ev_wait_ms(obj(A0), INFINITE); L1O("event wait <", A0); }
+static void ev_wait(Ctx *c) {
+    L1O("event wait >", A0);
+    if (evlog_on()) {
+        Obj *o = obj(A0);
+        if (!ev_wait_ms(o, 2000)) {
+            const char *n = guest_thread_name_of(GetCurrentThreadId());
+            printf("evlog: %s waits on event %llx (called from %llx) for over 2 s\n", n ? n : "?", (unsigned long long)A0, (unsigned long long)c->x[30]);
+            LONG i = InterlockedIncrement(&g_evlog_n) - 1;
+            if (i < 64) g_evlog_keys[i] = A0;
+            ev_wait_ms(o, INFINITE);
+            printf("evlog: %s: event %llx came\n", n ? n : "?", (unsigned long long)A0);
+        }
+    } else ev_wait_ms(obj(A0), INFINITE);
+    L1O("event wait <", A0);
+}
 static void ev_trywait(Ctx *c) { RET(ev_wait_ms(obj(A0), 0)); }
 static void ev_timedwait(Ctx *c) { uint64_t k_ = A0; L1O("event timedwait >", k_); RET(ev_wait_ms(obj(A0), ns_to_ms((int64_t)A1))); L1O("event timedwait <", k_); }
 

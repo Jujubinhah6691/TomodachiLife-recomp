@@ -161,7 +161,7 @@ def cmd_compile(jobs, force):
 
 # The lifted game code lives in ssbu_game.dll, linked only when obj\ changes; the exe holds just the
 # host runtime, so the edit-link-run loop costs a couple of seconds (see game_shim.c, gamedll.c).
-GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1' + ('.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'))
+GAME_DLL = os.environ.get('RECOMP_DLL', 'tomodachi_game' + ('.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'))
 HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
@@ -332,7 +332,7 @@ def compile_host(job):
 def cmd_link(host_only=False):
     if not host_only and build_game_dll():
         return 1
-    exe = os.environ.get('RECOMP_EXE', 'ssbu_native.exe')      # parallel work: one exe name per worker
+    exe = os.environ.get('RECOMP_EXE', 'tomodachi_native.exe')      # parallel work: one exe name per worker
     out = os.path.join(HERE, exe)
     objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)

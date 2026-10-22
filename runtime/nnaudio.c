@@ -275,10 +275,10 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");
             int gfx_volume(void);                     /* U1: graphics.ini volume = auto | 0..100, for the copies a person plays only (gfx_options.c) */
 #ifdef _WIN32
-            int person = !_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe");   /* (_rb: the rollback pair) */
+            int person = !_stricmp(base, "tomodachi_native.exe") || !_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe");   /* (_rb: the rollback pair) */
 #else
             if (strrchr(base, '/')) base = strrchr(base, '/') + 1;
-            int person = !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user");      /* Linux build: no ".exe" */
+            int person = !strcmp(base, "tomodachi_native") || !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user");      /* Linux build: no ".exe" */
 #endif
             int percent = vol ? atoi(vol) : person ? (gfx_volume() >= 0 ? gfx_volume() : 100) : 0;
             if (percent < 0) percent = 0;

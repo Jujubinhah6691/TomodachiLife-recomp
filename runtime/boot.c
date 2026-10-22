@@ -252,6 +252,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     c.tpidr = (uint64_t)tls;
     { uint64_t os_main_thread_type(void); memcpy(tls + 0x1f8, &(uint64_t){os_main_thread_type()}, 8); }   /* [sdk 0x3349dc..e0] nn::os::detail::ThreadManager(): the main thread's ThreadType pointer */
     g_main_ctx = &c;
+    { void os_sample_main(Ctx *); os_sample_main(&c); }       /* os_threads.c: TOMO_SAMPLE */
     { void module_coverage_start(Ctx *main_ctx); module_coverage_start(&c); }   /* nnro.c: SSBU_MODCOV=1 */
     { void os_apply_main_sched(void); os_apply_main_sched(); }                  /* os_threads.c: SSBU_OS_CONSOLE_CORES=1 */
     { void hitch_set_main(Ctx *c); hitch_set_main(&c); }      /* hitch.c: SSBU_HITCH */
