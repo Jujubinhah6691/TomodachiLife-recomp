@@ -88,9 +88,19 @@ Host bugs fixed on the way, each one a hang:
   started locked by a thread that had moved on: the world load hung in 0x7100329cc4. `InitializeMutex` /
   `FinalizeMutex` (and the SDK mutex resets) drop such a lock.
 
-Open renderer gaps: fragment shaders with `TEX (b)` (bindless texture handle in a register) are not translated; `VMNMX`
-is (video min/max, yuzu's field layout, unverified against hardware); views of ASTC textures are refused by the driver
-(sampled as the plain texture). Not touched yet: audio output, rumble, the Vulkan back end.
+**Rendering and speed (2026-10-22, late):** the world runs at the game's 30 fps cap (from 14). Translated since:
+`TEX.B` (bindless handle in a register, through a hash table of resident GL handles per texture / sampler id pair that
+the back end fills as the game asks for handles), `RED`, `SHFL`, `FSWZADD`, `VMNMX`; the compute programs' code (data +
+ctl[0], or +0x100) so every compute program of the game runs. Per-frame costs cut: textures in CPU_NO_ACCESS pools are
+GPU-owned (the game remakes its render targets every frame: 30 MB of uploads and hashing a frame gone), write watch on
+the game's heap, no game-thread barrier for texture finalize / pool registration, no GPU sync after a dispatch. The
+shaders of earlier runs are compiled before the game starts behind a "preparing shaders" screen with a bar (text-only
+loading screen; `SSBU_PREPARE=0` skips it); shaders first met during play still hold a present while they compile.
+`nvn_perf` (every 300 frames) now lists the costliest command types, the jobs the game thread waits for and the barriers
+by caller. Known: views of ASTC textures are refused by the driver (sampled as the plain texture); a driver-side crash
+(nvoglv64 reading NULL, on a host thread while the render thread is idle) was seen twice near frame 5000; the retire
+barrier (buffer / pool finalize) stays, without it the sea foam drew wrong. Not touched yet: audio output, rumble, the
+Vulkan back end.
 
 Diagnostics: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at exit, and a
 thread / wait report after 3 s without a present), `TOMO_GPUTIME=<ms>` (every draw and dispatch finished and timed; with
