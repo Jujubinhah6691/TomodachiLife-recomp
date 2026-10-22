@@ -631,7 +631,7 @@ static volatile LONG64 g_handles_live, g_tex_live;       /* resident bindless ha
  * their GL objects each frame crashed the driver in glDeleteTextures after some 2400 frames. Only GPU-written textures
  * (CPU_NO_ACCESS pools) are kept: nothing is ever uploaded into them, so stale texels are what the pool memory holds too. */
 #define SPARE_KEY (offsetof(TexBuilder, layout))        /* flags .. has_layout, swz: what tex_realize makes the storage from */
-static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[96];
+static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[256];
 static int g_spare_n;
 static LONG64 g_spare_hits, g_spare_kept, g_spare_full;
 static int tex_take_spare(Tex *t) {
@@ -967,7 +967,7 @@ static void texobj_free(TexObj *o, int is_view) {
 static struct { GLuint gl; int target, format, w, h, d, levels, nh, views, gpu; uint32_t flags; char vinfo[160]; } g_freed[16];
 static unsigned g_freed_n;
 void nvn_front_crash_notes(FILE *out) {                   /* hostrt.c: the textures freed last (the driver crashed in glDeleteTextures once) */
-    fprintf(out, "  textures freed last (newest first):\n");
+    fprintf(out, "  textures freed last (newest first; %d spare render targets held):\n", g_spare_n);
     for (unsigned k = 0; k < 16 && k < g_freed_n; k++) {
         unsigned i = (g_freed_n - 1 - k) % 16;
         fprintf(out, "    gl %u target %d format 0x%x %dx%dx%d levels %d flags 0x%x handles %d views %d%s\n", g_freed[i].gl, g_freed[i].target, g_freed[i].format, g_freed[i].w, g_freed[i].h, g_freed[i].d,
@@ -1129,12 +1129,23 @@ typedef struct { GLuint color[8], depth; int n, dkind; int layer[8], level[8], d
 static struct { FboKey k; GLuint fbo; int w, h, used; } g_fbos[NFBO];
 static int g_fbo_next;
 static void fbo_drop_bound(GLuint fbo);
+/* Every attachment of a framebuffer off (through the read binding: the draw binding stays). A framebuffer that still names a
+ * deleted texture is undefined, and the driver crashed in glDeleteTextures over such records: nothing is ever deleted while
+ * attached, and the cache keeps its framebuffer names for reuse instead of deleting them. */
+static void fbo_detach(GLuint fbo) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER_, fbo);
+    for (int i = 0; i < 8; i++) glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_ + (GLenum)i, 0, 0);
+    glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, 0, 0);
+    glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_DEPTH_ATTACHMENT_, 0, 0);
+    glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_STENCIL_ATTACHMENT_, 0, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER_, 0);
+}
 static void fbo_purge(GLuint tex) {
     for (int i = 0; i < NFBO; i++) {
         if (!g_fbos[i].used) continue;
         int hit = g_fbos[i].k.depth == tex;
         for (int j = 0; j < 8; j++) hit |= g_fbos[i].k.color[j] == tex;
-        if (hit) { fbo_drop_bound(g_fbos[i].fbo); glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].used = 0; }
+        if (hit) { fbo_drop_bound(g_fbos[i].fbo); fbo_detach(g_fbos[i].fbo); g_fbos[i].used = 0; }
     }
 }
 static int g_fbo_bad_last;                         /* set by fbo_get for an incomplete framebuffer: set_targets then names the textures */
@@ -1143,10 +1154,10 @@ static GLuint fbo_get(const FboKey *k) {
     for (int i = 0; i < NFBO; i++) if (g_fbos[i].used && !memcmp(&g_fbos[i].k, k, sizeof *k)) return g_fbos[i].fbo;
     int slot = -1;
     for (int i = 0; i < NFBO && slot < 0; i++) if (!g_fbos[i].used) slot = i;
-    if (slot < 0) { slot = g_fbo_next++ & (NFBO - 1); fbo_drop_bound(g_fbos[slot].fbo); glDeleteFramebuffers(1, &g_fbos[slot].fbo); }
-    GLuint fbo = 0;
+    if (slot < 0) { slot = g_fbo_next++ & (NFBO - 1); fbo_drop_bound(g_fbos[slot].fbo); fbo_detach(g_fbos[slot].fbo); }
+    GLuint fbo = g_fbos[slot].fbo;                 /* a name kept from a purged or evicted entry, detached */
     GLenum bufs[8];
-    glGenFramebuffers(1, &fbo);
+    if (!fbo) glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER_, fbo);
     for (int i = 0; i < 8; i++) {
         bufs[i] = i < k->n && k->color[i] ? GL_COLOR_ATTACHMENT0_ + (GLenum)i : GL_NONE;
@@ -3203,6 +3214,7 @@ static void blit_tex(Tex *src, const View *sv, const int *sr, Tex *dst, const Vi
     glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[3], sr[1] + sr[4], dr[0], dr[1], dr[0] + dr[3], dr[1] + dr[4], mask, linear && mask == GL_COLOR_BUFFER_BIT ? GL_LINEAR : GL_NEAREST);
     glEnable(GL_FRAMEBUFFER_SRGB_);
     glEnable(GL_SCISSOR_TEST);
+    fbo_detach(g_fbo_tmp[0]); fbo_detach(g_fbo_tmp[1]);
     glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
     g_st.copies++;
 }
@@ -3732,6 +3744,7 @@ static void exec(const Cmd *m, int depth) {
         }
         glScissorIndexed(0, S.sc0[0], S.sc0[1], S.sc0[2], S.sc0[3]);
         apply_chanmask();
+        fbo_detach(g_fbo_tmp[1]);
         glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
         g_st.clears++;
         break;
@@ -4194,6 +4207,7 @@ static void job_present(void *arg) {
         glClear(GL_COLOR_BUFFER_BIT);
     }
 #ifdef _WIN32
+    fbo_detach(g_fbo_read);
     { LONG64 pf1 = pf_now(); HS_IN("SwapBuffers", 0); SwapBuffers(g_dc); HS_OUT(); pf_add(PF_SWAP, pf1); }
 #endif
     pf_add(PF_PRESENT, pf0);
@@ -5303,6 +5317,7 @@ static void job_present_movie(void *arg) {
     glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);                /* GL row 0 is the top row of an NVN texture (see save_bmp) */
+    fbo_detach(g_fbo_read);
     album_movie_push_frame(px, w, h, w * 4, 0);
     free(px);
     glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
