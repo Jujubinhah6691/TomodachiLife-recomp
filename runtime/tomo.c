@@ -280,9 +280,39 @@ static const ImportDef sdk_lock_overrides[] = {
 };
 void sdk_host_override(const char *name, ImportFn fn);   /* sdklift_rt.c */
 
+/* TOMO_HEAPLOG=1 (diagnosis): every failed allocation of the game's sead::ExpHeap::tryAlloc [game 0x71001e68c0]
+ * (this, size, alignment) with the heap's name (sead::Heap: the name pointer after the IDisposer, +0x20) and its size. */
+int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk/hook_host.c */
+static ImportFn g_try_alloc;
+static void heaplog_try_alloc(Ctx *c, void *user) {
+    (void)user;
+    uint64_t heap = A0, size = A1;
+    uint64_t from = c->x[30];
+    g_try_alloc(c);
+    const char *name = "?";
+    uint64_t np = rd64(heap + 0x20);
+    if (np > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)np, 1)) name = (const char *)(uintptr_t)np;
+    if (c->x[0]) {                                       /* TOMO_HEAPLOG=<heap name>: that heap's allocations too */
+        static int n;
+        const char *want = getenv("TOMO_HEAPLOG");
+        if (want[0] != '1' && !strcmp(name, want) && n++ < 400)
+            printf("heaplog: %s +0x%llx at %llx (from %llx)\n", name, (unsigned long long)size, (unsigned long long)c->x[0], (unsigned long long)from);
+        return;
+    }
+    static int said;
+    if (said++ >= 40) return;
+    printf("heaplog: %.40s (heap %llx) could not give 0x%llx bytes (alignment %d), called from %llx\n", name,
+           (unsigned long long)heap, (unsigned long long)size, (int)(int32_t)A2, (unsigned long long)from);
+}
+static void heaplog_install(void) {
+    if (!getenv("TOMO_HEAPLOG")) return;
+    printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");
+}
+
 void register_tomo_imports(void) {
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);
     for (size_t i = 0; i < sizeof sdk_lock_overrides / sizeof sdk_lock_overrides[0]; i++)
         sdk_host_override(sdk_lock_overrides[i].name, sdk_lock_overrides[i].fn);
+    heaplog_install();
 }

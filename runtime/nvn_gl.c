@@ -2067,7 +2067,7 @@ static const char *const k_op_name[OP_COUNT] = {
     "UpdateUniformBuffer", "ClearBuffer", "CallCommands", "SetCopyRowStride", "CopyTextureToBuffer", "DispatchCompute", "BindImage", "SetCopyImageStride", "SetDepthBounds", "SetConservativeRasterEnable", "SetConservativeRasterDilate",
     "SetSubpixelPrecisionBias", "SetViewportSwizzles", "SetTessellationLevels", "Barrier", "Discard", "ClearTexture", "DownsampleTextureView", "DrawIndirect",
     "DispatchComputeIndirect", "SetRenderEnable", "ResetCounter", "ReportCounter", "ReportValue", "FenceSync", "WaitSync", "SignalEvent", "WaitEvent",
-    "BindCoverageModulationTable", "DebugGroup", "DrawTexture"};
+    "BindCoverageModulationTable", "DebugGroup", "DrawTexture", "BindDeferred"};
 
 typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used; } List;
 static List *g_lists;
@@ -2132,7 +2132,7 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
     {   /* Command memory as the game sees it. The real encoding is the driver's own; the model is 8 bytes per command plus its
          * array payload (control memory: 32 bytes per recording, charged by EndRecording). When the memory the game added is
          * used up, its callback is asked for more, as NVN does (NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY = 0). */
-        uint64_t use = 8 + ((blob + 7) & ~(size_t)7);
+        uint64_t use = (g_game_build == GAME_OTHER ? 4 : 8) + ((blob + 7) & ~(size_t)7);   /* Tomodachi Life: its gsys display lists (ShapeDL) live in fixed-size heaps sized for the real encoding (Maxwell methods: a 4-byte header and data words); 8 per command ran the MiiBodyBaseModel heap dry */
         if (cb->cmd_size && cb->cmd_used + use > cb->cmd_size && cb->callback && !cb->callback_off && !cb->in_callback) {
             uint64_t sx[19];
             V128 sv[8];
@@ -3027,6 +3027,17 @@ static void exec(const Cmd *m, int depth) {
     g_cur_op = k_op_name[m->op < OP_COUNT ? m->op : 0];
     if (g_cbuf_live && (m->op == OP_COPY_BUF_TEX || m->op == OP_COPY_BUF_BUF || m->op == OP_UPDATE_UBO || m->op == OP_CLEAR_BUF || m->op == OP_COPY_TEX_BUF)) compute_flush();
     switch (m->op) {
+    case OP_DEFERRED: {                        /* NVN 55 Bind*Deferred: the array is read now, when the commands run (a[5] = bind op, a[6] = element size) */
+        size_t n = (size_t)a[2], es = (size_t)a[6];
+        Cmd *t = malloc(sizeof(Cmd) + n * es);
+        if (!t) break;
+        *t = *m;
+        t->op = (uint32_t)a[5];
+        if (a[3]) memcpy(BLOB(t), P(a[3]), n * es); else memset(BLOB(t), 0, n * es);
+        exec(t, depth);
+        free(t);
+        break;
+    }
     case OP_TEXPOOL: S.tpool = P(a[0]); break;
     case OP_SMPPOOL: S.spool = P(a[0]); break;
     case OP_PROGRAM:
@@ -4258,9 +4269,10 @@ static void texb_sdk(const TexBuilder *b, NvnSdkTexBuilder *r) {
     r->has_layout = (uint32_t)b->has_layout; memcpy(&r->layout, b->layout, 4);
 }
 /* Tomodachi Life (SDK 20, GAME_OTHER): nvn_sdk.c models SSBU's 13.x NVN internals only, so this game gets this file's own
- * layout: the size rounded up to the 64 KB GPU page, alignment 64 KB, storage class 0, no sparse layout. */
+ * layout: its size rounded to 512 bytes, alignment 512, storage class 0, no sparse layout. Not rounded to a 64 KB page:
+ * the game carves texture storage out of fixed-size heaps (MiiBodyBaseModel ran out with 64 KB pages). */
 #define OWN_LAYOUT (g_game_build == GAME_OTHER)
-static uint64_t own_size(const TexBuilder *b) { return ((uint64_t)tex_storage_size(b) + 0xffff) & ~0xffffull; }
+static uint64_t own_size(const TexBuilder *b) { return ((uint64_t)tex_storage_size(b) + 0x1ff) & ~0x1ffull; }
 static void texb_storage_size(Ctx *c) {
     static int nlog;
     TexBuilder b = *TB;
@@ -4275,7 +4287,7 @@ static void texb_storage_size(Ctx *c) {
 }
 static void texb_storage_align(Ctx *c) {
     NvnSdkTexBuilder r;
-    if (OWN_LAYOUT) { RET(0x10000); return; }
+    if (OWN_LAYOUT) { RET(0x200); return; }
     texb_sdk(TB, &r);
     RET(nvn_sdk_texture_storage_alignment(c, &r));
 }
@@ -4476,6 +4488,13 @@ static void rec_ranges(Ctx *c, uint32_t op, int single) {      /* (cmdbuf, stage
     else if (src) memcpy(BLOB(m), P(src), (size_t)n * 16);
     else memset(BLOB(m), 0, (size_t)n * 16);
 }
+/* NVN 55 nvnCommandBufferBind{UniformBuffers,StorageBuffers,Textures,Images}Deferred(cmdbuf, stage, first, count, address): like
+ * the immediate forms, but the array at `address` is read when the commands execute, so the game can fill it after recording */
+static void rec_deferred(Ctx *c, uint32_t op, size_t esz) { Cmd *m = rec(c, OP_DEFERRED, 0); m->a[3] = A4; m->a[5] = op; m->a[6] = esz; }
+static void cmd_ubos_deferred(Ctx *c) { rec_deferred(c, OP_UBO, 16); }
+static void cmd_ssbos_deferred(Ctx *c) { rec_deferred(c, OP_SSBO, 16); }
+static void cmd_textures_deferred(Ctx *c) { rec_deferred(c, OP_TEXTURES, 8); }
+static void cmd_images_deferred(Ctx *c) { rec_deferred(c, OP_IMAGES, 8); }
 static void cmd_ubo(Ctx *c) { rec_ranges(c, OP_UBO, 1); }
 static void cmd_ubos(Ctx *c) { rec_ranges(c, OP_UBO, 0); }
 static void cmd_ssbo(Ctx *c) { rec_ranges(c, OP_SSBO, 1); }
@@ -5852,6 +5871,8 @@ static const struct { const char *name; ImportFn fn; } k_nvn[] = {
     {"nvnCommandBufferDrawElementsIndirect", cmd_draw_elements_indirect}, {"nvnCommandBufferMultiDrawArraysIndirectCount", cmd_multi_draw_arrays_indirect},
     {"nvnCommandBufferMultiDrawElementsIndirectCount", cmd_multi_draw_elements_indirect}, {"nvnCommandBufferDispatchComputeIndirect", cmd_dispatch_indirect},
     {"nvnCommandBufferSetRenderEnable", cmd_render_enable}, {"nvnCommandBufferSetRenderEnableConditional", cmd_render_enable_cond}, {"nvnCommandBufferResetCounter", cmd_reset_counter},
+    {"nvnCommandBufferBindUniformBuffersDeferred", cmd_ubos_deferred}, {"nvnCommandBufferBindStorageBuffersDeferred", cmd_ssbos_deferred},
+    {"nvnCommandBufferBindTexturesDeferred", cmd_textures_deferred}, {"nvnCommandBufferBindImagesDeferred", cmd_images_deferred},
     {"nvnCommandBufferReportCounter", cmd_report_counter}, {"nvnCommandBufferReportValue", cmd_report_value}, {"nvnCommandBufferFenceSync", cmd_fence_sync},
     {"nvnCommandBufferWaitSync", cmd_wait_sync}, {"nvnCommandBufferSignalEvent", cmd_signal_event}, {"nvnCommandBufferWaitEvent", cmd_wait_event},
     {"nvnCommandBufferDrawTexture", cmd_draw_texture},
