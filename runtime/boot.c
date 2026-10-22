@@ -479,6 +479,7 @@ int main(int argc, char **argv) {
     register_cxxrt_imports();                /* C / C++ runtime: everything still without a handler (keep last) */
     register_unwind_imports();               /* installs the unwinder the C++ runtime calls on a throw */
     register_sdk2_imports();                 /* SDK families (lifted sdk.elf code + offline service answers): fills only; after the C runtime because its self-test needs every handler */
+    { void register_tomo_imports(void); register_tomo_imports(); }   /* tomo.c: Tomodachi Life's SDK 20 services; fills only */
     { void audit_startup(void); audit_startup(); }   /* hostrt.c: fake audit / SSBU_STRICT (plan\FAKE_AUDIT.md) */
     display_init();
     int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */

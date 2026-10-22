@@ -46,7 +46,7 @@ static void nvn_generic(Ctx *c) {
 /* NVNdeviceInfo values of a real Switch, indexed by pname (enum order from the SDK's nvn.h
  * as published in the BotW decomp; values from an NVN device-info dump of a development unit). */
 static const int g_devinfo[0x62] = {
-    53, 312, 14, 65536, 256, 8, 16, 4, 16, 32, 16, 4, 4, 4, 16, 32,             /* 0x00..0x0f */
+    55, 15, 14, 65536, 256, 8, 16, 4, 16, 32, 16, 4, 4, 4, 16, 32,              /* 0x00..0x0f: API 55.15 (SDK 20; Tomodachi Life checks major == 55, minor >= 15; SSBU had 53.312) */
     32, 256, 256, 4, 8, 512, 256, 2, 256, 4096, 131072, 16, 1536, 1024, 64, 1536, /* 0x10..0x1f */
     65535, 65535, 65535, 8, 1048576, 4096, 16, 4096, 1, 1, 1, 262144, 15, 2048, 1, 1, /* 0x20..0x2f */
     15, 5, 1, 8, 8, 4, 32, 128, 32, 128, 65536, 1, 4, 16384, 134217728, 2048,  /* 0x30..0x3f */

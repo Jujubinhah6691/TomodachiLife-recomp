@@ -753,6 +753,7 @@ static void hid_GetNpadStyleSet(Ctx *c) {   /* (const NpadIdType &) */
     }
     RET(r);
 }
+void hid_fill_pad_state(uint64_t out, uint32_t id, int kind) { fill_pad(out, id, kind); }   /* tomo.c: GetNpadStates */
 static void hid_GetNpadState_FullKey(Ctx *c) { fill_pad(A0, rd32(A1), 1); }
 static void hid_GetNpadState_Gc(Ctx *c) { fill_pad(A0, rd32(A1), 2); }
 static void hid_GetNpadState_Other(Ctx *c) { fill_pad(A0, rd32(A1), 0); }

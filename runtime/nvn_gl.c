@@ -4251,10 +4251,15 @@ static void texb_sdk(const TexBuilder *b, NvnSdkTexBuilder *r) {
     r->levels = (uint32_t)b->levels; r->format = (uint32_t)b->format; r->samples = (uint32_t)b->samples; r->stride = (uint32_t)b->stride; r->glname = b->glname;
     r->has_layout = (uint32_t)b->has_layout; memcpy(&r->layout, b->layout, 4);
 }
+/* Tomodachi Life (SDK 20, GAME_OTHER): nvn_sdk.c models SSBU's 13.x NVN internals only, so this game gets this file's own
+ * layout: the size rounded up to the 64 KB GPU page, alignment 64 KB, storage class 0, no sparse layout. */
+#define OWN_LAYOUT (g_game_build == GAME_OTHER)
+static uint64_t own_size(const TexBuilder *b) { return ((uint64_t)tex_storage_size(b) + 0xffff) & ~0xffffull; }
 static void texb_storage_size(Ctx *c) {
     static int nlog;
     TexBuilder b = *TB;
     NvnSdkTexBuilder r;
+    if (OWN_LAYOUT) { RET(own_size(&b)); return; }
     texb_sdk(&b, &r);
     uint64_t real = nvn_sdk_texture_storage_size(c, &r);
     size_t own = nvn_sdk_format_known(r.format) && !b.glname ? tex_storage_size(&b) : 0;
@@ -4264,6 +4269,7 @@ static void texb_storage_size(Ctx *c) {
 }
 static void texb_storage_align(Ctx *c) {
     NvnSdkTexBuilder r;
+    if (OWN_LAYOUT) { RET(0x10000); return; }
     texb_sdk(TB, &r);
     RET(nvn_sdk_texture_storage_alignment(c, &r));
 }
@@ -4319,9 +4325,9 @@ TEXGET(tex_get_dsmode, t->b.dsmode)
 /* Storage class (raw, and 0x100 | GPU memory kind) and sparse tile layout: the SDK's own code, lifted (nvn_sdk.c: [sdk 0x427a10],
  * [0x427b30], [0x428c00], [0x429870], [0x4290b0], [0x429150]). NVNtextureSparseTileLayout = the 16 bytes [sdk 0x411090] writes.
  * The texture forms run on the NVNtexture that nvnTextureInitialize [sdk 0x4287d0] would have built from this texture's builder. */
-static void texb_storage_class(Ctx *c) { NvnSdkTexBuilder r; texb_sdk(TB, &r); RET(nvn_sdk_texture_storage_class(c, &r)); }
-static void texb_raw_storage_class(Ctx *c) { NvnSdkTexBuilder r; texb_sdk(TB, &r); RET(nvn_sdk_texture_raw_storage_class(c, &r)); }
-static void texb_sparse_layout(Ctx *c) { uint64_t out = A1; uint32_t v[4]; NvnSdkTexBuilder r; texb_sdk(TB, &r); nvn_sdk_texture_sparse_layout(c, &r, v); if (out) memcpy(P(out), v, 16); }
+static void texb_storage_class(Ctx *c) { NvnSdkTexBuilder r; if (OWN_LAYOUT) { RET(0); return; } texb_sdk(TB, &r); RET(nvn_sdk_texture_storage_class(c, &r)); }
+static void texb_raw_storage_class(Ctx *c) { NvnSdkTexBuilder r; if (OWN_LAYOUT) { RET(0); return; } texb_sdk(TB, &r); RET(nvn_sdk_texture_raw_storage_class(c, &r)); }
+static void texb_sparse_layout(Ctx *c) { uint64_t out = A1; uint32_t v[4]; NvnSdkTexBuilder r; if (OWN_LAYOUT) { if (out) memset(P(out), 0, 16); return; } texb_sdk(TB, &r); nvn_sdk_texture_sparse_layout(c, &r, v); if (out) memcpy(P(out), v, 16); }
 static int tex_sdk(Ctx *c, NvnSdkTexBuilder *r, const char *fn) {
     Tex *t = hobj(A0, K_TEX);
     if (t && !t->b.glname) { texb_sdk(&t->b, r); return 1; }
@@ -4330,12 +4336,12 @@ static int tex_sdk(Ctx *c, NvnSdkTexBuilder *r, const char *fn) {
     report_and_exit(6);
     return 0;
 }
-static void tex_storage_class(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (tex_sdk(c, &r, "nvnTextureGetStorageClass")) nvn_sdk_tex_storage_class(c, &r, &v); RET(v); }
-static void tex_raw_storage_class(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (tex_sdk(c, &r, "nvnTextureGetRawStorageClass")) nvn_sdk_tex_raw_storage_class(c, &r, &v); RET(v); }
+static void tex_storage_class(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (OWN_LAYOUT) { RET(0); return; } if (tex_sdk(c, &r, "nvnTextureGetStorageClass")) nvn_sdk_tex_storage_class(c, &r, &v); RET(v); }
+static void tex_raw_storage_class(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (OWN_LAYOUT) { RET(0); return; } if (tex_sdk(c, &r, "nvnTextureGetRawStorageClass")) nvn_sdk_tex_raw_storage_class(c, &r, &v); RET(v); }
 /* nvnTextureGetStorageSize [sdk 0x429720] = the 32-bit word +0x78 of the NVNtexture = the SDK layout's size (nvn_sdk.c). Until close5
  * this answered t->storage, the size of this file's own layout, which is not rounded to the GPU page as the SDK's is. */
-static void tex_get_storage_size(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (tex_sdk(c, &r, "nvnTextureGetStorageSize")) nvn_sdk_tex_storage_size(c, &r, &v); RET(v); }
-static void tex_sparse_layout(Ctx *c) { uint64_t out = A1; uint32_t v[4] = {0, 0, 0, 0}; NvnSdkTexBuilder r; if (tex_sdk(c, &r, "nvnTextureGetSparseTileLayout")) nvn_sdk_tex_sparse_layout(c, &r, v); if (out) memcpy(P(out), v, 16); }
+static void tex_get_storage_size(Ctx *c) { NvnSdkTexBuilder r; uint32_t v = 0; if (OWN_LAYOUT) { Tex *t = hobj(A0, K_TEX); RET(t ? own_size(&t->b) : 0); return; } if (tex_sdk(c, &r, "nvnTextureGetStorageSize")) nvn_sdk_tex_storage_size(c, &r, &v); RET(v); }
+static void tex_sparse_layout(Ctx *c) { uint64_t out = A1; uint32_t v[4] = {0, 0, 0, 0}; NvnSdkTexBuilder r; if (OWN_LAYOUT) { if (out) memset(P(out), 0, 16); return; } if (tex_sdk(c, &r, "nvnTextureGetSparseTileLayout")) nvn_sdk_tex_sparse_layout(c, &r, v); if (out) memcpy(P(out), v, 16); }
 
 static void tex_write_texels(Ctx *c) {                 /* (texture, view, region, data) [, rowStride, imageStride] */
     Tex *t = hobj(A0, K_TEX);

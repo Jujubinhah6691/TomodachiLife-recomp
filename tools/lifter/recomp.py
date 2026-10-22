@@ -970,7 +970,15 @@ class Env:
                 starts.add(BASE + addend)
         # code addresses materialised in registers (callbacks, thread entry points): ADRP+ADD pairs and ADR
         page = {}
-        for i, (w,) in enumerate(struct.iter_unpack('<I', text)):
+        words = [w for (w,) in struct.iter_unpack('<I', text)]
+
+        def table_base(i, reg):
+            """The address made at i is the base of a jump table (`adr x9, base; ldrb w10, [..]; add x9, x9, x10, lsl #2;
+            br x9`, clang's compact switch): a br through the same register follows within six instructions. Such a base
+            is a label inside the function, not a function entry; taking it as one split the function there, and the
+            table's targets after it were left outside the lifted body (Tomodachi Life; SSBU's main has none)."""
+            return any(words[k] == 0xd61f0000 | (reg << 5) for k in range(i + 1, min(i + 7, len(words))))
+        for i, w in enumerate(words):
             if (w & 0x9f000000) == 0x90000000:                       # adrp
                 imm = sext((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3), 21)
                 page[w & 31] = (i, ((i * 4) & ~0xfff) + (imm << 12))
@@ -978,12 +986,12 @@ class Env:
                 hit = page.get((w >> 5) & 31)
                 if hit and i - hit[0] <= 8:
                     target = hit[1] + ((w >> 10) & 0xfff)
-                    if 0 <= target < TEXT_SIZE and target % 4 == 0:
+                    if 0 <= target < TEXT_SIZE and target % 4 == 0 and not table_base(i, w & 31):
                         starts.add(BASE + target)
             elif (w & 0x9f000000) == 0x10000000:                     # adr
                 imm = sext((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3), 21)
                 target = i * 4 + imm
-                if 0 <= target < TEXT_SIZE and target % 4 == 0:
+                if 0 <= target < TEXT_SIZE and target % 4 == 0 and not table_base(i, w & 31):
                     starts.add(BASE + target)
         # functions other modules call by name: exported FUNC symbols
         for i in range((STRTAB - SYMTAB) // 24):

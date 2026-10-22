@@ -439,6 +439,29 @@ static void stdalloc_Free(Ctx *c) { _aligned_free((void *)(uintptr_t)A1); }
 static void stdalloc_Reallocate(Ctx *c) { RET(_aligned_realloc((void *)(uintptr_t)A1, A2 ? (size_t)A2 : 1, 16)); }
 static void stdalloc_GetTotalFreeSize(Ctx *c) { RET(g_std_alloc_size); }
 
+/* ---- nn::os memory heap, as an SDK 20 nninitStartup sets it up (Tomodachi Life: QueryMemoryInfo, SetMemoryHeapSize,
+ * AllocateMemoryBlock for the malloc region, StandardAllocator::Initialize(region, size, cache)). Blocks are committed
+ * host pages; the heap size is only a limit the game asked for. */
+static uint64_t g_heap_size, g_heap_used;
+#define APP_MEMORY 0xcd500000ull                         /* what a normal application gets (3.2 GiB on a retail console) */
+static void os_QueryMemoryInfo(Ctx *c) {                 /* MemoryInfo: available, used, heap size, heap allocated, program, stacks, threads */
+    uint64_t m = A0;
+    wr64(m, APP_MEMORY); wr64(m + 8, g_heap_used + 0x4000000); wr64(m + 16, g_heap_size); wr64(m + 24, g_heap_used);
+    wr64(m + 32, 0x3800000); wr64(m + 40, 0x100000); wr32(m + 48, 1);
+}
+static void os_SetMemoryHeapSize(Ctx *c) {
+    if (A0 > APP_MEMORY) { RET(0x1003); return; }        /* nn::os out of memory */
+    g_heap_size = A0;
+    RET(0);
+}
+static void os_AllocateMemoryBlockHeap(Ctx *c) {         /* (uintptr_t *out, size) */
+    void *p = g_heap_used + A1 <= g_heap_size ? VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL;
+    if (p) { wr64(A0, (uint64_t)(uintptr_t)p); g_heap_used += A1; }
+    RET(p ? 0 : 0x1003);
+}
+static void os_FreeMemoryBlockHeap(Ctx *c) { VirtualFree(P(0), 0, MEM_RELEASE); g_heap_used -= A1 < g_heap_used ? A1 : g_heap_used; }
+static void stdalloc_ctor_init(Ctx *c) { stdalloc_Initialize(c); }      /* StandardAllocator(void *, size_t) */
+
 /* ---- nn::mii::detail layout helpers.
  * BufferAllocator { void *current; size_t remaining; }: the game reads `current` directly
  * (first field) between AlignUp and Advance. CalculateSizeAndAlignment is used only through
@@ -546,6 +569,13 @@ static const ImportDef sdk_imports[] = {
     {"_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", ret0},
     {"_ZN2nn7friends17NotificationQueue8FinalizeEv", ret0},
     {"_ZN2nn3mem17StandardAllocator10InitializeEPvm", stdalloc_Initialize},
+    {"_ZN2nn3mem17StandardAllocator10InitializeEPvmb", stdalloc_Initialize},
+    {"_ZN2nn3mem17StandardAllocatorC1EPvm", stdalloc_ctor_init},
+    {"_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE", os_QueryMemoryInfo},
+    {"_ZN2nn2os17SetMemoryHeapSizeEm", os_SetMemoryHeapSize},
+    {"_ZN2nn2os19AllocateMemoryBlockEPmm", os_AllocateMemoryBlockHeap},
+    {"_ZN2nn2os15FreeMemoryBlockEmm", os_FreeMemoryBlockHeap},
+    {"_ZN2nn2os32SetMemoryAllocatorForThreadLocalEPFPvmmEPFvS1_mE", keep},
     {"_ZN2nn3mem17StandardAllocator8FinalizeEv", keep},
     {"_ZN2nn3mem17StandardAllocator8AllocateEm", stdalloc_Allocate},
     {"_ZN2nn3mem17StandardAllocator8AllocateEmm", stdalloc_AllocateAligned},

@@ -646,6 +646,42 @@ static void mq_receive(Ctx *c) { uint64_t k_ = A1; L1O("queue receive >", k_); m
 static void mq_tryreceive(Ctx *c) { RET(mq_get(obj(A1), A0, 0)); }
 static void mq_timedreceive(Ctx *c) { RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
 
+/* ---------------------------------------------------------------- SDK 20 additions (Tomodachi Life) */
+static void sem_release_n(Ctx *c) {                   /* ReleaseSemaphore(sem, count) */
+    Obj *o = obj(A0);
+    EnterCriticalSection(&o->cs);
+    o->count = o->count + (int)A1 > o->max ? o->max : o->count + (int)A1;
+    WakeAllConditionVariable(&o->cv);
+    LeaveCriticalSection(&o->cs);
+}
+static int mq_peek(Obj *o, uint64_t out, DWORD ms) {  /* the first message, left in the queue */
+    int ok = 1;
+    EnterCriticalSection(&o->cs);
+    while (o->len == 0) {
+        if (!SleepConditionVariableCS(&o->cv, &o->cs, ms)) { ok = o->len > 0; break; }
+    }
+    if (ok) wr64(out, o->buf[o->head]);
+    LeaveCriticalSection(&o->cs);
+    return ok;
+}
+static void mq_peekwait(Ctx *c) { mq_peek(obj(A1), A0, INFINITE); }
+static void mq_trypeek(Ctx *c) { RET(mq_peek(obj(A1), A0, 0)); }
+static void mtx_is_mine(Ctx *c) { RET(os_mutex_owner(A0) == GetCurrentThreadId()); }
+/* TimerEvent: an event a host timer signals (first after `first`, then every `interval`; 0 = once) */
+static void CALLBACK timer_fire(void *key, BOOLEAN unused) { (void)unused; os_signal_event((uint64_t)(uintptr_t)key); }
+static void tev_init(Ctx *c) { os_init_event(A0, A1 == 1); obj(A0)->user = 0; }
+static void tev_stop(uint64_t key) {
+    Obj *o = obj(key);
+    if (o->user) { DeleteTimerQueueTimer(NULL, (HANDLE)(uintptr_t)o->user, INVALID_HANDLE_VALUE); o->user = 0; }
+}
+static void tev_start_periodic(Ctx *c) {              /* (event, TimeSpan first, TimeSpan interval) */
+    HANDLE t;
+    tev_stop(A0);
+    DWORD first = ns_to_ms((int64_t)A1), every = ns_to_ms((int64_t)A2);
+    if (CreateTimerQueueTimer(&t, NULL, timer_fire, (void *)(uintptr_t)A0, first, every ? every : 1, WT_EXECUTEDEFAULT)) obj(A0)->user = (uint64_t)(uintptr_t)t;
+}
+static void tev_finalize(Ctx *c) { tev_stop(A0); }
+
 /* ---------------------------------------------------------------- multi-wait (polling implementation) */
 static void mw_init(Ctx *c) { obj_reset(A0); }
 static void mw_holder_init(Ctx *c) { Obj *h = obj(A0); h->target = A1; h->user = 0; }
@@ -1060,6 +1096,19 @@ static const ImportDef thread_imports[] = {
     {OS("20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE"), ev_init}, {OS("18FinalizeLightEventEPNS0_14LightEventTypeE"), nothing},
     {OS("16SignalLightEventEPNS0_14LightEventTypeE"), ev_signal}, {OS("15ClearLightEventEPNS0_14LightEventTypeE"), ev_clear},
     {OS("14WaitLightEventEPNS0_14LightEventTypeE"), ev_wait},
+    {OS("19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"), ev_timedwait},
+    {OS("24InitializeLightSemaphoreEPNS0_18LightSemaphoreTypeEii"), sem_init}, {OS("22FinalizeLightSemaphoreEPNS0_18LightSemaphoreTypeE"), nothing},
+    {OS("21AcquireLightSemaphoreEPNS0_18LightSemaphoreTypeE"), sem_acquire}, {OS("21ReleaseLightSemaphoreEPNS0_18LightSemaphoreTypeE"), sem_release},
+    {OS("16ReleaseSemaphoreEPNS0_13SemaphoreTypeEi"), sem_release_n},
+    {OS("27InitializeLightMessageQueueEPNS0_21LightMessageQueueTypeEPmm"), mq_init}, {OS("25FinalizeLightMessageQueueEPNS0_21LightMessageQueueTypeE"), nothing},
+    {OS("21SendLightMessageQueueEPNS0_21LightMessageQueueTypeEm"), mq_send}, {OS("24TrySendLightMessageQueueEPNS0_21LightMessageQueueTypeEm"), mq_trysend},
+    {OS("20JamLightMessageQueueEPNS0_21LightMessageQueueTypeEm"), mq_jam}, {OS("23TryJamLightMessageQueueEPNS0_21LightMessageQueueTypeEm"), mq_tryjam},
+    {OS("24ReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE"), mq_receive}, {OS("27TryReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE"), mq_tryreceive},
+    {OS("21PeekLightMessageQueueEPmPKNS0_21LightMessageQueueTypeE"), mq_peekwait}, {OS("24TryPeekLightMessageQueueEPmPKNS0_21LightMessageQueueTypeE"), mq_trypeek},
+    {OS("28IsMutexLockedByCurrentThreadEPKNS0_9MutexTypeE"), mtx_is_mine},
+    {OS("20InitializeTimerEventEPNS0_14TimerEventTypeENS0_14EventClearModeE"), tev_init}, {OS("18FinalizeTimerEventEPNS0_14TimerEventTypeE"), tev_finalize},
+    {OS("23StartPeriodicTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanES3_"), tev_start_periodic}, {OS("14WaitTimerEventEPNS0_14TimerEventTypeE"), ev_wait},
+    {OS("21SetDyingMessageRegionEmm"), nothing},
     {OS("18DestroySystemEventEPNS0_15SystemEventTypeE"), nothing}, {OS("16ClearSystemEventEPNS0_15SystemEventTypeE"), ev_clear},
     {OS("18TryWaitSystemEventEPNS0_15SystemEventTypeE"), ev_trywait}, {OS("15WaitSystemEventEPNS0_15SystemEventTypeE"), ev_wait},
     {OS("20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE"), ev_timedwait},
