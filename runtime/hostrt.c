@@ -2,6 +2,7 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <windows.h>
 #include <psapi.h>                                  /* K32EnumProcessModules: module list of the crash report */
@@ -953,11 +954,36 @@ static void crash_file_report(EXCEPTION_POINTERS *ep) {
     fclose(f);
 }
 
+const char *guest_thread_name_of(DWORD tid);         /* os_threads.c */
+/* abort() (an assert, a CRT invalid parameter) ends the process with a fast fail (0xC0000409) that no exception filter sees:
+ * the SIGABRT handler runs first, so the log at least names the thread and the host call chain. */
+static void host_backtrace(const char *why) {
+    void *frames[32];
+    USHORT n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+    const char *tn = guest_thread_name_of(GetCurrentThreadId());
+    printf("\nHOST %s on thread %s; host call chain:", why, tn ? tn : "main thread (or a host thread)");
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE m = NULL;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m) && m) {
+            GetModuleFileNameA(m, name, MAX_PATH);
+            printf(" %s+0x%llx", base_name(name), (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)m));
+        } else printf(" %p", frames[i]);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+static void on_abort(int sig) { (void)sig; host_backtrace("ABORT (SIGABRT)"); }
+static void on_invalid_param(const wchar_t *expr, const wchar_t *fn, const wchar_t *file, unsigned line, uintptr_t r) {
+    (void)r;
+    printf("\nHOST CRT invalid parameter: %ls in %ls (%ls:%u)\n", expr ? expr : L"?", fn ? fn : L"?", file ? file : L"?", line);
+    host_backtrace("invalid parameter");
+}
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     static volatile LONG owner;                     /* one report and one dump: a second thread that faults meanwhile waits for the exit */
     LONG me = (LONG)GetCurrentThreadId(), was = InterlockedCompareExchange(&owner, me, 0);
-    if (was == me) TerminateProcess(GetCurrentProcess(), 4);      /* a fault inside the report itself ends the process */
+    if (was == me) { fflush(stdout); TerminateProcess(GetCurrentProcess(), 4); }      /* a fault inside the report itself ends the process */
     if (was) {                                      /* not for ever: this thread may hold a lock that the report needs */
         Sleep((minidump_mode() & MD_FULL ? DUMP_WAIT_FULL_MS : DUMP_WAIT_MS) + 15000);
         TerminateProcess(GetCurrentProcess(), 4);
@@ -969,6 +995,8 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
             GetModuleFileNameA(mod, mname, MAX_PATH);
         printf("\nHOST EXCEPTION 0x%08lx at host address %p (%s + 0x%llx)\n", er->ExceptionCode, er->ExceptionAddress, base_name(mname),
                mod ? (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)mod) : 0ull);
+        { const char *tn = guest_thread_name_of(GetCurrentThreadId()); printf("  on thread: %s\n", tn ? tn : "main thread (or a host thread)"); }
+        fflush(stdout);                             /* a log file keeps this even if the rest of the report faults */
     }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
@@ -977,6 +1005,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
         printf("  (the placeholder address of the run-time host function %d, %s, +%llu, used as data)\n", (int)((er->ExceptionInformation[1] - HOSTFN_BASE) / 16),
                g_hostfn[(er->ExceptionInformation[1] - HOSTFN_BASE) / 16].name, (unsigned long long)((er->ExceptionInformation[1] - HOSTFN_BASE) % 16));
     dump_guest_registers();
+    fflush(stdout);
     {   /* the first host stack words with their module offsets: a fault inside a small helper (rd64, an -O0 build's
          * accessors) is placed by its caller's return address, which is one of these */
         const uint64_t *s = (const uint64_t *)(uintptr_t)ep->ContextRecord->Rsp;
@@ -1196,6 +1225,9 @@ void runtime_init(const char *elf, const char *trace_path) {
     g_trace = fopen(trace_path, "w");
 #ifdef _WIN32
     SetUnhandledExceptionFilter(crash_filter);
+    signal(SIGABRT, on_abort);
+    _set_invalid_parameter_handler(on_invalid_param);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
     (void)minidump_mode();                          /* read SSBU_MINIDUMP now: the crash path should not have to */
 #else
     install_crash_handler();

@@ -25,6 +25,7 @@ static HICON g_icon_small, g_icon_big;                /* the title bar's small i
 #endif
 static volatile LONG g_ready;
 static volatile LONG64 g_frames;
+long long display_frame_count(void) { return g_frames; }   /* os_threads.c: the sampler's stall report */
 volatile LONG64 g_prof15_frame;                       /* presented frames, read by prof15.c (SSBU_PROF15, test only; included by boot.c) */
 void nvn_gl_start(void *hwnd);                        /* nvn_gl.c */
 void nvn_gl_report(FILE *out);

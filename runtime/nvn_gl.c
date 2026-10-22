@@ -186,6 +186,7 @@ GLF(X)
     X(void, TextureBarrier, (void)) \
     X(void, InvalidateFramebuffer, (GLenum, GLsizei, const GLenum *)) \
     X(void, FramebufferTextureLayer, (GLenum, GLenum, GLuint, GLint, GLint)) \
+    X(void, CopyImageSubData, (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei)) \
     X(void *, FenceSync, (GLenum, GLbitfield)) \
     X(GLenum, ClientWaitSync, (void *, GLbitfield, uint64_t)) \
     X(void, WaitSync, (void *, GLbitfield, uint64_t)) \
@@ -939,17 +940,19 @@ static GLuint sampler_gl(const SamplerParams *p) {
 }
 
 /* NVN texture handle (texture ID | sampler ID << 20, bit 32 set: dev_texture_handle, as [sdk 0x41bc80]) -> resident GL bindless handle. */
-static uint64_t resolve_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, uint32_t *dims, int *isint) {
+static int gputime_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOMO_GPUTIME"); v = e ? atoi(e) : 0; if (e && v <= 0) v = 30; } return v; }
+static int handle_lookup(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v, SamplerParams *p) {
     uint32_t tid = (uint32_t)nh & 0xfffff, sid = (uint32_t)(nh >> 20) & 0xfff;   /* real layout [sdk 0x41bc80]; DrawTexture splits it the same way [0x4382f0] */
-    Tex *t = NULL;
-    View v;
-    SamplerParams p;
     int have_sampler = 0;
-    if (!nh || !tp) return g_dummy_handle;
+    *t = NULL; memset(v, 0, sizeof *v); memset(p, 0, sizeof *p);
+    if (!nh || !tp) return 0;
     AcquireSRWLockShared(&g_pool_lock);
-    if (tid < (uint32_t)tp->count) { t = tp->e[tid].tex; v = tp->e[tid].view; }
-    if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { p = sp->e[sid]; have_sampler = 1; }
+    if (tid < (uint32_t)tp->count) { *t = tp->e[tid].tex; *v = tp->e[tid].view; }
+    if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { *p = sp->e[sid]; have_sampler = 1; }
     ReleaseSRWLockShared(&g_pool_lock);
+    return have_sampler;
+}
+static uint64_t handle_make(Tex *t, View v, SamplerParams p, int have_sampler, uint64_t nh, uint32_t *dims, int *isint) {
     if (!t || t->dead) return g_dummy_handle;
     tex_sync(t);
     TexObj *o = tex_view_obj(t, &v);
@@ -971,7 +974,20 @@ static uint64_t resolve_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, uint32
     o->h = realloc(o->h, sizeof *o->h * (size_t)(o->nh + 1));
     o->h[o->nh].smp = smp; o->h[o->nh++].h = h;
     g_st.handles++;
+    if (gputime_ms() && (t->b.target == 8 || t->b.target == 9 || (v.set & 0xa0) == 0xa0)) {     /* TOMO_GPUTIME: cube handles and target-changing views */
+        static int nlog;
+        logf_limited(&nlog, 60, "gputime: handle %llx (nvn %llx) = texture target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u, view set 0x%x target %d lvl %d+%d lay %d+%d format 0x%x -> gl %u%s, sampler %u\n",
+                     (unsigned long long)h, (unsigned long long)nh, t->b.target, t->b.format, t->b.width, t->b.height, t->b.depth, t->b.levels, (unsigned)t->b.flags, t->o.gl,
+                     v.set, v.target, v.lvl0, v.nlvl, v.lay0, v.nlay, v.format, o->gl, o->alias ? " (alias)" : "", smp);
+    }
     return h;
+}
+static uint64_t resolve_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, uint32_t *dims, int *isint) {
+    Tex *t;
+    View v;
+    SamplerParams p;
+    int have_sampler = handle_lookup(tp, sp, nh, &t, &v, &p);
+    return handle_make(t, v, p, have_sampler, nh, dims, isint);
 }
 /* The same lookup for nvnCommandBufferDrawTexture, which needs the OpenGL names: 0 = no live texture under that ID (resolve_handle
  * gives the 1x1 dummy there; a DrawTexture of it is reported instead). */
@@ -994,7 +1010,7 @@ static int resolve_names(TexPool *tp, SamplerPool *sp, uint64_t nh, GLuint *tex,
 }
 
 /* ---------------------------------------------------------------- framebuffers */
-typedef struct { GLuint color[8], depth; int n, dkind; } FboKey;
+typedef struct { GLuint color[8], depth; int n, dkind; int layer[8], level[8], dlayer, dlevel; } FboKey;   /* layer -1: the whole texture (or a view) */
 static struct { FboKey k; GLuint fbo; int w, h, used; } g_fbos[256];
 static int g_fbo_next;
 static void fbo_purge(GLuint tex) {
@@ -1005,6 +1021,7 @@ static void fbo_purge(GLuint tex) {
         if (hit) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].used = 0; }
     }
 }
+static int g_fbo_bad_last;                         /* set by fbo_get for an incomplete framebuffer: set_targets then names the textures */
 static GLuint fbo_get(const FboKey *k) {
     static int nlog;
     for (int i = 0; i < 256; i++) if (g_fbos[i].used && !memcmp(&g_fbos[i].k, k, sizeof *k)) return g_fbos[i].fbo;
@@ -1017,14 +1034,21 @@ static GLuint fbo_get(const FboKey *k) {
     glBindFramebuffer(GL_FRAMEBUFFER_, fbo);
     for (int i = 0; i < 8; i++) {
         bufs[i] = i < k->n && k->color[i] ? GL_COLOR_ATTACHMENT0_ + (GLenum)i : GL_NONE;
-        if (i < k->n && k->color[i]) glFramebufferTexture(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_ + (GLenum)i, k->color[i], 0);
+        if (i < k->n && k->color[i]) {
+            if (k->layer[i] >= 0) glFramebufferTextureLayer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_ + (GLenum)i, k->color[i], k->level[i], k->layer[i]);
+            else glFramebufferTexture(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_ + (GLenum)i, k->color[i], 0);
+        }
     }
-    if (k->depth) glFramebufferTexture(GL_FRAMEBUFFER_, k->dkind == 3 ? GL_DEPTH_STENCIL_ATTACHMENT_ : k->dkind == 2 ? GL_STENCIL_ATTACHMENT_ : GL_DEPTH_ATTACHMENT_, k->depth, 0);
+    if (k->depth) {
+        GLenum att = k->dkind == 3 ? GL_DEPTH_STENCIL_ATTACHMENT_ : k->dkind == 2 ? GL_STENCIL_ATTACHMENT_ : GL_DEPTH_ATTACHMENT_;
+        if (k->dlayer >= 0) glFramebufferTextureLayer(GL_FRAMEBUFFER_, att, k->depth, k->dlevel, k->dlayer);
+        else glFramebufferTexture(GL_FRAMEBUFFER_, att, k->depth, 0);
+    }
     glDrawBuffers(8, bufs);
     GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER_);
     g_st.fbo_made++;
     if (st != GL_FRAMEBUFFER_COMPLETE_) {
-        g_st.fbo_bad++;
+        g_st.fbo_bad++; g_fbo_bad_last = 1;
         logf_limited(&nlog, 20, "nvn_gl: framebuffer incomplete (status 0x%x): %d colour targets (first gl %u), depth gl %u kind %d\n", st, k->n, k->color[0], k->depth, k->dkind);
     }
     g_fbos[slot].k = *k; g_fbos[slot].fbo = fbo; g_fbos[slot].used = 1;
@@ -1690,7 +1714,7 @@ static void shd_workers_start(void) {
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
     if (g_shd_mode <= 0 || !g_shw_n || stage > 1 || code_len <= 0) return;
-    uint64_t h = sh_hash(0xcbf29ce484222325ULL ^ (uint64_t)stage, code, (size_t)code_len);
+    uint64_t h = sh_hash(0xcbf29ce484222325ULL ^ 0x20261022ULL ^ (uint64_t)stage, code, (size_t)code_len);
     if (cdata) h = sh_hash(h ^ cdata_size, cdata, cdata_size);
     if (!h) h = 1;
     ShJob *j = malloc(sizeof *j + (size_t)code_len + cdata_size);
@@ -1947,10 +1971,10 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     st->glsl = 0;
     memset(&in, 0, sizeof in);
     in.stage = s; in.code = st->code; in.code_len = st->code_len;
-    if (st->ctl[3] && st->ctl[4]) { in.cdata = st->code - 0x30 + st->ctl[4]; in.cdata_size = st->ctl[3]; }
+    if (st->cdata_copy) { in.cdata = st->cdata_copy; in.cdata_size = st->ctl[3]; }
     uint64_t h1 = 0, h0 = 0;
     if (!g_shc_off) {
-        h1 = sh_hash(0xcbf29ce484222325ULL ^ (uint64_t)s, st->code, (size_t)st->code_len);
+        h1 = sh_hash(0xcbf29ce484222325ULL ^ 0x20261022ULL ^ (uint64_t)s, st->code, (size_t)st->code_len);
         if (in.cdata) h1 = sh_hash(h1 ^ in.cdata_size, in.cdata, in.cdata_size);
         h0 = h1 ? h1 : 1;                           /* the workers' name for this stage (shd_prewarm) */
         h1 = sh_hash(h1, key, 16);
@@ -2218,7 +2242,7 @@ static struct {
     int sref[2], svmask[2], swmask[2], stencil_dirty;
     float alpha_ref; int alpha_func;
     int have_fbo, fbo_w, fbo_h; GLuint fbo;
-    Tex *color0, *color[8];
+    Tex *color0, *color[8], *depth_tex;
     int64_t row_stride, image_stride;
     int attr_enabled[16];
     uint8_t ms[24]; unsigned ms_ext;              /* the bound multisample state, and which of its extensions are on in OpenGL */
@@ -2255,18 +2279,110 @@ static void apply_chanmask(void) {
     for (unsigned i = 0; i < 8; i++) { unsigned m = S.chanmask >> (i * 4); glColorMaski(i, m & 1, (m >> 1) & 1, (m >> 2) & 1, (m >> 3) & 1); }
 }
 
+/* Feedback guard: a draw that samples, through a texture handle, the texture it renders to (the game draws each mip level of
+ * its cube map arrays from the previous one). In GL that is undefined, and here the NVIDIA driver hung the GPU (a TDR ended
+ * the process). The draw samples a copy of the texture instead, refreshed before every such draw. */
+static Tex *tex_scratch(Tex *t) {
+    static int nlog;
+    if (!gl_has(glCopyImageSubData, "glCopyImageSubData") || t->b.samples > 1 || !t->o.gl) return NULL;
+    if (!(t->b.target == 1 || t->b.target == 2 || t->b.target == 4 || t->b.target == 8 || t->b.target == 9)) return NULL;
+    if (!t->scratch) {
+        Tex *sc = calloc(1, sizeof *sc);
+        if (!sc) return NULL;
+        sc->b = t->b;
+        tex_realize(sc);
+        sc->gpu_written = 1; sc->uploaded = 1;
+        t->scratch = sc;
+        logf_limited(&nlog, 8, "nvn_gl: feedback guard: texture target %d %dx%dx%d format 0x%x levels %d is sampled by a draw into it: a copy is sampled\n",
+                     t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->glevels);
+    }
+    Tex *sc = t->scratch;
+    GLenum tg = gl_target(t->b.target, t->b.samples);
+    int layers = t->b.target == 2 ? 0 : tex_layers(&t->b);
+    for (int l = 0; l < t->glevels && l < sc->glevels; l++) {
+        int w = lvl(t->b.width, l), h = lvl(t->b.height, l), d = t->b.target == 2 ? lvl(t->b.depth, l) : layers;
+        glCopyImageSubData(t->o.gl, tg, l, 0, 0, 0, sc->o.gl, tg, l, 0, 0, 0, w, h, d);
+    }
+    return sc;
+}
+static uint64_t g_fb_saved[6][32];
+static uint32_t g_fb_mask[6];
+static int g_fb_active;
+static void feedback_restore(void) {
+    if (!g_fb_active) return;
+    for (int s = 0; s < 5; s++) {
+        if (!g_fb_mask[s]) continue;
+        for (unsigned u = 0; u < 32; u++) if (g_fb_mask[s] >> u & 1) S.gl_tex[s][4 + u] = g_fb_saved[s][u];
+        S.tex_dirty[s] = 1; g_fb_mask[s] = 0;
+    }
+    g_fb_active = 0;
+}
+static void feedback_guard(void) {
+    feedback_restore();
+    if (!S.have_fbo) return;
+    for (int s = 0; s < 5; s++) {
+        for (unsigned u = 0; u < 32; u++) {
+            uint64_t nh = S.nvn_tex[s][u];
+            Tex *t;
+            View v;
+            SamplerParams p;
+            if (!nh) continue;
+            int hs = handle_lookup(S.tpool, S.spool, nh, &t, &v, &p);
+            if (!t || t->dead) continue;
+            int hit = t == S.depth_tex;
+            for (int i = 0; i < 8 && !hit; i++) hit = t == S.color[i];
+            if (!hit) continue;
+            Tex *sc = tex_scratch(t);
+            if (!sc) continue;
+            uint32_t dims[4] = {0, 0, 0, 0};
+            int isint = 0;
+            g_fb_saved[s][u] = S.gl_tex[s][4 + u];
+            S.gl_tex[s][4 + u] = handle_make(sc, v, p, hs, nh, dims, &isint);
+            g_fb_mask[s] |= 1u << u; S.tex_dirty[s] = 1; g_fb_active = 1;
+        }
+    }
+}
+/* One layer of an array / cube / 3D texture as a render target is attached by layer from the texture itself
+ * (glFramebufferTextureLayer): a layered attachment next to the usual 2D depth target makes the framebuffer incomplete
+ * (GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS). A view that changes the format, or one of several layers, keeps the view path. */
+static int layered_rt(Tex *t, const View *v) {
+    int tg = t->b.target;
+    if (tg != 2 || t->b.samples > 1 || !t->o.gl) return 0;                     /* 3D textures only: arrays and cubes get a 2D view (rt_view) */
+    if ((v->set & 0x84) == 0x84 && v->format && v->format != t->b.format) return 0;
+    if ((v->set & 0x82) == 0x82 ? v->nlay > 1 : tex_layers(&t->b) > 1) return 0;
+    return gl_has(glFramebufferTextureLayer, "glFramebufferTextureLayer");
+}
+/* One layer of an array / cube texture as a render target: a 2D (1D) view of that level and layer, its own texture object. The
+ * game samples the whole cube map array while it draws its next mip level (a feedback loop in GL terms); drawn through the
+ * texture itself (glFramebufferTextureLayer) that hung the GPU in the driver (TDR), through a view it does not. */
+static TexObj *rt_view(Tex *t, const View *v) {
+    int tg = t->b.target;
+    if (!(tg == 3 || tg == 4 || tg == 8 || tg == 9) || t->b.samples > 1) return tex_view_obj(t, v);
+    if ((v->set & 0x82) == 0x82 ? v->nlay > 1 : tex_layers(&t->b) > 1) return tex_view_obj(t, v);      /* layered rendering */
+    View v2 = *v;
+    v2.set = (uint8_t)(0x80 | 1 | 2 | 32 | ((v->set & 0x84) == 0x84 ? 4 : 0));
+    v2.target = tg == 3 ? 0 : 1;
+    v2.lvl0 = (int16_t)((v->set & 0x81) == 0x81 ? v->lvl0 : 0); v2.nlvl = 1;
+    v2.lay0 = (int16_t)((v->set & 0x82) == 0x82 ? v->lay0 : 0); v2.nlay = 1;
+    return tex_view_obj(t, &v2);
+}
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
     Fmt f;
     memset(&k, 0, sizeof k);
-    S.have_fbo = 0; S.color0 = NULL; S.fbo_w = S.fbo_h = 0;
+    S.have_fbo = 0; S.color0 = NULL; S.depth_tex = NULL; S.fbo_w = S.fbo_h = 0;
     memset(S.color, 0, sizeof S.color);
     for (int i = 0; i < n && i < 8; i++) {
         Tex *t = col[i].tex;
         if (!t || t->dead) continue;
         tex_sync(t);
         t->gpu_written = 1;
-        k.color[i] = tex_view_obj(t, &col[i].view)->gl;
+        k.layer[i] = -1;
+        if (layered_rt(t, &col[i].view)) {
+            k.color[i] = t->o.gl;
+            k.layer[i] = (col[i].view.set & 0x82) == 0x82 ? col[i].view.lay0 : 0;
+            k.level[i] = (col[i].view.set & 0x81) == 0x81 ? col[i].view.lvl0 : 0;
+        } else k.color[i] = rt_view(t, &col[i].view)->gl;
         k.n = i + 1;
         if (!S.fbo_w) { int l = (col[i].view.set & 0x81) == 0x81 ? col[i].view.lvl0 : 0; S.fbo_w = lvl(t->b.width, l); S.fbo_h = lvl(t->b.height, l); }
         if (i == 0) S.color0 = t;
@@ -2274,14 +2390,28 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     }
     if (depth && depth->tex && !depth->tex->dead) {
         Tex *t = depth->tex;
+        S.depth_tex = t;
         tex_sync(t);
         t->gpu_written = 1;
-        k.depth = tex_view_obj(t, &depth->view)->gl;
+        k.dlayer = -1;
+        if (layered_rt(t, &depth->view)) {
+            k.depth = t->o.gl;
+            k.dlayer = (depth->view.set & 0x82) == 0x82 ? depth->view.lay0 : 0;
+            k.dlevel = (depth->view.set & 0x81) == 0x81 ? depth->view.lvl0 : 0;
+        } else k.depth = rt_view(t, &depth->view)->gl;
         k.dkind = fmt_get(t->b.format, &f) ? f.kind : 1;
         if (!S.fbo_w) { S.fbo_w = t->b.width; S.fbo_h = t->b.height; }
     }
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
+    g_fbo_bad_last = 0;
     S.fbo = fbo_get(&k);
+    if (g_fbo_bad_last) {
+        static int nlog;
+        for (int i = 0; i < k.n; i++) if (S.color[i]) logf_limited(&nlog, 40, "nvn_gl:   colour %d: texture target %d format 0x%x %dx%d levels %d samples %d flags 0x%x gl %u\n", i,
+            S.color[i]->b.target, S.color[i]->b.format, S.color[i]->b.width, S.color[i]->b.height, S.color[i]->b.levels, S.color[i]->b.samples, S.color[i]->b.flags, k.color[i]);
+        if (depth && depth->tex) logf_limited(&nlog, 40, "nvn_gl:   depth: texture target %d format 0x%x %dx%d levels %d samples %d flags 0x%x gl %u (view set 0x%x)\n",
+            depth->tex->b.target, depth->tex->b.format, depth->tex->b.width, depth->tex->b.height, depth->tex->b.levels, depth->tex->b.samples, depth->tex->b.flags, k.depth, depth->view.set);
+    }
     S.have_fbo = 1;
     glBindFramebuffer(GL_FRAMEBUFFER_, S.fbo);
 }
@@ -2406,7 +2536,15 @@ static int draw_prepare(void) {
                 Range r = {0, 0};
                 if (!(st->glsl_cbufs >> n & 1)) continue;
                 if (n == 2) { bind_handle_table(s, GL_SHADER_STORAGE_BUFFER_, (GLuint)s * 20 + n, 0); continue; }
-                if (n == 1) { r.addr = (uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]); r.size = st->ctl[3]; } else r = S.ubo[s][n - 3];
+                if (n == 1) { r.addr = (uint64_t)(uintptr_t)st->cdata_copy; r.size = st->cdata_copy ? st->ctl[3] : 0; } else r = S.ubo[s][n - 3];
+                if (n == 1 && gputime_ms() && !st->c1_logged) {       /* TOMO_GPUTIME: the shader's own constants (jump tables) as bound */
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)r.addr;
+                    st->c1_logged = 1;
+                    printf("gputime: program #%d stage %d constant buffer 1: ctl[3]=%u ctl[4]=%u at %p (code %p): %08x %08x %08x %08x %08x %08x %08x %08x\n", S.prog[s]->serial, s,
+                           st->ctl[3], st->ctl[4], (void *)(uintptr_t)r.addr, (void *)st->code, r.size >= 4 ? w[0] : 0, r.size >= 8 ? w[1] : 0, r.size >= 12 ? w[2] : 0,
+                           r.size >= 16 ? w[3] : 0, r.size >= 20 ? w[4] : 0, r.size >= 24 ? w[5] : 0, r.size >= 28 ? w[6] : 0, r.size >= 32 ? w[7] : 0);
+                    fflush(stdout);
+                }
                 if (r.addr && r.size) {
                     size_t off = arena_put(r.addr, r.size);
                     glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, (GLuint)s * 20 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
@@ -2655,7 +2793,7 @@ static int stage_glsl_compute(Prog *p) {
     if (st->glsl) { glDeleteProgram(st->glsl); st->glsl = 0; }
     memset(&in, 0, sizeof in);
     in.stage = MX_COMPUTE; in.code = st->code; in.code_len = st->code_len;
-    if (st->ctl[3] && st->ctl[4]) { in.cdata = st->code + st->ctl[4]; in.cdata_size = st->ctl[3]; }
+    if (st->cdata_copy) { in.cdata = st->cdata_copy; in.cdata_size = st->ctl[3]; }
     in.int_tex = S.tex_int[5]; in.sint_tex = S.tex_sint[5];
     in.binding_base = 0; in.ssbo_base = 40;        /* the bindings of the vertex stage: every draw and every dispatch binds what it uses */
     memcpy(in.local_size, st->local, sizeof in.local_size);
@@ -2722,7 +2860,7 @@ static void compute_bind_glsl(Prog *p) {
         if (!(st->glsl_cbufs >> n & 1)) continue;
         if (n == 0) { logf_limited(&nlog, 10, "nvn_gl: compute program #%d reads the driver's constant buffer 0 outside the storage buffer descriptors: not provided\n", p->serial); continue; }
         if (n == 2) { bind_handle_table(5, GL_SHADER_STORAGE_BUFFER_, n, 0); continue; }
-        if (n == 1) { r.addr = (uint64_t)(uintptr_t)(st->code + st->ctl[4]); r.size = st->ctl[3]; } else r = S.ubo[5][n - 3];
+        if (n == 1) { r.addr = (uint64_t)(uintptr_t)st->cdata_copy; r.size = st->cdata_copy ? st->ctl[3] : 0; } else r = S.ubo[5][n - 3];
         if (r.addr && r.size) {
             size_t off = arena_put(r.addr, r.size);
             glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
@@ -3029,10 +3167,61 @@ static void hitch_draw(LONG64 t0) {
     printf("hitch-draw: frame %lld %.1f ms, programs vs %u fs %u, %s | so far: %lld pairs, slow first draws %lld (%.0f ms), slow later draws %lld (%.0f ms)%c", (long long)g_st.frames + 1, ms, g_gs_last_prog[0],
            g_gs_last_prog[1], first ? "FIRST draw with this pair" : "pair drawn before", (long long)n_first, (long long)n_first_slow, ms_first, (long long)n_old_slow, ms_old, 10);
 }
+/* TOMO_GPUTIME=<ms> (diagnosis, slow): every draw / dispatch is finished on the GPU at once and timed; one over the limit is
+ * named with its programs and counts (a GPU hang of 2 s ends the process by a driver reset, so this finds the command). */
+static void gputime_note(const Cmd *m);
+static void gputime_check(const Cmd *m, LONG64 t0) {
+    static LARGE_INTEGER fq;
+    static int nlog;
+    if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+    glFinish();
+    gputime_note(NULL);                              /* marks the record: everything before this line is done on the GPU */
+    double ms = (double)(pf_now() - t0) * 1000.0 / (double)fq.QuadPart;
+    if (ms < gputime_ms()) return;
+    char progs[128] = "";
+    for (int i = 0; i < 6; i++) if (S.prog[i]) { char b[24]; snprintf(b, sizeof b, " s%d#%d", i, S.prog[i]->serial); strncat(progs, b, sizeof progs - strlen(progs) - 1); }
+    logf_limited(&nlog, 40, "gputime: %s took %.0f ms (frame %lld): a0=%llx a1=%llx a2=%llx a3=%llx a4=%llx a5=%llx a6=%llx; programs%s\n", g_cur_op, ms, (long long)g_st.frames,
+                 (unsigned long long)m->a[0], (unsigned long long)m->a[1], (unsigned long long)m->a[2], (unsigned long long)m->a[3], (unsigned long long)m->a[4],
+                 (unsigned long long)m->a[5], (unsigned long long)m->a[6], progs);
+}
+/* The last 8 timed commands go to gputime_last.txt through a file mapping before they run: a GPU hang ends the process
+ * (driver reset) before anything can be logged after the command, but the mapped pages survive the process. */
+static void gputime_note(const Cmd *m) {
+    static char *map;
+    static unsigned n;
+    if (!map) {
+        HANDLE f = CreateFileA("gputime_last.txt", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE sec = f != INVALID_HANDLE_VALUE ? CreateFileMappingA(f, NULL, PAGE_READWRITE, 0, 256 * 256, NULL) : NULL;
+        map = sec ? MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 256 * 256) : NULL;
+        if (!map) { printf("gputime: no gputime_last.txt mapping (error %lu)\n", GetLastError()); map = (char *)1; return; }
+        memset(map, ' ', 256 * 256);
+    }
+    if (map == (char *)1) return;
+    if (!m) { char *sl = map + (n % 256) * 256; int k = snprintf(sl, 255, "#%u ---- finished on the GPU ----\n", n); if (k > 0 && k < 255) memset(sl + k, ' ', 255 - k); n++; return; }
+    char progs[128] = "";
+    for (int i = 0; i < 6; i++) if (S.prog[i]) { char b[24]; snprintf(b, sizeof b, " s%d#%d", i, S.prog[i]->serial); strncat(progs, b, sizeof progs - strlen(progs) - 1); }
+    char *slot = map + (n % 256) * 256;
+    uint64_t fh0 = S.gl_tex[1][4], fh1 = S.nvn_tex[1][0];
+    int k = snprintf(slot, 255, "#%u frame %lld %s a0=%llx a1=%llx a2=%llx a3=%llx a4=%llx a5=%llx a6=%llx programs%s fbo %dx%d frag handles %llx %llx\n", n, (long long)g_st.frames, g_cur_op,
+                     (unsigned long long)m->a[0], (unsigned long long)m->a[1], (unsigned long long)m->a[2], (unsigned long long)m->a[3], (unsigned long long)m->a[4],
+                     (unsigned long long)m->a[5], (unsigned long long)m->a[6], progs, S.fbo_w, S.fbo_h, (unsigned long long)fh0, (unsigned long long)fh1);
+    if (k > 0 && k < 255) memset(slot + k, ' ', 255 - k);
+    n++;
+}
 static void exec(const Cmd *m, int depth) {
     const uint8_t *blob = BLOB(m);
     const uint64_t *a = m->a;
     g_cur_op = k_op_name[m->op < OP_COUNT ? m->op : 0];
+    /* TOMO_GPUTIME_EVERY=<n>: only every n-th draw / dispatch is finished and timed (the others run pipelined, as without the
+     * diagnostic); the last commands are noted for the record either way */
+    static int every = -1;
+    static unsigned nth;
+    if (every < 0) { const char *e = getenv("TOMO_GPUTIME_EVERY"); every = e ? atoi(e) : 0; }
+    int noted = gputime_ms() != 0 && m->op != OP_CALL;
+    int isdraw = m->op == OP_DRAW_ARRAYS || m->op == OP_DRAW_ELEMENTS || m->op == OP_DRAW_INDIRECT || m->op == OP_DISPATCH || m->op == OP_DISPATCH_INDIRECT;
+    int timed = noted && (every ? isdraw && ++nth % (unsigned)every == 0 : 1);
+    LONG64 gt0 = timed ? pf_now() : 0;
+    if (noted) gputime_note(m);
     if (g_cbuf_live && (m->op == OP_COPY_BUF_TEX || m->op == OP_COPY_BUF_BUF || m->op == OP_UPDATE_UBO || m->op == OP_CLEAR_BUF || m->op == OP_COPY_TEX_BUF)) compute_flush();
     switch (m->op) {
     case OP_DEFERRED: {                        /* NVN 55 Bind*Deferred: the array is read now, when the commands run (a[5] = bind op, a[6] = element size) */
@@ -3211,6 +3400,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_DRAW_ARRAYS: {
         LONG64 pf0 = pf_now();
         int ok;
+        feedback_guard();
         { HS_IN("draw state (pipeline, bindings)", 0); ok = draw_prepare(); HS_OUT(); }
         pf_add(PF_PREP, pf0);
         if (g_draw_tag) dt_line("gl", g_draw_tag, g_dt_idx++, ok, (unsigned)a[0], -1, (int)a[2], 0, (long long)a[1], (unsigned)a[3], (unsigned)a[4], S.prog, S.nattr, S.vattr, S.vbuf, (const uint32_t *)S.vstream, S.ubo, S.ssbo, dt_host);
@@ -3221,6 +3411,7 @@ static void exec(const Cmd *m, int depth) {
         pf0 = pf_now();
         g_fd_prim = (unsigned)a[0]; g_fd_count = (unsigned)a[2];
         { HS_IN("draw call (driver)", 0); glDrawArraysInstancedBaseInstance(nvn_prim((unsigned)a[0]), (GLint)a[1], (GLsizei)a[2], (GLsizei)a[4], (GLuint)a[3]); HS_OUT(); }
+        feedback_restore();
         pf_add(PF_DRAWCALL, pf0);
         if (g_hitch_ms) hitch_draw(pf0);
         drawlog_end();
@@ -3234,6 +3425,7 @@ static void exec(const Cmd *m, int depth) {
         int count = (int)a[2];
         LONG64 pf0 = pf_now();
         int ok;
+        feedback_guard();
         { HS_IN("draw state (pipeline, bindings)", 0); ok = count > 0 && a[3] && draw_prepare(); HS_OUT(); }
         if (g_draw_tag) dt_line("gl", g_draw_tag, g_dt_idx++, ok, (unsigned)a[0], (int)t, count, a[3], (long long)(int32_t)a[4], (unsigned)a[5], (unsigned)a[6], S.prog, S.nattr, S.vattr, S.vbuf, (const uint32_t *)S.vstream, S.ubo, S.ssbo, dt_host);
         if (!ok) { pf_add(PF_PREP, pf0); g_st.draws_skipped++; g_frame_skipped++; break; }
@@ -3247,6 +3439,7 @@ static void exec(const Cmd *m, int depth) {
         pf0 = pf_now();
         g_fd_prim = (unsigned)a[0]; g_fd_count = (unsigned)count;
         { HS_IN("draw call (driver)", 0); glDrawElementsInstancedBaseVertexBaseInstance(nvn_prim((unsigned)a[0]), count, itype[t], (const void *)off, (GLsizei)a[6], (GLint)a[4], (GLuint)a[5]); HS_OUT(); }
+        feedback_restore();
         pf_add(PF_DRAWCALL, pf0);
         if (g_hitch_ms) hitch_draw(pf0);
         drawlog_end();
@@ -3412,6 +3605,7 @@ static void exec(const Cmd *m, int depth) {
             uint32_t d[5];                     /* arrays: count, instances, first, base instance; elements: count, instances, first index, base vertex, base instance */
             memcpy(d, P(a[3] + (uint64_t)k * stride), elements ? 20 : 16);
             if (!d[0] || !d[1]) continue;
+            feedback_guard();
             if (!draw_prepare()) { g_st.draws_skipped++; g_frame_skipped++; continue; }
             if (elements) {
                 if (!a[2]) continue;
@@ -3419,6 +3613,7 @@ static void exec(const Cmd *m, int depth) {
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER_, g_arena);
                 glDrawElementsInstancedBaseVertexBaseInstance(nvn_prim((unsigned)a[0]), (GLsizei)d[0], itype[t], (const void *)off, (GLsizei)d[1], (GLint)d[3], d[4]);
             } else glDrawArraysInstancedBaseInstance(nvn_prim((unsigned)a[0]), (GLint)d[2], (GLsizei)d[0], (GLsizei)d[1], d[3]);
+            feedback_restore();
             g_st.draws++; g_frame_draws++; count_dummy_samples();
         }
         break;
@@ -3491,6 +3686,7 @@ static void exec(const Cmd *m, int depth) {
         for (int i = 0; i < (int)a[0]; i++) { uint64_t h; memcpy(&h, blob + i * 8, 8); if (depth < 8) replay(h, depth + 1); }
         break;
     }
+    if (timed) gputime_check(m, gt0);
     if (g_debug) {
         static int nlog;
         GLenum e = glGetError();
@@ -4085,14 +4281,14 @@ static int pw_queue_prog(Prog *p) {
     if (!(v->code && v->code_len > 0 && v->glsl_state == 0) || p->st[2].state || p->st[3].state || p->st[4].state) return 0;
     int has_f = f->code && f->code_len > 0 && f->glsl_state == 0;
     if (f->state && !has_f) return 0;
-    uint32_t vc = v->ctl[3] && v->ctl[4] ? v->ctl[3] : 0, fc = has_f && f->ctl[3] && f->ctl[4] ? f->ctl[3] : 0;
+    uint32_t vc = v->cdata_copy ? v->ctl[3] : 0, fc = has_f && f->cdata_copy ? f->ctl[3] : 0;
     size_t need = (size_t)v->code_len + vc + (has_f ? (size_t)f->code_len + fc : 0);
     ShJob *j = calloc(1, sizeof *j + need);
     uint8_t *d = j->data;
     j->stage = 3; j->code_len = v->code_len; j->cdata_size = vc; j->key[0] = has_f ? (uint32_t)f->code_len : 0; j->key[1] = fc;
     memcpy(d, v->code, (size_t)v->code_len); d += v->code_len;
-    if (vc) { memcpy(d, v->code - 0x30 + v->ctl[4], vc); d += vc; }
-    if (has_f) { memcpy(d, f->code, (size_t)f->code_len); d += f->code_len; if (fc) memcpy(d, f->code - 0x30 + f->ctl[4], fc); }
+    if (vc) { memcpy(d, v->cdata_copy, vc); d += vc; }
+    if (has_f) { memcpy(d, f->code, (size_t)f->code_len); d += f->code_len; if (fc) memcpy(d, f->cdata_copy, fc); }
     uint64_t h = sh_hash(0x5041495257ULL ^ (uint64_t)j->code_len ^ ((uint64_t)j->key[0] << 32), j->data, need);
     if (!h) h = 1;
     memcpy(&j->key[2], &h, 8);
@@ -4116,6 +4312,16 @@ static int pw_queue_prog(Prog *p) {
  * container when it sets the container up (loading), long before it makes the first program of it: the Vulkan back end
  * scans the container then (nvn_vk_m4.c). */
 void nvn_front_pool_made(uint64_t memory, uint64_t size) { if (g_rb == &rb_vk && memory && size >= 0x40 && (memory >> 28) != 0x710 && rd32(memory) == 0x12345678u) nvn_vk_container_seen(memory, memory); }      /* such a pool begins with the code section of a stage (its magic); a search below every other pool cost 0.2 s each (measured) */
+/* The constant block of a stage (ctl[3] bytes at ctl[4] of the shader data: the compiler's constants and BRX jump tables)
+ * is copied when the program is set: the game reuses that memory afterwards (program #5401's jump table read as zeros at
+ * draw time, and its vertex shader looped for ever: a GPU reset ended the process). */
+static void stage_keep_cdata(Stage *st, int compute) {
+    free(st->cdata_copy);
+    st->cdata_copy = NULL;
+    if (!st->code || !st->ctl[3] || !st->ctl[4] || st->ctl[3] > (1u << 20)) return;
+    st->cdata_copy = malloc(st->ctl[3]);
+    if (st->cdata_copy) memcpy(st->cdata_copy, (compute ? st->code : st->code - 0x30) + st->ctl[4], st->ctl[3]);
+}
 /* nvnProgramSetShaders(program, count, const NVNshaderData *): { u64 data (GPU address), const void *control }.
  * control: magic 0x98761234, offset of the NV_gpu_program5 text at +0x14, its length at +0x18. */
 __declspec(thread) long long nvn_setsh_part[8];
@@ -4171,7 +4377,7 @@ static void prog_set_shaders_(Ctx *c) {
             prog_add_stage(p, P(control + rd32(control + 0x14)), (int)rd32(control + 0x18), p->serial);
             if (data && rd32(data) == 0x12345678u) {                  /* the machine code is there as well */
                 int s2 = stage_of_type[(rd32(data + 0x30) >> 10) & 15], len2 = (int)rd32(control + 0x6f8);
-                if (s2 >= 0 && s2 < 2 && p->st[s2].state == 1 && len2 > 0 && len2 < (4 << 20)) { p->st[s2].code = P(data + 0x30); p->st[s2].code_len = len2; p->st[s2].glsl_state = 0; memcpy(p->st[s2].ctl, P(control + 0x6f0), 32); }
+                if (s2 >= 0 && s2 < 2 && p->st[s2].state == 1 && len2 > 0 && len2 < (4 << 20)) { p->st[s2].code = P(data + 0x30); p->st[s2].code_len = len2; p->st[s2].glsl_state = 0; memcpy(p->st[s2].ctl, P(control + 0x6f0), 32); stage_keep_cdata(&p->st[s2], 0); }
             }
             /* V1 M3: a compute program with assembly text (the five built into the exe) also carries its machine code; the
              * Vulkan back end runs that (no NV assembly there), OpenGL only with SSBU_COMPUTE_MC=1 (translator check). */
@@ -4182,7 +4388,7 @@ static void prog_set_shaders_(Ctx *c) {
                              rd32(data), rd32(data + 4), rd32(data + 8), rd32(data + 12), rd32(control + 0x748), rd32(control + 0x74c), rd32(control + 0x750));
                 for (int k = 0; k < 3; k++) p->st[5].local[k] = rd32(control + 0x748 + (uint64_t)k * 4);
                 p->st[5].smem_bytes = rd32(control + 0x754); p->st[5].lmem_bytes = rd32(control + 0x758);
-                if (len > 0 && len < (4 << 20)) { p->st[5].code = P(data); p->st[5].code_len = len; p->st[5].glsl_state = 0; memcpy(p->st[5].ctl, P(control + 0x6f0), 32); }
+                if (len > 0 && len < (4 << 20)) { p->st[5].code = P(data); p->st[5].code_len = len; p->st[5].glsl_state = 0; memcpy(p->st[5].ctl, P(control + 0x6f0), 32); stage_keep_cdata(&p->st[5], 1); }
             }
             continue;
         }
@@ -4197,20 +4403,31 @@ static void prog_set_shaders_(Ctx *c) {
                          rd32(data), rd32(data + 4), rd32(data + 8), rd32(data + 12), rd32(data + 0x30), rd32(data + 0x34), rd32(data + 0x38), rd32(data + 0x3c));
             for (int k = 0; k < 3; k++) p->st[5].local[k] = rd32(control + 0x748 + (uint64_t)k * 4);      /* work group size */
             p->st[5].smem_bytes = rd32(control + 0x754); p->st[5].lmem_bytes = rd32(control + 0x758);
-            if (len > 0 && len < (4 << 20)) { p->st[5].code = P(data); p->st[5].code_len = len; p->st[5].state = 4; p->st[5].dumped = 0; p->st[5].glsl_state = 0; memcpy(p->st[5].ctl, P(control + 0x6f0), 32); }
+            if (len > 0 && len < (4 << 20)) { p->st[5].code = P(data); p->st[5].code_len = len; p->st[5].state = 4; p->st[5].dumped = 0; p->st[5].glsl_state = 0; memcpy(p->st[5].ctl, P(control + 0x6f0), 32); stage_keep_cdata(&p->st[5], 1); }
             continue;
         }
         if (!data || rd32(data) != 0x12345678u) { logf_limited(&nlog2, 10, "nvn_gl: program #%d shader %d: no text and no recognisable code section\n", p->serial, i); continue; }
         int s = stage_of_type[(rd32(data + 0x30) >> 10) & 15], len = (int)rd32(control + 0x6f8);
         if (s < 0 || len <= 0 || len > (4 << 20)) { logf_limited(&nlog2, 10, "nvn_gl: program #%d shader %d: unexpected program header %08x, code size %d\n", p->serial, i, rd32(data + 0x30), len); continue; }
-        p->st[s].code = P(data + 0x30); p->st[s].code_len = len; p->st[s].state = 4; p->st[s].dumped = 0; p->st[s].glsl_state = 0; memcpy(p->st[s].ctl, P(control + 0x6f0), 32);
+        p->st[s].code = P(data + 0x30); p->st[s].code_len = len; p->st[s].state = 4; p->st[s].dumped = 0; p->st[s].glsl_state = 0; memcpy(p->st[s].ctl, P(control + 0x6f0), 32); stage_keep_cdata(&p->st[s], 0);
     }
     if (g_rb == &rb_vk) { LONG64 tb = pf_now(); nvn_vk_program_set(p); nvn_setsh_part[4] += pf_now() - tb; RET(1); return; }       /* V1 M4: the stages go to the Vulkan workers at once (nvn_vk_m4.c) */
+    if (gputime_ms()) for (int s = 0; s < 2; s++) {      /* TOMO_GPUTIME: where a stage's constant data (jump tables) lies in the shader data */
+        Stage *st = &p->st[s];
+        static int nlog;
+        if (!st->code || st->ctl[3] < 16 || !st->ctl[4] || p->serial < 5380) continue;   /* only stages with a table-sized constant block */
+        const uint32_t *d = (const uint32_t *)(st->code - 0x30), *cd = (const uint32_t *)(st->code - 0x30 + st->ctl[4]);
+        logf_limited(&nlog, 60, "gputime: program #%d stage %d set: code %p len %d ctl %u %u %u %u %u %u %u %u; data+ctl[4] (%u): %08x %08x %08x %08x %08x %08x; data+0x30+len: %08x %08x %08x %08x %08x %08x\n",
+                     p->serial, s, (void *)st->code, st->code_len, st->ctl[0], st->ctl[1], st->ctl[2], st->ctl[3], st->ctl[4], st->ctl[5], st->ctl[6], st->ctl[7], st->ctl[4],
+                     cd[0], cd[1], cd[2], cd[3], cd[4], cd[5], d[(0x30 + st->code_len) / 4], d[(0x30 + st->code_len) / 4 + 1], d[(0x30 + st->code_len) / 4 + 2],
+                     d[(0x30 + st->code_len) / 4 + 3], d[(0x30 + st->code_len) / 4 + 4], d[(0x30 + st->code_len) / 4 + 5]);
+        fflush(stdout);
+    }
     if (!pw_queue_prog(p))
     for (int s = 0; s < 2; s++) {              /* P3: have the driver's binary ready before the first draw */
         Stage *st = &p->st[s];
         if (st->code && st->code_len > 0 && st->glsl_state == 0)
-            shd_prewarm(s, st->code, st->code_len, st->ctl[3] && st->ctl[4] ? st->code - 0x30 + st->ctl[4] : NULL, st->ctl[3]);
+            shd_prewarm(s, st->code, st->code_len, st->cdata_copy, st->cdata_copy ? st->ctl[3] : 0);
     }
     RET(1);
 }

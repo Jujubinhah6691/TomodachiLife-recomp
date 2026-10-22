@@ -333,6 +333,7 @@ static void tex_store_pair(Mx *e, unsigned mask, unsigned rd0, unsigned rd1, int
 static const char *tv_decl(int is_int, int sint) { return is_int ? (sint ? "ivec4 tv = " : "uvec4 tv = ") : "vec4 tv = "; }
 
 /* TEX (bound): coords at Ra, then [lod/bias] [offset] [dref] from Rb */
+static int brx_targets(Mx *e, unsigned pc, uint64_t i, unsigned *out, int max);
 static void op_tex(Mx *e, uint64_t i) {
     unsigned t = MXB(i, 28, 3), mask = MXB(i, 31, 4), dc = MXB(i, 50, 1), aoffi = MXB(i, 54, 1), blod = MXB(i, 55, 3), meta = MXB(i, 20, 8);
     int unit = tex_unit(e, i), dim;
@@ -1327,7 +1328,19 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
          * outputs at their defaults. Found 2026-10-09 (bounded round): the layout shader's "window frame" texture
          * coordinate table (13 entries) has entries on scheduling words; frame kind 12 = the body of the header pill of the
          * stage select screen left the stage with texture coordinate (0,0) = a transparent texel. */
-        emit(e, "if (%s) { pc = (%uu + %s + 0x%08xu) >> 3; if ((pc & 3u) == 0u) pc++; continue; }", FLOW(e, MXB(i, 0, 5)), pc * 8 + 8, A8, (uint32_t)off);
+        /* A jump to a word that is no table target (the table read at run time differs from the one the translation saw)
+         * would loop for ever in the dispatcher (pc 1 again): the GPU hung for 2 s and the driver reset ended the process
+         * (Tomodachi Life #5401, the cube map mip chain). Such a jump ends the stage instead. */
+        {
+            unsigned tg[64];
+            int n = brx_targets(e, pc, i, tg, 64);
+            char guard[1024];
+            size_t gl = 0;
+            guard[0] = 0;
+            for (int k = 0; k < n && gl < sizeof guard - 32; k++) gl += (size_t)snprintf(guard + gl, sizeof guard - gl, "%spc == %uu", k ? " || " : "", tg[k]);
+            emit(e, "if (%s) { pc = (%uu + %s + 0x%08xu) >> 3; if ((pc & 3u) == 0u) pc++; %s%s%s continue; }", FLOW(e, MXB(i, 0, 5)), pc * 8 + 8, A8, (uint32_t)off,
+                 n > 0 ? "if (!(" : "", guard, n > 0 ? ")) return;" : "");
+        }
         break;
     }
     case MXOP_EXIT:

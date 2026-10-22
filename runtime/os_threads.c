@@ -32,6 +32,7 @@ typedef struct Obj {
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
     int signaled, autoclear;                 /* events */
+    unsigned gen;                            /* events: bumped by every signal, so a Signal+Clear pair still releases the waiters */
     int count, max;                          /* semaphores */
     uint64_t *buf, cap, len, head;           /* message queues */
     HANDLE thread;                           /* threads */
@@ -238,10 +239,28 @@ static volatile LONG g_threads_n;
 static struct { uint64_t fn[SMP_FN]; unsigned n[SMP_FN]; } g_smp[64];
 static Ctx *g_smp_main;                              /* boot.c: the main thread's context (slot 63) */
 void os_sample_main(Ctx *c) { g_smp_main = c; }
+static void sample_report(FILE *out);
+void dump_guest_threads(FILE *out);
+void os_wait_report(FILE *out);
+long long display_frame_count(void);
 static DWORD WINAPI sampler(LPVOID arg) {
     (void)arg;
-    for (;;) {
+    long long last_frames = 0; ULONGLONG last_change = GetTickCount64(); int reported = 0;
+    for (unsigned it = 0;; it++) {
         Sleep(1);
+        if (it % 100 == 0) {                          /* TOMO_SAMPLE also reports a stall: 3 s without a present after the first */
+            long long f = display_frame_count();
+            if (f != last_frames) { last_frames = f; last_change = GetTickCount64(); reported = 0; }
+            else if (f && !reported && GetTickCount64() - last_change > 3000) {
+                reported = 1;
+                printf("\nsample: no present for 3 s after frame %lld: where the threads are\n", f);
+                dump_guest_threads(stdout);
+                os_wait_report(stdout);
+                if (g_smp_main) printf("    main thread: f_%llx lr=%llx %s x0=%llx\n", (unsigned long long)g_smp_main->fn, (unsigned long long)g_smp_main->x[30],
+                                       g_smp_main->in_import ? g_smp_main->in_import : "(guest code)", (unsigned long long)g_smp_main->x[0]);
+                fflush(stdout);
+            }
+        }
         for (int i = 0; i < 64; i++) {
             Ctx *c = i == 63 ? g_smp_main : i < g_threads_n ? g_threads[i].c : NULL;
             if (!c || c->in_import) continue;
@@ -288,8 +307,7 @@ void dump_guest_threads(FILE *out) {
     }
 }
 
-#ifndef _WIN32
-/* Freeze report (nvn_vk_wd.c): every guest thread, the host import it is blocked in, and the state of the nn::os object
+/* Freeze report (nvn_vk_wd.c, and the TOMO_SAMPLE stall report): every guest thread, the host import it is blocked in, and the state of the nn::os object
  * its first argument names (looked up without creating one). A worker thread listed as "finished" that should run
  * forever, or a wait on an object that is signaled, points at the cause. */
 static Obj *obj_peek(uint64_t key);                   /* below (R1): a look-up without the table lock */
@@ -306,7 +324,6 @@ void os_wait_report(FILE *out) {
         fputc('\n', out);
     }
 }
-#endif
 
 /* (R3 lwr, runs lwr5..lwr13: "NetSystem" never at a wait for the rollback ring's base state) a ThreadType started again (the
  * game's NetSystem thread, each time a Local Wireless session starts) is the same object: its older slot kept the finished
@@ -592,6 +609,7 @@ static void ev_signal(Ctx *c) {
     Obj *o = obj(A0);
     EnterCriticalSection(&o->cs);
     o->signaled = 1;
+    o->gen++;
     WakeAllConditionVariable(&o->cv);
     LeaveCriticalSection(&o->cs);
 }
@@ -601,6 +619,7 @@ void os_signal_event(uint64_t key) {
     Obj *o = obj(key);
     EnterCriticalSection(&o->cs);
     o->signaled = 1;
+    o->gen++;
     WakeAllConditionVariable(&o->cv);
     LeaveCriticalSection(&o->cs);
 }
@@ -608,7 +627,8 @@ static void ev_clear(Ctx *c) { Obj *o = obj(A0); EnterCriticalSection(&o->cs); o
 static int ev_wait_ms(Obj *o, DWORD ms) {
     int ok = 1;
     EnterCriticalSection(&o->cs);
-    while (!o->signaled) {
+    unsigned g0 = o->gen;                    /* manual-clear events release a waiter that saw a signal, even one cleared right after */
+    while (!o->signaled && (o->autoclear || o->gen == g0)) {
         if (!SleepConditionVariableCS(&o->cv, &o->cs, ms)) { ok = o->signaled; break; }
     }
     if (ok && o->autoclear) o->signaled = 0;

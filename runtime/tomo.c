@@ -354,25 +354,48 @@ void sdk_host_override(const char *name, ImportFn fn);   /* sdklift_rt.c */
  * (this, size, alignment) with the heap's name (sead::Heap: the name pointer after the IDisposer, +0x20) and its size. */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk/hook_host.c */
 static ImportFn g_try_alloc;
+const char *guest_thread_name_of(DWORD tid);               /* os_threads.c */
+static const char *heap_name(uint64_t heap) {
+    uint64_t np = rd64(heap + 0x20);
+    return np > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)np, 1) ? (const char *)(uintptr_t)np : "?";
+}
+/* sead::ExpHeap: mSize +0x30, mFreeList +0xd0 (sentinel, next +0xd8, count +0xe0, node offset +0xe4), mUseList +0xf0 (next +0xf8,
+ * count +0x100, node offset +0x104); MemBlock: mSize +0x18, the memory at +0x20. Prints the biggest blocks of a list. */
+static void heap_list_report(uint64_t heap, uint64_t list, const char *what) {
+    uint64_t top[6] = {0}, topat[6] = {0}, node = rd64(list + 8), sum = 0;
+    int32_t off = (int32_t)rd32(list + 0x14);
+    uint32_t n = 0;
+    while (node != list && node > 0x10000 && n < 200000 && !IsBadReadPtr((void *)(uintptr_t)node, 0x20)) {
+        uint64_t blk = node - (uint64_t)off, sz = rd64(blk + 0x18);
+        sum += sz; n++;
+        for (int i = 0; i < 6; i++) if (sz > top[i]) { for (int j = 5; j > i; j--) { top[j] = top[j - 1]; topat[j] = topat[j - 1]; } top[i] = sz; topat[i] = blk + 0x20; break; }
+        node = rd64(node + 8);
+    }
+    printf("heaplog:   %s: %u blocks, 0x%llx bytes in all (list count %u); biggest:", what, n, (unsigned long long)sum, rd32(list + 0x10));
+    for (int i = 0; i < 6 && top[i]; i++) printf(" 0x%llx@%llx", (unsigned long long)top[i], (unsigned long long)topat[i]);
+    printf("\n");
+    (void)heap;
+}
 static void heaplog_try_alloc(Ctx *c, void *user) {
     (void)user;
     uint64_t heap = A0, size = A1;
     uint64_t from = c->x[30];
     g_try_alloc(c);
-    const char *name = "?";
-    uint64_t np = rd64(heap + 0x20);
-    if (np > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)np, 1)) name = (const char *)(uintptr_t)np;
-    if (c->x[0]) {                                       /* TOMO_HEAPLOG=<heap name>: that heap's allocations too */
+    const char *name = heap_name(heap);
+    const char *tn = guest_thread_name_of(GetCurrentThreadId());
+    const char *want = getenv("TOMO_HEAPLOG");
+    if (c->x[0]) {                                       /* TOMO_HEAPLOG=<heap name>: that heap's allocations too; =1: every one of 1 MB or more */
         static int n;
-        const char *want = getenv("TOMO_HEAPLOG");
-        if (want[0] != '1' && !strcmp(name, want) && n++ < 400)
-            printf("heaplog: %s +0x%llx at %llx (from %llx)\n", name, (unsigned long long)size, (unsigned long long)c->x[0], (unsigned long long)from);
+        if (want[0] == '1' ? size >= 0x100000 : (!strcmp(name, want) && (size >= 0x100000 || n++ < 400)))
+            printf("heaplog: %s +0x%llx at %llx (from %llx, %s)\n", name, (unsigned long long)size, (unsigned long long)c->x[0], (unsigned long long)from, tn ? tn : "?");
         return;
     }
     static int said;
     if (said++ >= 40) return;
-    printf("heaplog: %.40s (heap %llx) could not give 0x%llx bytes (alignment %d), called from %llx\n", name,
-           (unsigned long long)heap, (unsigned long long)size, (int)(int32_t)A2, (unsigned long long)from);
+    printf("heaplog: %.40s (heap %llx, size 0x%llx) could not give 0x%llx bytes (alignment %d), called from %llx on %s\n", name,
+           (unsigned long long)heap, (unsigned long long)rd64(heap + 0x30), (unsigned long long)size, (int)(int32_t)A2, (unsigned long long)from, tn ? tn : "?");
+    heap_list_report(heap, heap + 0xd0, "free");
+    heap_list_report(heap, heap + 0xf0, "used");
 }
 /* TOMO_TASKLOG=1 (diagnosis): the scene start-up's task step [game 0x71005e1ffc] (task): every change of a task's state
  * (+0x10) or sub-state (+0x68), with its method table */
@@ -390,7 +413,34 @@ static void tasklog_step(Ctx *c, void *user) {
     seen[i].t = t; seen[i].s = s; seen[i].s2 = s2;
     printf("tasklog: task %llx (method table %llx) state %u sub %u\n", (unsigned long long)t, (unsigned long long)rd64(t), s, s2);
 }
+/* TOMO_TRACE=<hex addr>[,<hex addr>...] (diagnosis): every call of those guest functions is logged with x0..x3 at entry and
+ * x0 at return (the first 20 calls of each, then one in 500), with the caller and the thread. No rebuild between probes. */
+const char *guest_thread_name_of(DWORD tid);               /* os_threads.c */
+typedef struct { uint64_t addr; ImportFn orig; unsigned n; } TraceSite;
+static TraceSite g_trace_sites[32];
+static void trace_site_call(Ctx *c, void *user) {
+    TraceSite *t = user;
+    unsigned n = ++t->n;
+    static volatile LONG total; static int all = -1;
+    if (all < 0) all = getenv("TOMO_TRACE_ALL") != NULL;                  /* TOMO_TRACE_ALL=1: every call, the first 30000 in all */
+    int say = n <= 20 || n % 500 == 0 || (all && InterlockedIncrement(&total) < 30000);
+    uint64_t a0 = A0, a1 = A1, a2 = A2, a3 = A3, from = c->x[30];
+    const char *name = guest_thread_name_of(GetCurrentThreadId());
+    t->orig(c);
+    if (say) printf("trace %llx #%u [%s]: x0 %llx x1 %llx x2 %llx x3 %llx -> %llx (from %llx)\n", (unsigned long long)t->addr, n, name ? name : "main",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)c->x[0], (unsigned long long)from);
+}
+static void trace_install(void) {
+    const char *e = getenv("TOMO_TRACE");
+    int k = 0;
+    for (const char *p = e; p && *p && k < 32;) {
+        uint64_t a = strtoull(p, (char **)&p, 16);
+        if (a) { g_trace_sites[k].addr = a; printf("trace: %llx %s\n", (unsigned long long)a, hook_install(a, trace_site_call, &g_trace_sites[k], &g_trace_sites[k].orig) ? "hooked" : "NOT hooked (not a function entry?)"); k++; }
+        while (*p == ',' || *p == ' ') p++;
+    }
+}
 static void heaplog_install(void) {
+    trace_install();
     if (getenv("TOMO_TASKLOG")) printf("tasklog: hook %s\n", hook_install(0x71005e1ffcull, tasklog_step, NULL, &g_task_step) ? "installed" : "NOT installed");
     if (!getenv("TOMO_HEAPLOG")) return;
     printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");

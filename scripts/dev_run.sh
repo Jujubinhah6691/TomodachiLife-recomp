@@ -16,5 +16,5 @@ tail -1 host_build.log
 export SSBU_ROMFS=$(cygpath -w ../dump/romfs) SSBU_ERROR_DIALOG=0 SSBU_RENDERER=${SSBU_RENDERER:-gl} SSBU_OS_CONSOLE_CORES=${SSBU_OS_CONSOLE_CORES:-1}   # console core model: the game sizes heaps from free memory and races without it; the Vulkan back end lacks counters (nvnCommandBufferReportCounter) so far
 set +e
 timeout $(( ${2:-40} + 60 )) ./tomodachi_native.exe "$(cygpath -w ../dump/exefs/main.elf)" "${2:-40}" > "$1" 2>&1
-echo "exit $?"
+rc=$?; echo "exit $rc"; echo "" >> "$1"; echo "exit code $rc (ended $(date +%H:%M:%S))" >> "$1"
 grep -v "is not an import of the game\|is in sdklift_install.h\|was not lifted" "$1" | grep -n "^\[phase\|HOST EXCEPTION\|^GA:\|without a handler\|guest_trap\|TRAP\|stopping\|frames presented\|still running" | head -40

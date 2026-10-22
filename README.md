@@ -61,16 +61,35 @@ answers live in `runtime/tomo.c`. What works:
 - SDK 20 services: light semaphores / message queues, timer events, the nn::os memory heap, SdkMutex / SdkConditionVariable
   cut to host locks, ~300 pure SDK functions lifted (prepo, mii values, vibration, png/jpeg, the nn::audio client).
 
-**Where it stops:** the loading screen never ends. After the game has read its RSDB tables (215 file opens) it asks for no
-more files; no actor pack (`Pack/Actor`, 2,693 files) and no message archive (`Mals/`) is ever opened. Nothing is blocked
-at the OS level: every thread is idle on its queue or loops per frame (the "Scene Prepare Thread" re-runs its three
-preparation tasks, which complete, then waits on a per-frame event). The game's own logic does not advance to the next
-loading phase. Checked and ruled out: controller input (A every 2 s), the language (ja, en-GB, en-US), heap exhaustion
-(`TOMO_HEAPLOG`), the audio renderer's update answers (now accepted by the SDK client), Mii database Initialize (returns
-success now), time init. Not checked: the game's scene state machine itself (what condition it polls each frame).
+**Where it stops (2026-10-22, later):** the loading screen is passed. The game shows its first real screen, a dialog
+"Save data from the demo version of Tomodachi Life: Living the Dream has been detected" with an OK button, at a steady
+30 fps for as long as it runs (tested 75 s). Three host bugs had held it:
 
-Diagnostics added for this: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at
-exit), `TOMO_EVLOG=1` (events waited on for over 2 s and who signals them), `TOMO_TASKLOG=1` (scene task states),
+- **Lost event wake-up** (`os_threads.c`): the scene start-up signals a manual-clear light event and clears it at once
+  (`SignalLightEvent` / `ClearLightEvent` in the task-group step at 0x71005e1f40). The host event woke the waiter, which
+  re-checked `signaled`, found it cleared and slept again, so the Scene Prepare Thread never left `WaitLightEvent`
+  (0x71004aee60). Events now carry a signal generation: a waiter released by a signal returns even if a clear followed.
+- **GPU hang** (`mx_translate.c`): program #5401 (the cube map array mip chain) ends its vertex shader in a BRX jump
+  through a table in the shader's constant buffer 1; the value read at run time differs from the table the translation
+  saw, the computed target is no case of the dispatcher and the shader looped for ever. The driver reset the GPU after
+  2 s (event log 4101) and ended the process with 0xC0000409, silently. A BRX target outside its table now ends the
+  stage. Also: each stage's constant block is copied when the program is set (`stage_keep_cdata`, the game reuses that
+  memory) and the shader cache keys carry a translator salt.
+- **Layered render targets** (`nvn_gl.c`): one face / layer of a cube map array or 2D array as a colour target was a
+  one-layer array view, a layered attachment next to the plain 2D depth target (GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS):
+  now a 2D view of that level and layer (`rt_view`); 3D textures attach by layer. A draw that samples the texture it
+  renders to samples a refreshed copy (`feedback_guard`).
+
+The dialog waits for input; answering it (A on OK) and the save-data answers behind it (the game believes a demo save
+exists) are the next thing. Open renderer gaps seen so far: fragment shaders with `TEX (b)` (bindless texture handle in
+a register, programs #6562/#6590) and one with `VMNMX` (#5392) are not translated; views of ASTC textures are refused
+by the driver (sampled as the plain texture).
+
+Diagnostics: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at exit, and a
+thread / wait report after 3 s without a present), `TOMO_GPUTIME=<ms>` (every draw and dispatch finished and timed; with
+`TOMO_GPUTIME_EVERY=<n>` only every n-th; the last 256 commands are kept in `gputime_last.txt` through a file mapping
+that survives a GPU reset), `scripts/ps_run.ps1` (runs the game from PowerShell with the real exit code: under the bash
+`timeout` wrapper a driver reset showed as exit 127 and a truncated log), `TOMO_EVLOG=1` (events waited on for over 2 s and who signals them), `TOMO_TASKLOG=1` (scene task states),
 `TOMO_HEAPLOG=1|<heap name>`, `TOMO_ALIASLOG=1`, `SSBU_PEEK=<addr,...>` in the crash report, `tools/debug/*.py`
 (disassemble main or sdk by address / name, callers, relocation of a slot, cross-references, host code at a DLL RVA).
 
@@ -103,8 +122,10 @@ The keys must cover key generation 0x0f or newer, since this game is newer than 
 
 ## Next steps
 
-1. Find the condition the loading scene polls (hook the main thread's per-frame scene update, `0x71005e3288` and the
-   function at `0x7101d7c270` that waits for the three preparation tasks; `TOMO_SAMPLE` names the hot functions).
-2. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
-3. The Vulkan back end: `nvnCommandBufferReportCounter`.
-4. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).
+1. Answer the "demo save data" dialog: press A on OK (`SSBU_PRESS`), then follow the save-data flow (the fs / save
+   answers in tomo.c decide whether a demo save and a main save exist).
+2. Translate `TEX (b)` (bindless handle in a register: a table from NVN handle to GL bindless handle, filled by
+   nvnDeviceGetTextureHandle) and `VMNMX`.
+3. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
+4. The Vulkan back end: `nvnCommandBufferReportCounter`.
+5. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).

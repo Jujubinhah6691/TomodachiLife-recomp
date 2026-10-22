@@ -490,10 +490,11 @@ int main(int argc, char **argv) {
     { void prof15_start(void); prof15_start(); }         /* prof15.c: SSBU_PROF15, every busy thread (test only; nothing without the variable) */
     DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
-        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50 && h < 30000; done = h) wr = WaitForSingleObject(t, h - done);   /* a present held for ever (a hang) must not hold the exit */
     }
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());
+        fflush(stdout);                              /* a file gets this even if the report below cannot finish */
         trace_printf("=== stopped by the time limit after %d s\n", seconds);
         main_stack_report();
         if (g_main_ctx) {
@@ -523,6 +524,7 @@ int main(int argc, char **argv) {
                 ctx.ContextFlags = CONTEXT_FULL;
                 SuspendThread(t);
                 GetThreadContext(t, &ctx);
+                ResumeThread(t);                     /* never print while it is suspended: it may hold the stdout lock */
                 printf("  host rip sample %d: rip=%p -> f_%llx |", s, (void *)ctx.Rip, (unsigned long long)guest_function_of(ctx.Rip));
                 uint64_t last = 0;
                 for (int depth = 0, shown = 0; depth < 200 && shown < 12; depth++) {
@@ -537,7 +539,6 @@ int main(int argc, char **argv) {
                     if (!ctx.Rip) break;
                 }
                 printf("\n");
-                ResumeThread(t);
             }
 #endif
             for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
