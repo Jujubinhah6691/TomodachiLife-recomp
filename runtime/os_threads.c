@@ -33,6 +33,7 @@ typedef struct Obj {
     CONDITION_VARIABLE cv;
     int signaled, autoclear;                 /* events */
     unsigned gen;                            /* events: bumped by every signal, so a Signal+Clear pair still releases the waiters */
+    uint64_t lock_from;                      /* mutexes: the guest return address of the last lock (os_held_report) */
     int count, max;                          /* semaphores */
     uint64_t *buf, cap, len, head;           /* message queues */
     HANDLE thread;                           /* threads */
@@ -90,8 +91,10 @@ static Obj *obj(uint64_t key) {
     return o;
 }
 /* Forget an object so a new one created at the same address starts clean. */
+static void mutex_fresh(Obj *o, const char *why);
 static void obj_reset(uint64_t key) {
     Obj *o = obj(key);
+    mutex_fresh(o, "initialisation");            /* an SDK mutex re-made at a locked address would block here for ever */
     EnterCriticalSection(&o->cs);
     o->signaled = o->autoclear = o->count = o->max = 0;
     o->len = o->head = 0;
@@ -321,6 +324,11 @@ void os_wait_report(FILE *out) {
                 (unsigned long long)c->fn, (unsigned long long)c->x[30], c->in_import ? c->in_import : "(guest code)", (unsigned long long)c->x[0]);
         Obj *w = !o->finished && c->in_import && c->x[0] > 0x10000 ? obj_peek(c->x[0]) : NULL;
         if (w) fprintf(out, " -> signaled %d autoclear %d count %d", w->signaled, w->autoclear, w->count);
+        if (w && w->cs.OwningThread) {                  /* a mutex: who holds it (CRITICAL_SECTION's owner is the thread id) */
+            DWORD tid = (DWORD)(uintptr_t)w->cs.OwningThread;
+            const char *on = guest_thread_name_of(tid);
+            fprintf(out, " held by thread %lu (%s) recursion %ld, locked from %llx", (unsigned long)tid, on ? on : tid == GetCurrentThreadId() ? "this thread" : "main or host thread", w->cs.RecursionCount, (unsigned long long)w->lock_from);
+        }
         fputc('\n', out);
     }
 }
@@ -539,7 +547,21 @@ static void os_GetTlsValue(Ctx *c) { RET(t_tls[A0 & 63]); }
 static void os_SetTlsValue(Ctx *c) { t_tls[A0 & 63] = A1; }
 
 /* ---------------------------------------------------------------- mutexes */
-static void mtx_init(Ctx *c) { (void)obj(A0); }
+/* A mutex initialised (or finalised) while the host lock is still held starts unlocked. The game destroys its GPU memory
+ * pools while holding their mutex (0x71002ab68c: lock, free the pool, return); on the console the lock dies with the
+ * memory, here the object keyed by that address kept the lock, and the next pool made at the same address was born
+ * locked by a thread that had long moved on (the world load hung in 0x7100329cc4). */
+static void mutex_fresh(Obj *o, const char *why) {
+    if (!o->cs.OwningThread || o->cs.RecursionCount <= 0) return;
+    if ((DWORD)(uintptr_t)o->cs.OwningThread == GetCurrentThreadId()) { while (o->cs.RecursionCount > 0) LeaveCriticalSection(&o->cs); return; }
+    static int nlog;
+    if (nlog++ < 8) printf("nn::os: %s of mutex %llx still held by thread %lu (locked from %llx): the lock is dropped\n", why, (unsigned long long)o->key,
+                           (unsigned long)(uintptr_t)o->cs.OwningThread, (unsigned long long)o->lock_from);
+    DeleteCriticalSection(&o->cs);
+    InitializeCriticalSection(&o->cs);
+}
+static void mtx_init(Ctx *c) { mutex_fresh(obj(A0), "InitializeMutex"); }
+static void mtx_fini(Ctx *c) { mutex_fresh(obj(A0), "FinalizeMutex"); }
 /* Round 17, MEASUREMENT (SSBU_MUTEXSTAT=1; nothing runs without it): calls of the libc++ / nn::os mutex lock import, the
  * time in the table look-up and in the lock itself, and how many calls found the mutex taken, for the thread that
  * queues the presents (the game's main thread) and for all other threads; a line every 200,000 calls of the main thread. */
@@ -577,10 +599,26 @@ static void mtx_lock_stat(Ctx *c) {
 static void mtx_lock(Ctx *c) {
     if (g_mstat < 0) g_mstat = getenv("SSBU_MUTEXSTAT") != NULL;
     if (g_mstat) { mtx_lock_stat(c); return; }
-    EnterCriticalSection(&obj(A0)->cs);
+    Obj *o = obj(A0);
+    EnterCriticalSection(&o->cs);
+    o->lock_from = c->x[30];
 }
 static void mtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); }
-static void mtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 1 : 0); }
+static void mtx_trylock(Ctx *c) { Obj *o = obj(A0); int ok = TryEnterCriticalSection(&o->cs) ? 1 : 0; if (ok) o->lock_from = c->x[30]; RET(ok); }
+/* Diagnosis (the time-limit report): every guest mutex held right now, its owner and where it was locked. A mutex a
+ * thread holds while it waits for something else, or one left locked, is the usual deadlock. */
+void os_held_report(FILE *out) {
+    int n = 0;
+    for (int h = 0; h < BUCKETS; h++)
+        for (Obj *o = g_table[h]; o; o = o->next) {
+            if (!o->cs.OwningThread || o->cs.RecursionCount <= 0) continue;
+            DWORD tid = (DWORD)(uintptr_t)o->cs.OwningThread;
+            const char *on = guest_thread_name_of(tid);
+            if (!n++) fprintf(out, "  guest mutexes held now (object, owner, recursion, locked from):\n");
+            fprintf(out, "    %llx held by thread %lu (%s) x%ld, locked from %llx\n", (unsigned long long)o->key, (unsigned long)tid, on ? on : "main or host thread",
+                    o->cs.RecursionCount, (unsigned long long)o->lock_from);
+        }
+}
 /* hitch.c (SSBU_HITCH): host thread id that owns the guest mutex `key` now, 0 = nobody. Diagnostics only. */
 #ifdef _WIN32
 DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs.OwningThread : 0; }
@@ -1180,7 +1218,7 @@ static const ImportDef thread_imports[] = {
     {OS("19GetCurrentStackInfoEPmS1_"), os_GetCurrentStackInfo},
     {OS("15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE"), os_AllocateTlsSlot}, {OS("18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE"), os_AllocateTlsSlot},
     {OS("11FreeTlsSlotENS0_7TlsSlotE"), os_FreeTlsSlot}, {OS("11GetTlsValueENS0_7TlsSlotE"), os_GetTlsValue}, {OS("11SetTlsValueENS0_7TlsSlotEm"), os_SetTlsValue},
-    {OS("15InitializeMutexEPNS0_9MutexTypeEbi"), mtx_init}, {OS("13FinalizeMutexEPNS0_9MutexTypeE"), nothing},
+    {OS("15InitializeMutexEPNS0_9MutexTypeEbi"), mtx_init}, {OS("13FinalizeMutexEPNS0_9MutexTypeE"), mtx_fini},
     {OS("9LockMutexEPNS0_9MutexTypeE"), mtx_lock}, {OS("11UnlockMutexEPNS0_9MutexTypeE"), mtx_unlock}, {OS("12TryLockMutexEPNS0_9MutexTypeE"), mtx_trylock},
     {"pthread_mutex_init", ret0}, {"pthread_mutex_destroy", ret0}, {"pthread_mutex_lock", pmtx_lock}, {"pthread_mutex_unlock", pmtx_unlock},
     {"pthread_mutex_trylock", pmtx_trylock},

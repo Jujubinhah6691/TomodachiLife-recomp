@@ -550,6 +550,7 @@ int main(int argc, char **argv) {
             }
         }
         dump_guest_threads(stdout);
+        { void os_wait_report(FILE *); void os_held_report(FILE *); os_wait_report(stdout); os_held_report(stdout); }     /* the object each blocked thread waits for, and who holds it */
         icall_dump(stdout, (uint64_t)(uintptr_t)g_main_ctx);
         if (getenv("SSBU_CHAIN")) {
             /* SSBU_CHAIN=<fn>:<off>,<off>,...[;<fn>:...] (hex): start from x0 of the first recorded indirect call to fn
