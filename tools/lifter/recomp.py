@@ -38,10 +38,26 @@ def _layout(img):
         if tag == 0:
             break
         tags.setdefault(tag, val)
-    return text, tags[7], tags[8], tags[23], tags[2], tags[6], tags[5]
+    return text, tags[7], tags[8], tags[23], tags[2], tags[6], tags[5], tags.get(36, 0), tags.get(35, 0)
 
 
-TEXT_SIZE, RELA, RELASZ, JMPREL, PLTRELSZ, SYMTAB, STRTAB = _layout(IMG)
+def relr_offsets(img, file_off, relr, relrsz):
+    """The places DT_RELR relocates (SDK 20 binaries, e.g. Tomodachi Life; SSBU has none): an even entry is an address,
+    an odd one a bitmap of the 63 words after the last address. Each place holds its implicit addend (an image offset)."""
+    where = 0
+    for i in range(relrsz // 8):
+        e, = struct.unpack_from('<Q', img, file_off + relr + i * 8)
+        if not e & 1:
+            yield e
+            where = e + 8
+        else:
+            for b in range(1, 64):
+                if e >> b & 1:
+                    yield where + (b - 1) * 8
+            where += 63 * 8
+
+
+TEXT_SIZE, RELA, RELASZ, JMPREL, PLTRELSZ, SYMTAB, STRTAB, RELR, RELRSZ = _layout(IMG)
 
 
 # Instruction patch list (N3, plan\phases\N3_new_kind.md): DEFAULT OFF. A patch replaces one instruction word of the
@@ -947,6 +963,10 @@ class Env:
         for i in range(RELASZ // 24):
             off, info, addend = struct.unpack_from('<QQq', IMG, FILE_OFF + RELA + i * 24)
             if info == 0x403 and 0 <= addend < TEXT_SIZE and addend % 4 == 0:
+                starts.add(BASE + addend)
+        for off in relr_offsets(IMG, FILE_OFF, RELR, RELRSZ):         # the same, packed as DT_RELR
+            addend, = struct.unpack_from('<Q', IMG, FILE_OFF + off)
+            if 0 <= addend < TEXT_SIZE and addend % 4 == 0:
                 starts.add(BASE + addend)
         # code addresses materialised in registers (callbacks, thread entry points): ADRP+ADD pairs and ADR
         page = {}
