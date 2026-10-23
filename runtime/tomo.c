@@ -283,10 +283,31 @@ static void prepo_limit_event(Ctx *c) {
  * audren service on the console. For now the renderer only keeps time: once started it signals the game's system event
  * every audio frame (5 ms, the console's rate), and an update is accepted without mixing (no sound yet). */
 void os_signal_event(uint64_t key);                      /* os_threads.c */
-typedef struct { uint64_t obj[2]; uint64_t vtbl[32]; uint64_t event; HANDLE timer; uint64_t frames; } Renderer;
+typedef struct { uint64_t obj[2]; uint64_t vtbl[32]; uint64_t event; HANDLE timer; uint64_t frames; volatile LONG run; } Renderer;
 static Renderer g_ren[4];
 static void audren_request_update(Ctx *c, void *user);
-static void CALLBACK ren_tick(void *p, BOOLEAN unused) { (void)unused; os_signal_event(((Renderer *)p)->event); }
+/* The audio frame clock: the game's system event every 5 ms (200 a second, 240 samples each at 48 kHz). A timer-queue
+ * timer ran at the system's 15.6 ms granularity, 64 ticks a second: the game made a third of the sound it should and the
+ * output stuttered. A thread on a high-resolution waitable timer, catching up when it falls behind. */
+static DWORD WINAPI ren_clock(void *p) {
+    Renderer *r = p;
+    HANDLE t = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    if (!t) t = CreateWaitableTimerW(NULL, FALSE, NULL);
+    LARGE_INTEGER f, now; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+    long long period = f.QuadPart / 200, next = now.QuadPart + period;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (r->run) {
+        QueryPerformanceCounter(&now);
+        long long wait = next - now.QuadPart;
+        if (wait > 0) { LARGE_INTEGER due; due.QuadPart = -(wait * 10000000 / f.QuadPart); SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE); WaitForSingleObject(t, 20); }
+        os_signal_event(r->event);
+        next += period;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - next > f.QuadPart / 10) next = now.QuadPart;        /* more than 100 ms behind: no burst to catch up */
+    }
+    CloseHandle(t);
+    return 0;
+}
 static void audio_open(Ctx *c) {                         /* (AudioRendererHandle *out, SystemEvent *event, const Parameter &, void *work, size_t) */
     int i = 0;
     while (i < 4 && g_ren[i].event) i++;
@@ -306,12 +327,12 @@ static void audio_open(Ctx *c) {                         /* (AudioRendererHandle
 static Renderer *ren_of(uint64_t h) { for (int i = 0; i < 4; i++) if (h == (uint64_t)(uintptr_t)g_ren[i].obj) return &g_ren[i]; return NULL; }
 static void audio_start(Ctx *c) {
     Renderer *r = ren_of(A0);
-    if (r && !r->timer) CreateTimerQueueTimer(&r->timer, NULL, ren_tick, r, 5, 5, WT_EXECUTEDEFAULT);
+    if (r && !r->timer) { r->run = 1; r->timer = CreateThread(NULL, 0, ren_clock, r, 0, NULL); }
     RET(0);
 }
 static void audio_stop(Ctx *c) {
     Renderer *r = ren_of(A0);
-    if (r && r->timer) { DeleteTimerQueueTimer(NULL, r->timer, INVALID_HANDLE_VALUE); r->timer = NULL; }
+    if (r && r->timer) { r->run = 0; WaitForSingleObject(r->timer, 1000); CloseHandle(r->timer); r->timer = NULL; }
     RET(0);
 }
 static void audio_close(Ctx *c) { audio_stop(c); Renderer *r = ren_of(A0); if (r) r->event = 0; }
