@@ -1852,9 +1852,18 @@ unsigned nvn_gl_held_ms(void) {
     return (unsigned)(ticks * 1000 / f.QuadPart);
 }
 /* Render thread, before a present: hold it while cold shader work is pending (see above). */
+/* Asynchronous shaders (default; SSBU_SHADER_SYNC=1 = the old waits). A stage the driver has not compiled on this PC took
+ * it 3 to 5 s (the large island and room shaders): the present was held that long (pw_gate) or the render thread compiled
+ * it in the middle of a frame, and the game froze each time it showed something new. Now the stage goes to a worker and
+ * the draws that need it are skipped until its binary is on disk (stage_glsl): the object appears a few seconds later
+ * instead. A stage still missing after 20 s is compiled on the render thread as before. */
+static int shader_async(void) { static int v = -1; if (v < 0) v = getenv("SSBU_SHADER_SYNC") == NULL; return v; }
+static struct { uint64_t h1; LONG64 t0; char path[320]; } g_pend[512];
+static int g_pend_n;
+static LONG64 g_pend_skipped, g_pend_started, g_pend_late;
 static void pw_gate(void) {
     static int off = -1;
-    if (off < 0) { const char *e = getenv("SSBU_PAIR_GATE"); off = (e && !strcmp(e, "0")) || !pw_mode(); }
+    if (off < 0) { const char *e = getenv("SSBU_PAIR_GATE"); off = (e && !strcmp(e, "0")) || !pw_mode() || shader_async(); }
     if (off || !g_pw_cold) return;
     if (g_shw_queued == g_shw_done || g_shw_ctx_failed) { InterlockedExchange(&g_pw_cold, 0); return; }
     LONG64 t0 = pf_now(), last = t0, freq, start_done = g_shw_done;
@@ -2001,7 +2010,7 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
     {
         static int nowait = -1;
         if (nowait < 0) nowait = getenv("SSBU_SHADER_NOWAIT") != NULL;
-        if (!nowait && g_st.frames >= 300 && GetCurrentThreadId() != g_render_tid && g_shw_queued - g_shw_done >= g_shw_n) {
+        if (!nowait && !shader_async() && g_st.frames >= 300 && GetCurrentThreadId() != g_render_tid && g_shw_queued - g_shw_done >= g_shw_n) {
             LONG64 t0 = pf_now(), freq = 0;
             { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
             while (g_shw_queued - g_shw_done >= g_shw_n && pf_now() - t0 < 30 * freq) Sleep(1);
@@ -2237,6 +2246,16 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
                 return 1;
             }
     }
+    int pend_i = -1;
+    if (h1 && shader_async())
+        for (int i = 0; i < g_pend_n; i++) if (g_pend[i].h1 == h1) { pend_i = i; break; }
+    if (pend_i >= 0) {                                  /* a worker is compiling this stage: skip the draw until its binary is there */
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        int late = pf_now() - g_pend[pend_i].t0 > 20 * f.QuadPart;
+        if (GetFileAttributesA(g_pend[pend_i].path) == INVALID_FILE_ATTRIBUTES && !late) { g_pend_skipped++; return 0; }
+        if (late) g_pend_late++;
+        g_pend[pend_i] = g_pend[--g_pend_n];
+    }
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
     in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16;
     in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL;
@@ -2281,7 +2300,29 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     ShSrc *hit = NULL;
     for (ShSrc *e = g_shc_off ? NULL : g_shs[h2 & 4095]; e && !hit; e = e->next) if (e->h == h2 && e->len == src_len) hit = e;
     if (hit) { st->glsl = hit->prog; ok = 1; g_shc_src_hit++; }
-    else {
+    else if (shader_async() && !g_shc_off && h1 && pend_i < 0 && !getenv("TOMO_SHOVR") && g_shd_mode > 0 && g_shw_n && GetCurrentThreadId() == g_render_tid && g_pend_n < 512) {
+        char path[320];
+        shd_path(path, sizeof path, h2, src_len);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {     /* not compiled on this PC yet: a worker does it */
+            ShJob *j = malloc(sizeof *j + (size_t)st->code_len + (in.cdata ? in.cdata_size : 0));
+            j->next = NULL; j->stage = s; j->code_len = st->code_len; j->cdata_size = in.cdata ? in.cdata_size : 0;
+            memcpy(j->key, key, sizeof j->key);
+            memcpy(j->data, st->code, (size_t)st->code_len);
+            if (in.cdata) memcpy(j->data + st->code_len, in.cdata, in.cdata_size);
+            EnterCriticalSection(&g_shw_lock);
+            if (g_shw_tail) g_shw_tail->next = j; else g_shw_head = j;
+            g_shw_tail = j;
+            LeaveCriticalSection(&g_shw_lock);
+            InterlockedIncrement64(&g_shw_queued);
+            ReleaseSemaphore(g_shw_sem, 1, NULL);
+            g_pend[g_pend_n].h1 = h1; g_pend[g_pend_n].t0 = pf_now(); strcpy(g_pend[g_pend_n].path, path); g_pend_n++;
+            g_pend_started++; g_pend_skipped++;
+            if (h0) shv_record(h0, s, key);             /* the next start compiles it with the others (variants.txt) */
+            free(src);
+            return 0;
+        }
+    }
+    if (!st->glsl && !hit) {
         pf0 = pf_now();
         LONG64 saved0 = g_shd_saved;
         st->glsl = g_shc_off ? glCreateShaderProgramv(s == 0 ? 0x8B31 : 0x8B30, 1, srcs) : shader_build(s == 0 ? 0x8B31 : 0x8B30, src, src_len, h2, &ok);
@@ -4772,6 +4813,8 @@ void nvn_gl_report(FILE *out) {
       fprintf(out, "nvn_gl: shader pairs made ready by the workers (SSBU_PAIR_WARM=%d): %lld from pairs.txt + %lld programs handed over; %lld warm draws, %lld of them over 8 ms (not in the driver's cache), %.1f s in all; %lld known already, %lld without binaries or not translated, %lld stages compiled for it\n",
               pw_mode(), (long long)g_pw_named, (long long)g_pw_progs, (long long)g_pw_warmed, (long long)g_pw_cold_n, (double)g_pw_ticks / (double)f.QuadPart, (long long)g_pw_dup, (long long)g_pw_missing, (long long)g_pw_compiled);
       fprintf(out, "nvn_gl: presents held for shader preparation: %lld times, %.2f s in all\n", (long long)g_pw_gates, (double)g_pw_gate_ticks / (double)f.QuadPart); }
+    fprintf(out, "nvn_gl: asynchronous shaders%s: %lld stages handed to the workers during play, %lld draws skipped while they compiled, %lld compiled here after 20 s\n",
+            shader_async() ? "" : " (off: SSBU_SHADER_SYNC)", (long long)g_pend_started, (long long)g_pend_skipped, (long long)g_pend_late);
     fprintf(out, "nvn_gl: shader pairs drawn (pairs.txt): %lld known at start, %lld added in this run\n", (long long)g_prec_loaded, (long long)g_prec_added);
     if (pair_mode()) fprintf(out, "nvn_gl: linked pair programs (SSBU_PAIR=%d): %lld loaded from disk, %lld linked here, %lld not linkable, %lld binaries refused, %lld draws used one\n", pair_mode(), (long long)g_pair_loaded, (long long)g_pair_linked, (long long)g_pair_failed, (long long)g_pair_refused, (long long)g_pair_draws);
     { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fprintf(out, "nvn_gl: first draws of a program pair preceded by a discarded point: %lld (%lld over 4 ms, %.0f ms in all), not done %lld (counter running or vertex stage with side effects)\n", (long long)g_fdw_n, (long long)g_fdw_slow, (double)g_fdw_ticks * 1000.0 / (double)f.QuadPart, (long long)g_fdw_skipped); }

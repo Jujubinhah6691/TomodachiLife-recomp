@@ -343,9 +343,9 @@ typedef struct { uint64_t played; uint32_t consumed, popped, pos, last_index, se
 static SilentVoice g_sv[1024];
 /* ---- the mixer: what the console's DSP does, cut down. Each playing voice is read from its wave buffers (PCM16, or
  * Nintendo's DSP-ADPCM: 8-byte frames of 14 samples, coefficients at the voice's source data, history from the wave
- * buffer's context or carried over), resampled to 48 kHz by its rate and pitch, scaled by its volume and by the left /
+ * buffer's context or carried over), resampled to 48 kHz by its rate and pitch (linear interpolation), scaled by its volume and by the left /
  * right mix volumes of its channel resources, and summed into one stereo frame of 240 samples per update (5 ms). The
- * mixes, effects and splitters behind a voice are not applied (a voice routed through a splitter plays centred).
+ * mixes and splitters behind a voice are applied (the mix graph above); effects and filters are not.
  * TOMO_AUDIO=0: silent (the voices still advance). */
 #include <SDL3/SDL.h>
 static SDL_AudioStream *g_audio_out;
@@ -400,6 +400,130 @@ static void adpcm_frame(SilentVoice *s, uint64_t data, int32_t f, uint64_t coef)
     }
     s->af = f;
 }
+static int adpcm_peek(const SilentVoice *s, uint64_t data, int32_t f, uint64_t coef) {    /* the first sample of frame f, the state untouched */
+    uint64_t base = data + (uint64_t)f * 8;
+    uint8_t h = rd8(base);
+    int scale = 1 << (h & 0xf), ci = (h >> 4) & 7;
+    int c1 = (int16_t)rd16(coef + (uint64_t)ci * 4), c2 = (int16_t)rd16(coef + (uint64_t)ci * 4 + 2);
+    int nib = (rd8(base + 1) >> 4) & 0xf;
+    if (nib >= 8) nib -= 16;
+    int v = (((nib * scale) << 11) + 1024 + c1 * s->yn1 + c2 * s->yn2) >> 11;
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+}
+/* The mix graph (after the reference implementation, yuzu/eden audio_core: info_updater.cpp, command_generator.cpp,
+ * mix_info.h, splitter_*.h). Mixes and splitter destinations are kept from update to update: with "dirty only" updates
+ * the game sends just the mixes that changed. A voice adds into the buffers of its mix (its channel resource's 24 mix
+ * volumes), or, without a mix, into the mixes of its splitter's destinations (channel, channel + channel count, ...); a
+ * mix adds its buffers into its destination mix (its volume times its 24 x 24 volumes) or into its splitter's
+ * destinations; the final mix (0) is the output. Effects (reverb, delay, aux) and biquad filters are not applied. */
+#define AMIX_MAX 128
+#define ASPL_MAX 128
+#define ADST_MAX 512
+typedef struct { int in_use, buffers, dest_mix, dest_splitter; float volume, vol[24][24]; } AMix;
+static AMix g_amix[AMIX_MAX];
+static struct { int ndest, dest[32]; } g_aspl[ASPL_MAX];
+static struct { int in_use, mix; float vol[24]; } g_adst[ADST_MAX];
+static float g_abuf[AMIX_MAX][24][240];
+static unsigned long long g_routed, g_direct;            /* voice updates mixed through the graph / by the direct path (TOMO_AUDIOLOG) */
+static int amix_ok(int m) { return m >= 0 && m < AMIX_MAX && g_amix[m].in_use && g_amix[m].buffers > 0; }
+static int adst_of(int splitter, int i) {               /* the i-th destination of a splitter, -1 past the last */
+    if (splitter < 0 || splitter >= ASPL_MAX || i < 0 || i >= g_aspl[splitter].ndest) return -1;
+    int d = g_aspl[splitter].dest[i];
+    return d >= 0 && d < ADST_MAX ? d : -1;
+}
+static void amix_parse(uint64_t in, uint64_t isp, uint64_t imx) {
+    uint32_t ssz = rd32(in + 0x24), msz = rd32(in + 0x18);
+    if (ssz >= 0x20 && rd32(isp) == 0x48444e53u) {      /* 'SNDH' {info count, destination count} */
+        uint32_t ninfo = rd32(isp + 4), ndst = rd32(isp + 8), off = 0x20;
+        {   static int log = -1, n; if (log < 0) log = getenv("TOMO_AUDIOLOG") != NULL;
+            if (log && (ninfo || ndst) && n++ < 40) {
+                printf("audio: splitter update: %u infos, %u destinations, %u bytes; first entry:", ninfo, ndst, ssz);
+                for (int k = 0; k < 12 && 0x20 + k * 4 < (int)ssz; k++) printf(" %08x", rd32(isp + 0x20 + (uint64_t)k * 4));
+                printf("\n");
+            }
+        }
+        for (uint32_t i = 0; i < ninfo && off + 0x10 <= ssz; i++) {
+            uint64_t h = isp + off;
+            if (rd32(h) != 0x49444e53u) break;          /* 'SNDI' {id, sample rate, destination count, destination ids} */
+            int id = (int)rd32(h + 4); uint32_t dc = rd32(h + 0xc);
+            if (id >= 0 && id < ASPL_MAX) {
+                g_aspl[id].ndest = dc < 32 ? (int)dc : 32;
+                for (int k = 0; k < g_aspl[id].ndest; k++) g_aspl[id].dest[k] = (int)rd32(h + 0x10 + (uint64_t)k * 4);
+            }
+            off += (0x10 + dc * 4 + 15) & ~15u;           /* an info is padded to 16 bytes (seen: one destination = 0x20) */
+        }
+        uint32_t stride = ndst ? (ssz - off) / ndst : 0;
+        stride = stride >= 0xa8 ? 0xa8 : stride >= 0x90 ? 0x90 : 0x70;   /* the section may end in padding: the largest format that fits */
+        uint32_t use_at = stride == 0x70 ? 0x6c : stride == 0x90 ? 0x84 : 0x9c;
+        for (uint32_t i = 0; i < ndst && off + stride <= ssz; i++, off += stride) {
+            uint64_t d = isp + off;
+            if (rd32(d) != 0x44444e53u) continue;       /* 'SNDD' {id, 24 volumes, mix id, ...} */
+            int id = (int)rd32(d + 4);
+            if (id < 0 || id >= ADST_MAX) continue;
+            for (int k = 0; k < 24; k++) g_adst[id].vol[k] = rdf(d + 8 + (uint64_t)k * 4);
+            g_adst[id].mix = (int)rd32(d + 0x68); g_adst[id].in_use = rd8(d + use_at);
+        }
+    }
+    uint32_t count = msz / 0x930, dirty = msz % 0x930 == 0x20;
+    uint64_t p = imx;
+    if (dirty) { count = rd32(imx + 4); p += 0x20; }
+    for (uint32_t i = 0; i < count; i++, p += 0x930) {
+        int id = dirty ? (int)rd32(p + 0x10) : (int)i;
+        if (id < 0 || id >= AMIX_MAX) continue;
+        AMix *m = &g_amix[id];
+        m->volume = rdf(p); m->buffers = (int)rd32(p + 8); m->in_use = rd8(p + 0xc);
+        if (m->buffers > 24) m->buffers = 24;
+        m->dest_mix = (int)rd32(p + 0x924); m->dest_splitter = (int)rd32(p + 0x928);
+        memcpy(m->vol, (void *)(uintptr_t)(p + 0x24), sizeof m->vol);
+    }
+}
+static int amix_depth(int m) {                           /* hops to the final mix (cycles cut at 16) */
+    int d = 0;
+    for (int guard = 0; m != 0 && guard < 16; guard++, d++) {
+        if (!amix_ok(m)) return d;
+        if (amix_ok(g_amix[m].dest_mix)) { m = g_amix[m].dest_mix; continue; }
+        int k = adst_of(g_amix[m].dest_splitter, 0);
+        if (k < 0) return d;
+        m = g_adst[k].mix;
+    }
+    return d;
+}
+static void amix_run(void) {                            /* sub-mixes into their destinations, then the final mix to g_mix */
+    int order[AMIX_MAX], n = 0;
+    for (int m = 1; m < AMIX_MAX; m++) if (amix_ok(m)) order[n++] = m;
+    int depth[AMIX_MAX];
+    for (int i = 0; i < n; i++) depth[order[i]] = amix_depth(order[i]);
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && depth[order[j]] > depth[order[j - 1]]; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
+    for (int i = 0; i < n; i++) {
+        AMix *m = &g_amix[order[i]];
+        if (amix_ok(m->dest_mix)) {
+            AMix *dm = &g_amix[m->dest_mix];
+            for (int a = 0; a < m->buffers; a++)
+                for (int b = 0; b < dm->buffers; b++) {
+                    float g = m->volume * m->vol[a][b];
+                    if (g != 0.0f) for (int k = 0; k < 240; k++) g_abuf[m->dest_mix][b][k] += g_abuf[order[i]][a][k] * g;
+                }
+        } else for (int di = 0; ; di++) {
+            int d = adst_of(m->dest_splitter, di);
+            if (d < 0) break;
+            if (!g_adst[d].in_use || !amix_ok(g_adst[d].mix)) continue;
+            AMix *dm = &g_amix[g_adst[d].mix];
+            int a = di % m->buffers;
+            for (int b = 0; b < dm->buffers; b++) {
+                float g = m->volume * g_adst[d].vol[b];
+                if (g != 0.0f) for (int k = 0; k < 240; k++) g_abuf[g_adst[d].mix][b][k] += g_abuf[order[i]][a][k] * g;
+            }
+        }
+    }
+    AMix *f = &g_amix[0];
+    for (int k = 0; k < 240; k++) {
+        float l, r;
+        if (f->buffers >= 6) { l = g_abuf[0][0][k] + 0.707f * (g_abuf[0][2][k] + g_abuf[0][4][k]); r = g_abuf[0][1][k] + 0.707f * (g_abuf[0][2][k] + g_abuf[0][5][k]); }
+        else if (f->buffers >= 2) { l = g_abuf[0][0][k]; r = g_abuf[0][1][k]; }
+        else l = r = g_abuf[0][0][k];
+        g_mix[k][0] += l * f->volume; g_mix[k][1] += r * f->volume;
+    }
+}
 static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t frames) {
     static int said;
     if (!in || !out) return 0;
@@ -413,6 +537,9 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
     int mixing = audio_out_open();
     memset(g_mix, 0, sizeof g_mix);
     uint64_t ie = iv + rd32(in + 0xc);
+    amix_parse(in, ie + rd32(in + 0x14), ie + rd32(in + 0x14) + rd32(in + 0x24));
+    int graph = amix_ok(0);
+    if (graph) for (int m = 0; m < AMIX_MAX; m++) if (amix_ok(m)) memset(g_abuf[m], 0, sizeof g_abuf[m][0] * (size_t)g_amix[m].buffers);
     uint64_t total = 0x40 + npool * 0x10 + nvoice * 0x10 + neffect * esz_out + nsink * 0x20 + 0x10 + 0xb0 + 0x10;
     if (total > cap) { if (said++ < 3) printf("audio: update output needs %llu bytes, the buffer holds %llu\n", (unsigned long long)total, (unsigned long long)cap); return 0x5299; }
     if (total != cap && said++ < 3) printf("audio: update output %llu bytes, buffer %llu (revision %u, %u pools %u voices %u effects %u sinks)\n", (unsigned long long)total, (unsigned long long)cap, rev, npool, nvoice, neffect, nsink);
@@ -439,6 +566,33 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
             if (!(step > 0.0f && step < 16.0f)) step = (float)(rate ? rate : 48000) / 48000.0f;
             if (cc < 1 || cc > 6) cc = 1;
             uint64_t coef = rd64(v + (rev >= 15 ? 0x60 : 0x48));
+            float *tb[6][48]; float tg[6][48]; int tn[6] = {0};   /* with the mix graph: the buffers each channel adds into, and the gains */
+            if (graph) {
+                uint64_t ids = v + (rev >= 15 ? 0x158 : 0x140);
+                int mid = (int)rd32(v + (rev >= 15 ? 0x70 : 0x58)), spl = (int)rd32(v + (rev >= 15 ? 0x74 : 0x5c));
+                for (uint32_t ch = 0; ch < cc && ch < 6; ch++) {
+                    if (amix_ok(mid)) {
+                        uint32_t rid = rd32(ids + ch * 4);
+                        for (uint32_t k = 0; k < nres; k++) {
+                            uint64_t r = ires + k * 0x70;
+                            if (rd32(r) != rid || !rd8(r + 0x64)) continue;
+                            for (int b = 0; b < g_amix[mid].buffers && tn[ch] < 48; b++) {
+                                float g = rdf(r + 4 + (uint64_t)b * 4) * vol;
+                                if (g != 0.0f) { tb[ch][tn[ch]] = g_abuf[mid][b]; tg[ch][tn[ch]++] = g; }
+                            }
+                            break;
+                        }
+                    } else for (int di = (int)ch; ; di += (int)cc) {
+                        int d = adst_of(spl, di);
+                        if (d < 0) break;
+                        if (!g_adst[d].in_use || !amix_ok(g_adst[d].mix)) continue;
+                        for (int b = 0; b < g_amix[g_adst[d].mix].buffers && tn[ch] < 48; b++) {
+                            float g = g_adst[d].vol[b] * vol;
+                            if (g != 0.0f) { tb[ch][tn[ch]] = g_abuf[g_adst[d].mix][b]; tg[ch][tn[ch]++] = g; }
+                        }
+                    }
+                }
+            }
             float gl[6], gr[6];                          /* left / right gain of each channel: its channel resource's mix volumes */
             {   uint64_t ids = v + (rev >= 15 ? 0x158 : 0x140);
                 uint32_t splitter = rd32(v + (rev >= 15 ? 0x74 : 0x5c));
@@ -453,6 +607,8 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
                     gl[ch] *= vol; gr[ch] *= vol;
                 }
             }
+            int routed = graph && (tn[0] || (cc > 1 && tn[1]));   /* no destination known for this voice: the direct stereo path */
+            if (vol > 0.0f && play == 0) { if (routed) g_routed++; else g_direct++; }
             int mix = mixing && (fmt == 2 || (fmt == 6 && coef > 0x10000)) && (vol > 0.0f);
             if (mixing && fmt == 6 && coef <= 0x10000) {       /* an ADPCM voice without coefficients where they were looked for: the layout */
                 static int said_v;
@@ -477,9 +633,11 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
                     uint64_t data = rd64(b);
                     uint32_t idx = (uint32_t)start + s->pos;
                     for (uint32_t ch = 0; ch < cc; ch++) {
-                        int smp = 0;
-                        if (fmt == 2) smp = (int16_t)rd16(data + ((uint64_t)idx * cc + ch) * 2);
-                        else if (ch == 0) {
+                        int smp = 0, nxt = 0;                    /* the samples at idx and idx + 1: linear interpolation by frac */
+                        if (fmt == 2) {
+                            smp = (int16_t)rd16(data + ((uint64_t)idx * cc + ch) * 2);
+                            nxt = (int32_t)(idx + 1) < end ? (int16_t)rd16(data + ((uint64_t)(idx + 1) * cc + ch) * 2) : smp;
+                        } else if (ch == 0) {
                             int32_t f = (int32_t)(idx / 14);
                             if (s->af == -1) {                       /* a new buffer: its context, else the history carried on */
                                 uint64_t ctx = rd64(b + 0x28);
@@ -488,9 +646,11 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
                             } else if (f < s->af) adpcm_frame(s, data, f, coef);
                             else while (s->af < f) adpcm_frame(s, data, s->af + 1, coef);
                             smp = s->abuf[idx % 14];
+                            nxt = (idx + 1) % 14 ? s->abuf[(idx + 1) % 14] : (int32_t)(idx + 1) < end ? adpcm_peek(s, data, f + 1, coef) : smp;
                         }
-                        g_mix[o][0] += (float)smp * gl[ch];
-                        g_mix[o][1] += (float)smp * gr[ch];
+                        float val = (float)smp + (float)(nxt - smp) * s->frac;
+                        if (routed) { if (ch < 6) for (int t = 0; t < tn[ch]; t++) tb[ch][t][o] += val * tg[ch][t]; }
+                        else { g_mix[o][0] += val * gl[ch]; g_mix[o][1] += val * gr[ch]; }
                     }
                 }
                 s->frac += step;
@@ -515,6 +675,28 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
             unsigned used = 0, playing = 0;
             for (uint32_t i = 0; i < nvoice; i++) { uint64_t v = iv + i * vsz; used += rd8(v + 9) != 0; playing += rd8(v + 9) && rd8(v + 0xa) == 0; }
             printf("audio: update %llu: revision %u, %u voices (%u in use, %u playing), %u pools, %u effects, %u sinks\n", n, rev, nvoice, used, playing, npool, neffect, nsink);
+            {   /* the mix graph: splitters (header 'SNDH'), then the mixes (an 0x20 'dirty' header first when the count is not size / 0x930) */
+                uint64_t isp = ie + rd32(in + 0x14), imx = isp + rd32(in + 0x24);
+                uint32_t msz = rd32(in + 0x18), mcount = msz / 0x930;
+                printf("audio:   splitter section %u bytes: magic %08x infos %d destinations %d; mix section %u bytes, first words %08x %08x\n", rd32(in + 0x24),
+                       rd32(isp), (int)rd32(isp + 4), (int)rd32(isp + 8), msz, rd32(imx), rd32(imx + 4));
+                if (msz % 0x930) { mcount = rd32(imx + 4); imx += 0x20; }
+                for (uint32_t m = 0; m < mcount && m < 64; m++) {
+                    uint64_t mp = imx + m * 0x930;
+                    if (!rd8(mp + 0xc)) continue;
+                    printf("audio:   mix %d: volume %.3f buffers %u dest mix %d dest splitter %d effects %u; volumes to dest buffer 0/1 from buffer 0: %.3f %.3f, from 1: %.3f %.3f\n",
+                           (int)rd32(mp + 0x10), rdf(mp), rd32(mp + 8), (int)rd32(mp + 0x924), (int)rd32(mp + 0x928), rd32(mp + 0x14),
+                           rdf(mp + 0x24), rdf(mp + 0x28), rdf(mp + 0x24 + 96), rdf(mp + 0x28 + 96));
+                }
+                unsigned to[8] = {0}; unsigned via_splitter = 0;
+                for (uint32_t i = 0; i < nvoice; i++) { uint64_t v = iv + i * vsz; if (!rd8(v + 9)) continue; int mid = (int)rd32(v + (rev >= 15 ? 0x70 : 0x58)); if (mid >= 0 && mid < 8) to[mid]++; via_splitter += rd32(v + (rev >= 15 ? 0x74 : 0x5c)) != 0xffffffffu; }
+                printf("audio:   voices in use by destination mix: 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u, through a splitter: %u; voice updates routed %llu, direct %llu\n", to[0], to[1], to[2], to[3], to[4], to[5], to[6], to[7], via_splitter, g_routed, g_direct);
+                for (int m = 0; m < AMIX_MAX; m++) if (amix_ok(m)) printf("audio:   mix %d: volume %.3f buffers %d -> mix %d splitter %d\n", m, g_amix[m].volume, g_amix[m].buffers, g_amix[m].dest_mix, g_amix[m].dest_splitter);
+                for (uint32_t e = 0; e < neffect; e++) {           /* effects: type (2 aux 3 delay 4 reverb 5 i3dl2 6 biquad 7 limiter 8 capture 9 compressor), enabled, mix */
+                    uint64_t ep = ie + e * 0xc0;
+                    if (rd8(ep)) printf("audio:   effect %u: type %u enabled %u mix %d order %u\n", e, rd8(ep), rd8(ep + 2), (int)rd32(ep + 4), rd32(ep + 0x18));
+                }
+            }
         }
     }
     wr32(out + 0xc, nvoice * 0x10);
@@ -526,6 +708,7 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
     wr64(op, frames + 1); wr32(out + 0x28, 0x10);
     wr32(out + 0x3c, (uint32_t)total);
     wr32(out, rd32(in));
+    if (mixing && graph) amix_run();
     if (mixing) audio_out_frame();
     return 0;
 }
