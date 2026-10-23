@@ -430,6 +430,7 @@ static const uint8_t k_norm12[12] = {1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
 static const uint16_t k_pix[4] = {0x1903, 0x8227, 0x1907, 0x1908}, k_pixint[4] = {0x8D94, 0x8228, 0x8D98, 0x8D99};
 static const uint8_t k_astc[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6}, {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
 
+static int bl_has(uint32_t nh);
 static int fmt_get(int nf, Fmt *f) {
     memset(f, 0, sizeof *f);
     f->bw = f->bh = 1;
@@ -2222,6 +2223,22 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
         snprintf(path, sizeof path, "%s/b%05d_%s.glsl", dir, p->serial, k_stage_name[s]);
         FILE *f = fopen(path, "wb");
         if (f) { fputs(src, f); fclose(f); }
+        snprintf(path, sizeof path, "%s/b%05d_%s.hash", dir, p->serial, k_stage_name[s]);   /* the name an override takes */
+        if ((f = fopen(path, "wb"))) { fprintf(f, "%016llx\n", (unsigned long long)sh_hash(0, st->code, (size_t)st->code_len)); fclose(f); }
+    }
+    {   /* debug: TOMO_SHOVR=<dir> replaces the GLSL of a stage by <dir>/<hash of its GLSL>.glsl when that file exists */
+        const char *ov = getenv("TOMO_SHOVR");
+        char path[260];
+        FILE *f;
+        snprintf(path, sizeof path, "%s/%016llx.glsl", ov ? ov : "", (unsigned long long)sh_hash(0, src, strlen(src)));
+        if (ov && (f = fopen(path, "rb"))) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            char *b = malloc((size_t)n + 1);
+            b[fread(b, 1, (size_t)n, f)] = 0;
+            fclose(f);
+            free(out.glsl); out.glsl = src = b;
+            printf("nvn_gl: program #%d %s stage: GLSL replaced by %s\n", p->serial, k_stage_name[s], path);
+        }
     }
     const char *srcs[1] = {src};
     GLint ok = 0;
@@ -2663,6 +2680,7 @@ static TexObj *rt_view(Tex *t, const View *v) {
     v2.lay0 = (int16_t)((v->set & 0x82) == 0x82 ? v->lay0 : 0); v2.nlay = 1;
     return tex_view_obj(t, &v2);
 }
+static int g_rt0_layer, g_rt0_level, g_rt0_vset;      /* the draw log: layer / level of colour target 0 (-1: the whole texture or a view) */
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
     Fmt f;
@@ -2700,6 +2718,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         k.dkind = fmt_get(t->b.format, &f) ? f.kind : 1;
         if (!S.fbo_w) { S.fbo_w = t->b.width; S.fbo_h = t->b.height; }
     }
+    g_rt0_layer = k.layer[0]; g_rt0_level = k.level[0]; g_rt0_vset = n ? col[0].view.set : 0;
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
     g_fbo_bad_last = 0;
     S.fbo = fbo_get(&k);
@@ -2927,7 +2946,8 @@ static int draw_prepare(void) {
         printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
                vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, glIsEnabled(GL_DEPTH_TEST), dfunc,
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
-        if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format);
+        if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x layer %d level %d view set 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format, g_rt0_layer, g_rt0_level, g_rt0_vset);
+        for (int ci = 1; ci < 8; ci++) if (S.color[ci]) printf("  colour target %d: gl %u mem %p %dx%dx%d format 0x%x target %d\n", ci, S.color[ci]->o.gl, (void *)S.color[ci]->mem, S.color[ci]->b.width, S.color[ci]->b.height, S.color[ci]->b.depth, S.color[ci]->b.format, S.color[ci]->b.target);
         for (int s = 0; s < 2; s++) {
             printf("  %s buffers:", k_stage_name[s]);
             for (int n = 0; n < 16; n++) if (S.ubo[s][n].addr) printf(" c%d=%llx+%llu", n, (unsigned long long)S.ubo[s][n].addr, (unsigned long long)S.ubo[s][n].size);
@@ -2939,7 +2959,7 @@ static int draw_prepare(void) {
                     printf(" ]");
                 }
             printf("  textures:");
-            for (int n = 0; n < 8; n++) if (S.nvn_tex[s][n]) printf(" %d:%llx%s", n, (unsigned long long)S.nvn_tex[s][n], S.gl_tex[s][4 + n] == g_dummy_handle ? "(dummy)" : "");
+            for (int n = 0; n < 16; n++) if (S.nvn_tex[s][n]) printf(" %d:%llx%s", n, (unsigned long long)S.nvn_tex[s][n], S.gl_tex[s][4 + n] == g_dummy_handle ? "(dummy)" : "");
             printf("\n");
             for (int n = 0; n < 16; n++)
                 if (S.ubo[s][n].addr && S.prog[s] && (S.prog[s]->st[s].glsl_cbufs >> (n + 3) & 1)) {
@@ -2949,14 +2969,46 @@ static int draw_prepare(void) {
                     if (full < 0) full = getenv("SSBU_DRAWLOG_FULL") != NULL;
                     for (unsigned k = 0; k < (full ? 1024u : 24u) && k * 4 < S.ubo[s][n].size; k++) printf(" %g", f[k]);
                     printf("\n");
+                    static long cbw = -2;              /* TOMO_CBWORDS=<word>: 64 words from there, as hex, '*' after a bindless handle never noted */
+                    if (cbw == -2) cbw = getenv("TOMO_CBWORDS") ? atol(getenv("TOMO_CBWORDS")) : -1;
+                    static long cbn = -2; if (cbn == -2) cbn = getenv("TOMO_CBCOUNT") ? atol(getenv("TOMO_CBCOUNT")) : 64;
+                    if (cbw >= 0 && (cbw + cbn) * 4 <= (long)S.ubo[s][n].size) {
+                        const uint32_t *w = P(S.ubo[s][n].addr);
+                        printf("    c%d words %ld:", n, cbw);
+                        for (long k = cbw; k < cbw + cbn; k++) printf(" %x%s", w[k], bl_has(w[k]) ? "" : "*");
+                        printf("\n");
+                        for (long k = cbw; k < cbw + cbn; k++) {
+                            uint32_t tid = w[k] & 0xfffff;
+                            Tex *t = bl_has(w[k]) && S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
+                            if (t) printf("      handle %x: target %d format 0x%x %dx%dx%d levels %d gl %u uploaded %d rendered %d dead %d view set 0x%x format 0x%x target 0x%x\n", w[k], t->b.target, t->b.format,
+                                          t->b.width, t->b.height, t->b.depth, t->b.levels, t->o.gl, t->uploaded, t->gpu_written, t->dead, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format, S.tpool->e[tid].view.target);
+                            if (t && t->o.gl && t->b.target == 1 && t->b.width <= 4096) {
+                                char path[64];
+                                uint8_t *px = malloc((size_t)t->b.width * t->b.height * 4);
+                                glBindTexture(GL_TEXTURE_2D, t->o.gl);
+                                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                                while (glGetError()) {}
+                                snprintf(path, sizeof path, "tex_%04x_%dx%d.rgba", tid, t->b.width, t->b.height);
+                                FILE *fp = fopen(path, "wb");
+                                if (fp) { fwrite(px, 1, (size_t)t->b.width * t->b.height * 4, fp); fclose(fp); }
+                                free(px);
+                            }
+                        }
+                    }
                 }
-            for (int n = 0; n < 8; n++) {
+            for (int n = 0; n < 16; n++) {
                 uint32_t tid = (uint32_t)S.nvn_tex[s][n] & 0xfffff;
                 Tex *t = S.tpool && tid && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
                 static uint8_t seen[0x4000];
                 if (!t) continue;
                 printf("    texture %d: id 0x%x target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u uploaded %d rendered %d view set 0x%x format 0x%x\n", n, tid, t->b.target, t->b.format, t->b.width,
                        t->b.height, t->b.depth, t->b.levels, t->b.flags, t->o.gl, t->uploaded, t->gpu_written, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format);
+                if (t->mem && t->storage >= 65536)     /* other live textures over the same memory (a target written under another object) */
+                    for (Tex *o = g_all_tex; o; o = o->all_next)
+                        if (o != t && !o->dead && o->mem && o->mem < t->mem + t->storage && o->mem + o->storage > t->mem)
+                            printf("      overlaps gl %u mem %+lld %dx%dx%d format 0x%x target %d levels %d rendered %d\n", o->o.gl, (long long)(o->mem - t->mem), o->b.width, o->b.height,
+                                   o->b.depth, o->b.format, o->b.target, o->b.levels, o->gpu_written);
                 {   uint32_t sid = (uint32_t)(S.nvn_tex[s][n] >> 20) & 0xfff;
                     if (S.spool && sid < (uint32_t)S.spool->count) {
                         const SamplerParams *sp = &S.spool->e[sid];
@@ -4044,6 +4096,11 @@ static SRWLOCK g_bl_lock = SRWLOCK_INIT;
 static uint32_t g_tgen[1 << 20], g_sgen[1 << 12];       /* bumped by a registration of that texture / sampler id: only its pairs are resolved again */
 static volatile LONG g_pool_gen = 1;
 static GLuint g_bl_buf;
+static int bl_has(uint32_t nh) {
+    uint32_t k = (nh * 2654435761u) >> 16;
+    for (int i = 0; i < 65536 && g_bl_slot[k]; i++, k = (k + 1) & 65535) if (g_bl[g_bl_slot[k] - 1].nh == nh) return 1;
+    return 0;
+}
 static void bl_note(uint32_t nh) {
     uint32_t k = (nh * 2654435761u) >> 16;
     AcquireSRWLockExclusive(&g_bl_lock);
@@ -4311,6 +4368,30 @@ static void job_present(void *arg) {
     LONG64 frame = g_st.frames + 1;
     LONG64 pf0 = pf_now();
     if (shot == -2) { shot = getenv("SSBU_SHOT") ? atoi(getenv("SSBU_SHOT")) : -1; every = getenv("SSBU_SHOT_EVERY") ? atoi(getenv("SSBU_SHOT_EVERY")) : 0; shot_from = getenv("SSBU_SHOT_FROM") ? atoi(getenv("SSBU_SHOT_FROM")) : 0; }
+    {   /* debug: TOMO_DBGBUF=<frame>: 64 KB of floats at storage binding 38 for override shaders (TOMO_SHOVR) to write; rows of 80 printed at that frame */
+        static int dbf = -2;
+        static GLuint dbb;
+        if (dbf == -2) dbf = getenv("TOMO_DBGBUF") ? atoi(getenv("TOMO_DBGBUF")) : -1;
+        if (dbf >= 0) {
+            if (!dbb) { void *z = calloc(1, 65536); glCreateBuffers(1, &dbb); glNamedBufferData(dbb, 65536, z, 0x88E8); free(z); }
+            if (frame == dbf) {
+                float *v = malloc(65536);
+                glMemoryBarrier(0xffffffffu);
+                glGetNamedBufferSubData(dbb, 0, 65536, v);
+                for (int row = 0; row < 65536 / 4 / 80; row++) {
+                    int any = 0;
+                    for (int i = 0; i < 80; i++) any |= v[row * 80 + i] != 0.0f;
+                    if (!any) continue;
+                    printf("dbgbuf %d:", row);
+                    for (int i = 0; i < 80; i++) printf(" %g", v[row * 80 + i]);
+                    printf("\n");
+                }
+                fflush(stdout);
+                free(v);
+            }
+            glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 38, dbb, 0, 65536);
+        }
+    }
     GetClientRect(g_hwnd, &r);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_FRAMEBUFFER_SRGB_);
