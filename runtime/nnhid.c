@@ -306,6 +306,8 @@ static void anchor_tick(void) {                           /* once per poll */
     }
 }
 
+static int g_play_done;                                  /* SSBU_PLAY: the recording has been fed to its end */
+static int replay_running(void) { return g_play_count > 0 && !g_play_done; }
 static void record_or_replay(uint64_t *buttons, int *lx, int *ly, int *rx, int *ry) {
     if (g_play_count < 0) {
         const char *play = getenv("SSBU_PLAY"), *rec = getenv("SSBU_REC");
@@ -343,6 +345,11 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly, int *rx, int *
                 printf("input replay: poll %lld (anchor %d + %lld) buttons %llx stick %d %d\n", g_rec_poll, g_anchor, since, (unsigned long long)g_play[g_play_pos].buttons, g_play[g_play_pos].lx, g_play[g_play_pos].ly);
             g_play_pos++;
         }
+        if (g_play_pos >= g_play_count && !g_play_done) {       /* the rest is the sequence's (seq_tick), or the player's */
+            g_play_done = 1;
+            printf("input replay: end of the recording at poll %lld: SSBU_SEQ or the player continues\n", g_rec_poll);
+        }
+        if (g_play_done) return;
         if (g_play_pos > 0 && (g_play[g_play_pos - 1].anchor >= 0 || g_play[g_play_pos - 1].poll >= 0)) {
             *buttons = g_play[g_play_pos - 1].buttons; *lx = g_play[g_play_pos - 1].lx; *ly = g_play[g_play_pos - 1].ly; *rx = g_play[g_play_pos - 1].rx; *ry = g_play[g_play_pos - 1].ry;
         } else { *buttons = 0; *lx = 0; *ly = 0; *rx = 0; *ry = 0; }
@@ -591,7 +598,7 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
     if (id == 0) { int fight_seq_ticks(void); int nt = fight_seq_ticks();
                    if (r1_on() && r1_poll(mark_seen("fight") ? nt : 0)) nt = 0;                  /* R1 re-run: the sequence waits, the recorded values are given (R1 run-ahead: the speculative poll) */
                    fight_shot_poll(nt); if (mark_seen("fight")) l1_ticks += nt;
-                   for (int n = nt; n > 0; n--) seq_tick(); }     /* S11: 1 per poll; SSBU_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
+                   if (!replay_running()) for (int n = nt; n > 0; n--) seq_tick(); }   /* with SSBU_PLAY, the sequence starts where the recording ends */     /* S11: 1 per poll; SSBU_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
     if (!player_connected(id)) return;
     static const struct { int vk, bit; } map[] = {
         {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},

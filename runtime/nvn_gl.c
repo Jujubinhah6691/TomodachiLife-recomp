@@ -3026,6 +3026,20 @@ static int draw_prepare(void) {
                     glGetTextureSubImage(t->o.gl, 0, t->b.width / 2, t->b.height / 2, 0, 1, 1, 1, GL_RGBA, GL_FLOAT, sizeof a, a);
                     if (vo && vo->gl) glGetTextureSubImage(vo->gl, 0, t->b.width / 2, t->b.height / 2, 0, 1, 1, 1, GL_RGBA, GL_FLOAT, sizeof b, b);
                     while (glGetError()) {}
+                    if (vo && vo->gl) {
+                        GLint fmt = 0, imm = 0, minl = 0, numl = 0, base = 0, maxl = 0, minf = 0, w = 0;
+                        glBindTexture(GL_TEXTURE_2D, vo->gl);
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003 /* INTERNAL_FORMAT */, &fmt);
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                        glGetTexParameteriv(GL_TEXTURE_2D, 0x912F /* IMMUTABLE_FORMAT */, &imm);
+                        glGetTexParameteriv(GL_TEXTURE_2D, 0x82DB /* VIEW_MIN_LEVEL */, &minl);
+                        glGetTexParameteriv(GL_TEXTURE_2D, 0x82DC /* VIEW_NUM_LEVELS */, &numl);
+                        glGetTexParameteriv(GL_TEXTURE_2D, 0x813C /* BASE_LEVEL */, &base);
+                        glGetTexParameteriv(GL_TEXTURE_2D, 0x813D /* MAX_LEVEL */, &maxl);
+                        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+                        while (glGetError()) {}
+                        printf("      view object: internal 0x%x width %d immutable %d levels %d+%d base %d max %d min filter 0x%x\n", fmt, w, imm, minl, numl, base, maxl, minf);
+                    }
                     printf("      centre texel: texture gl %u %g %g %g %g | view gl %u%s %g %g %g %g\n", t->o.gl, a[0], a[1], a[2], a[3], vo ? vo->gl : 0, vo && vo->alias ? " (alias)" : "", b[0], b[1], b[2], b[3]);
                     {   Tex *t2; View v2; SamplerParams p2;
                         int hs2 = handle_lookup(S.tpool, S.spool, S.nvn_tex[s][n], &t2, &v2, &p2);
