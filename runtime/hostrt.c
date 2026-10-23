@@ -589,6 +589,16 @@ void host_import(Ctx *c, int sym) {
         if (w >= 0) printf("import_watch: watching \"%s\"\n", dyn_syms[w].name);
         g_watch_sym = w;
     }
+    {   /* TOMO_IMPORTLOG_FROM=<frame> (diagnosis): from that presented frame on, the first call of each import, with its caller */
+        static long long from = -1;
+        static volatile LONG seen[8192];
+        if (from < 0) { const char *e = getenv("TOMO_IMPORTLOG_FROM"); from = e ? atoll(e) : 0; }
+        if (from && sym < 8192 && !seen[sym]) {
+            long long display_frame_count(void);
+            if (display_frame_count() >= from && !InterlockedExchange(&seen[sym], 1))
+                printf("importlog: frame %lld %s from %llx (x0 %llx)\n", display_frame_count(), dyn_syms[sym].name, (unsigned long long)c->x[30], (unsigned long long)c->x[0]);
+        }
+    }
     if (sym != g_watch_sym) { host_import_real(c, sym); return; }
     extern long long nvn_front_frame_next(void);
     static long long cur_frame, n, tks, max_tk, n_all; static char max_txt[72]; static uint64_t max_ra, ras[64]; static int nras; static uint64_t max_x1;

@@ -278,22 +278,21 @@ static int key(int vk) { return scripted(vk) || script_key(vk) || seq_key(vk) ||
  * lasted 30 polls (shorter blips while a screen builds up are ignored). An input is replayed when the same anchor
  * has been reached and the same number of polls has passed since it.
  * The older format "<poll> <buttons hex> <lx> <ly>" (polls counted from the movie only) is still read. */
-static struct { long long poll; int anchor; uint64_t buttons; int lx, ly; } *g_play;
+static struct { long long poll; int anchor; uint64_t buttons; int lx, ly, rx, ry; } *g_play;
 static int g_play_count = -1, g_play_pos;
 static FILE *g_rec;
 static long long g_rec_poll, g_rec_mark = -1;
 static uint64_t g_rec_buttons = ~0ull;
-static int g_rec_lx, g_rec_ly;
+static int g_rec_lx, g_rec_ly, g_rec_rx, g_rec_ry;
 static int g_anchor = -1, g_anchor_class = -1, g_anchor_cand = -1, g_anchor_run;
 static long long g_anchor_poll, g_anchor_cand_poll;
 
 static int draw_class(long d) { return d <= 12 ? 0 : d <= 60 ? 1 : d <= 240 ? 2 : 3; }
 
 static void anchor_tick(void) {                           /* once per poll */
-    if (g_anchor < 0) {
-        if (!mark_seen("movie")) return;
+    if (g_anchor < 0) {                                   /* Tomodachi Life has no opening movie (SSBU's mark): anchor 0 is the first poll */
         g_anchor = 0; g_anchor_poll = g_rec_poll; g_anchor_class = -1; g_anchor_cand = -1;
-        printf("input anchor 0 at poll %lld: opening movie created\n", g_rec_poll);
+        printf("input anchor 0 at poll %lld: the first poll\n", g_rec_poll);
         return;
     }
     int cls = draw_class(g_frame_draws_seen);
@@ -307,7 +306,7 @@ static void anchor_tick(void) {                           /* once per poll */
     }
 }
 
-static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
+static void record_or_replay(uint64_t *buttons, int *lx, int *ly, int *rx, int *ry) {
     if (g_play_count < 0) {
         const char *play = getenv("SSBU_PLAY"), *rec = getenv("SSBU_REC");
         g_play_count = 0;
@@ -316,18 +315,18 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
             char line[256];
             int cap = 0;
             while (fgets(line, sizeof line, f)) {
-                long long poll; unsigned long long b; int x, y, anchor = -1;
+                long long poll; unsigned long long b; int x, y, x2 = 0, y2 = 0, anchor = -1;
                 if (line[0] == '#') continue;
-                if (sscanf(line, "a %d %lld %llx %d %d", &anchor, &poll, &b, &x, &y) != 5 && (anchor = -1, sscanf(line, "%lld %llx %d %d", &poll, &b, &x, &y) != 4)) continue;
+                if (sscanf(line, "a %d %lld %llx %d %d %d %d", &anchor, &poll, &b, &x, &y, &x2, &y2) < 5 && (anchor = -1, sscanf(line, "%lld %llx %d %d", &poll, &b, &x, &y) != 4)) continue;
                 if (g_play_count == cap) { cap = cap ? cap * 2 : 1024; g_play = realloc(g_play, (size_t)cap * sizeof *g_play); }
-                g_play[g_play_count].poll = poll; g_play[g_play_count].anchor = anchor; g_play[g_play_count].buttons = b; g_play[g_play_count].lx = x; g_play[g_play_count++].ly = y;
+                g_play[g_play_count].poll = poll; g_play[g_play_count].anchor = anchor; g_play[g_play_count].buttons = b; g_play[g_play_count].lx = x; g_play[g_play_count].ly = y; g_play[g_play_count].rx = x2; g_play[g_play_count++].ry = y2;
             }
             fclose(f);
             printf("input replay: %d changes from %s\n", g_play_count, play);
         } else if (play) printf("input replay: cannot open %s\n", play);
         if (!g_play_count) {
             g_rec = fopen(rec ? rec : "input_last.rec", "w");
-            if (g_rec) fprintf(g_rec, "# a <anchor> <polls since the anchor> <buttons hex> <lx> <ly>   (see nnhid.c; replay with SSBU_PLAY=<this file>)\n");
+            if (g_rec) fprintf(g_rec, "# a <anchor> <polls since the anchor> <buttons hex> <lx> <ly> <rx> <ry>   (see nnhid.c; replay with SSBU_PLAY=<this file>)\n");
         }
     }
     g_rec_poll++;
@@ -344,13 +343,14 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
                 printf("input replay: poll %lld (anchor %d + %lld) buttons %llx stick %d %d\n", g_rec_poll, g_anchor, since, (unsigned long long)g_play[g_play_pos].buttons, g_play[g_play_pos].lx, g_play[g_play_pos].ly);
             g_play_pos++;
         }
-        if (g_play_pos > 0 && (g_play[g_play_pos - 1].anchor >= 0 || g_play[g_play_pos - 1].poll >= 0)) { *buttons = g_play[g_play_pos - 1].buttons; *lx = g_play[g_play_pos - 1].lx; *ly = g_play[g_play_pos - 1].ly; }
-        else { *buttons = 0; *lx = 0; *ly = 0; }
+        if (g_play_pos > 0 && (g_play[g_play_pos - 1].anchor >= 0 || g_play[g_play_pos - 1].poll >= 0)) {
+            *buttons = g_play[g_play_pos - 1].buttons; *lx = g_play[g_play_pos - 1].lx; *ly = g_play[g_play_pos - 1].ly; *rx = g_play[g_play_pos - 1].rx; *ry = g_play[g_play_pos - 1].ry;
+        } else { *buttons = 0; *lx = 0; *ly = 0; *rx = 0; *ry = 0; }
         return;
     }
-    if (g_rec && g_anchor >= 0 && (*buttons != g_rec_buttons || *lx != g_rec_lx || *ly != g_rec_ly)) {
-        g_rec_buttons = *buttons; g_rec_lx = *lx; g_rec_ly = *ly;
-        fprintf(g_rec, "a %d %lld %llx %d %d\n", g_anchor, since, (unsigned long long)*buttons, *lx, *ly);
+    if (g_rec && g_anchor >= 0 && (*buttons != g_rec_buttons || *lx != g_rec_lx || *ly != g_rec_ly || *rx != g_rec_rx || *ry != g_rec_ry)) {
+        g_rec_buttons = *buttons; g_rec_lx = *lx; g_rec_ly = *ly; g_rec_rx = *rx; g_rec_ry = *ry;
+        fprintf(g_rec, "a %d %lld %llx %d %d %d %d\n", g_anchor, since, (unsigned long long)*buttons, *lx, *ly, *rx, *ry);
         fflush(g_rec);
     }
 }
@@ -637,7 +637,7 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
         ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
         wired = !g_x[slot].wireless;
     }
-    if (id == 0) record_or_replay(&buttons, &lx, &ly);
+    if (id == 0) record_or_replay(&buttons, &lx, &ly, &rx, &ry);
     if (id == 0 && r1_on()) r1_pad(&buttons, &lx, &ly, &rx, &ry);
     if (id == 1 && r1_on()) { void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry); r1_pad_id(1, &buttons, &lx, &ly, &rx, &ry); }      /* R3: port 2 in an online rollback match */
     if (lx < -STICK_MAX / 2) buttons |= 1ull << BTN_SL_LEFT;

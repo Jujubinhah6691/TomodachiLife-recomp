@@ -56,7 +56,7 @@ static const char *const g_stk[4] = {"LX", "LY", "RX", "RY"};
 static const char *const g_kbn[24] = {"A", "B", "X", "Y", "STICK_L", "STICK_R", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN",
     "LSTICK_LEFT", "LSTICK_UP", "LSTICK_RIGHT", "LSTICK_DOWN", "RSTICK_LEFT", "RSTICK_UP", "RSTICK_RIGHT", "RSTICK_DOWN"};
 static const int g_kb_default[24] = {'Z', 'X', 'C', 'V', 0, 0, 'Q', 'E', 'A', 'S', VK_RETURN, VK_BACK, 'J', 'I', 'L', 'K',
-    VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, 0, 0, 0, 0};
+    VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, 'F', 'T', 'H', 'G'};      /* right stick: F T H G (Tomodachi Life's camera) */
 
 static CRITICAL_SECTION g_cs;
 static volatile LONG g_cs_ready;

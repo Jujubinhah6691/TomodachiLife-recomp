@@ -373,6 +373,33 @@ static void sky_run_inline(Ctx *c, SkyInline *e) {
 }
 /* the re-lifted code calls this before the instruction at pc (game_shim.c / nro_shim.c host interface) */
 void sky_site_inline(Ctx *c, uint64_t pc) {
+    if (pc >> 56 == 0xfe) {                       /* diagnosis: a mark a hand-edited lifted function calls with 0xfe<<56 | address */
+        static uint64_t seen[8192]; static long long from = -1;      /* TOMO_MARK_FROM=<frame>: each address once, from that frame */
+        long long display_frame_count(void);
+        if (from < 0) { const char *e = getenv("TOMO_MARK_FROM"); from = e ? atoll(e) : 0; }
+        if (display_frame_count() < from) return;
+        uint64_t a = pc & 0x00ffffffffffffffull;
+        {   static char list[512] = "?";             /* TOMO_MARK_EVERY=<hex>,<hex>,...: those addresses on every call */
+            if (list[0] == '?') { const char *e = getenv("TOMO_MARK_EVERY"); snprintf(list, sizeof list, ",%s,", e ? e : ""); }
+            char key[24]; snprintf(key, sizeof key, ",%llx,", (unsigned long long)a);
+            if (strstr(list, key)) {
+                static long long to = -1;
+                if (to < 0) { const char *e = getenv("TOMO_MARK_TO"); to = e ? atoll(e) : 0x7fffffffffffffffll; }
+                if (display_frame_count() > to) return;
+                uint64_t o = c->x[0];
+                printf("mark: frame %lld f_%llx x0 %llx w1 %x w2 %x lr %llx | 11c %02x %02x %02x 123 %02x\n", display_frame_count(), (unsigned long long)a, (unsigned long long)o,
+                       (unsigned)c->x[1], (unsigned)c->x[2], (unsigned long long)c->x[30],
+                       o > 0x10000 ? rd8(o + 0x11c) : 0, o > 0x10000 ? rd8(o + 0x11d) : 0, o > 0x10000 ? rd8(o + 0x11e) : 0, o > 0x10000 ? rd8(o + 0x123) : 0);
+                return;
+            }
+        }
+        unsigned h = (unsigned)((a >> 2) * 2654435761u) & 8191;
+        while (seen[h] && seen[h] != a) h = (h + 1) & 8191;
+        if (seen[h]) return;
+        seen[h] = a;
+        printf("mark: frame %lld f_%llx x0 %llx w1 %llx\n", display_frame_count(), (unsigned long long)a, (unsigned long long)c->x[0], (unsigned long long)(uint32_t)c->x[1]);
+        return;
+    }
     SkyInline *e = sky_ih_find(pc);
     if (e && e->n) sky_run_inline(c, e);
 }

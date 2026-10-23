@@ -98,7 +98,15 @@ static void fs_read_file_opt(Ctx *c) {                   /* ReadFile(size_t *out
 static void mii_db_get_index(Ctx *c) { wr32(A0, (uint32_t)-1); RET(RESULT_UNAVAILABLE); }
 
 /* ---- nn::ngc::ProfanityFilter: no word is profane */
-static void ngc_check_words(Ctx *c) { if (A0) memset((void *)(uintptr_t)A0, 0, (size_t)(uint32_t)A1 * 4); RET(0); }
+/* CheckProfanityWords is a member: (this, uint32_t *results, uint32_t patterns, const char16_t / char **words, size_t count);
+ * each result is the bit set of the patterns the word matches: 0 for every word */
+static void ngc_check_words(Ctx *c) {
+    uint64_t results = A1, count = c->x[4];
+    static int said;
+    if (said++ < 5) printf("nn::ngc: CheckProfanityWords: %llu word(s), none profane\n", (unsigned long long)count);
+    if (results && count < 4096) memset((void *)(uintptr_t)results, 0, (size_t)count * 4);
+    RET(0);
+}
 
 /* ---- nn::swkbd::InlineKeyboard. The console draws its keyboard into an image the game shows and reports through
  * callbacks; here the text comes from the host's text prompt (nnapplet.c swkbd_prompt: a dialog, or SSBU_SWKBD=text:<..>)
@@ -161,10 +169,14 @@ static void ik_set_input_text(Ctx *c) {
     for (; it && n < 500; n++) { uint16_t ch = rd16(it + (uint64_t)n * 2); if (!ch) break; g_ik.initial[n] = ch; }
     g_ik.initial[n] = 0;
 }
+static uint8_t g_ik_snap[0x1d00];                     /* TOMO_IKLOG: the owner at the first Appear, diffed 3 s after the decision */
+static uint64_t g_ik_snap_owner;
+static volatile ULONGLONG g_ik_decided_at;
 static void ik_appear(Ctx *c) {                           /* AppearArg: +0x1c the most characters the game allows */
     int ml = (int)rd32(A1 + 0x1c);
     g_ik.max_len = ml > 0 && ml <= 500 ? ml : 32;
     if (g_ik.shown) return;
+    if (getenv("TOMO_IKLOG") && !g_ik_snap_owner) { g_ik_snap_owner = c->x[19]; memcpy(g_ik_snap, (void *)(uintptr_t)c->x[19], sizeof g_ik_snap); }
     g_ik.shown = 1; g_ik.shown_frames = 0; g_ik.text_sent = 0;
     InterlockedExchange(&g_ik.answer, 0);
     g_ik.thread = CreateThread(NULL, 0, ik_prompt_thread, NULL, 0, NULL);
@@ -189,7 +201,28 @@ static void ik_print(const char *what) {
     printf("ik: %s state %u init %u want %u decided %u 4b4 %u 1c18 %u textbox %u shown %u calc %u\n", what, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
     fflush(stdout);
 }
-static DWORD WINAPI ik_watch(void *p) { (void)p; for (;;) { Sleep(1000); ik_print("watch"); } }
+static DWORD WINAPI ik_watch(void *p) {
+    (void)p;
+    for (;;) {
+        Sleep(1000);
+        ik_print("watch");
+        if (g_ik_decided_at && GetTickCount64() - g_ik_decided_at > 3000 && g_ik_snap_owner) {
+            g_ik_decided_at = 0;
+            {   const char *fx = getenv("TOMO_IKFIX");    /* experiment: <hex offset>=<hex value> written into the owner */
+                unsigned off, val;
+                if (fx && sscanf(fx, "%x=%x", &off, &val) == 2) { wr32(g_ik_snap_owner + off, val); printf("ik: wrote %x to owner +%x\n", val, off); }
+            }
+            printf("ik: owner fields changed since Appear (offset: then -> now):\n");
+            int n = 0;
+            for (uint32_t off = 0; off < sizeof g_ik_snap && n < 120; off += 4) {
+                uint32_t then, now = rd32(g_ik_snap_owner + off);
+                memcpy(&then, g_ik_snap + off, 4);
+                if (then != now) { printf("  +%04x: %08x -> %08x\n", off, then, now); n++; }
+            }
+            fflush(stdout);
+        }
+    }
+}
 static void ik_trace(Ctx *c, const char *what) {
     static int on = -1;
     if (on < 0) { on = getenv("TOMO_IKLOG") != NULL; if (on) CloseHandle(CreateThread(NULL, 0, ik_watch, NULL, 0, NULL)); }
@@ -220,6 +253,7 @@ static void ik_calc(Ctx *c) {
         /* decided: the keyboard closes in this same Calc (state 1). The game's closing step [0x7102099a80] waits for a 1 and
          * otherwise calls Disappear, after which Calc is no longer called: a later 1 would never arrive. */
         g_ik.shown = 0; g_ik.closed_frames = 30;
+        g_ik_decided_at = GetTickCount64();
         if (a == 1) { printf("nn::swkbd: inline keyboard: decided\n"); ik_call(c, g_ik.cb_enter, (uint64_t)(uintptr_t)g_ik_arg); }
         else { printf("nn::swkbd: inline keyboard cancelled\n"); ik_call(c, g_ik.cb_cancel, 0); }
     }
@@ -249,19 +283,27 @@ static void prepo_limit_event(Ctx *c) {
  * audren service on the console. For now the renderer only keeps time: once started it signals the game's system event
  * every audio frame (5 ms, the console's rate), and an update is accepted without mixing (no sound yet). */
 void os_signal_event(uint64_t key);                      /* os_threads.c */
-typedef struct { uint64_t event; HANDLE timer; } Renderer;
+typedef struct { uint64_t obj[2]; uint64_t vtbl[32]; uint64_t event; HANDLE timer; uint64_t frames; } Renderer;
 static Renderer g_ren[4];
+static void audren_request_update(Ctx *c, void *user);
 static void CALLBACK ren_tick(void *p, BOOLEAN unused) { (void)unused; os_signal_event(((Renderer *)p)->event); }
 static void audio_open(Ctx *c) {                         /* (AudioRendererHandle *out, SystemEvent *event, const Parameter &, void *work, size_t) */
     int i = 0;
     while (i < 4 && g_ren[i].event) i++;
     if (i == 4) { RET(RESULT_UNAVAILABLE); return; }
-    g_ren[i].event = A1;
+    Renderer *r = &g_ren[i];
+    static uint64_t fn_update, fn_other;
+    if (!fn_update) { fn_update = hostfn_closure("audren:RequestUpdate", audren_request_update, NULL); fn_other = hostfn_address("audren:other", ret0); }
+    for (int k = 0; k < 32; k++) r->vtbl[k] = fn_other;
+    r->vtbl[0x40 / 8] = fn_update;                       /* [sdk 0x221160]: ldr x8, [handle]; ldr x8, [x8, #0x40]; blr x8 */
+    r->obj[0] = (uint64_t)(uintptr_t)r->vtbl; r->obj[1] = (uint64_t)i;
+    r->event = A1; r->frames = 0;
     os_init_event(A1, 1);
-    wr64(A0, (uint64_t)(i + 1));
+    wr64(A0, (uint64_t)(uintptr_t)r->obj);               /* AudioRendererHandle is 16 bytes: the object, then nothing */
+    wr64(A0 + 8, 0);
     RET(0);
 }
-static Renderer *ren_of(uint64_t h) { return h >= 1 && h <= 4 ? &g_ren[h - 1] : NULL; }
+static Renderer *ren_of(uint64_t h) { for (int i = 0; i < 4; i++) if (h == (uint64_t)(uintptr_t)g_ren[i].obj) return &g_ren[i]; return NULL; }
 static void audio_start(Ctx *c) {
     Renderer *r = ren_of(A0);
     if (r && !r->timer) CreateTimerQueueTimer(&r->timer, NULL, ren_tick, r, 5, 5, WT_EXECUTEDEFAULT);
@@ -274,9 +316,10 @@ static void audio_stop(Ctx *c) {
 }
 static void audio_close(Ctx *c) { audio_stop(c); Renderer *r = ren_of(A0); if (r) r->event = 0; }
 static void audio_work_size(Ctx *c) { RET(0x100000); }
-/* RequestUpdateAudioRenderer(handle, const AudioRendererConfig *): the service renders one audio frame per update and reports
- * it in the config's output; the elapsed frame count the SDK reads back [sdk 0x2182f0] is the 64-bit word *(config + 0x40).
- * The game's audio framework waits on it before it runs its queued work (no mixing yet). */
+/* RequestUpdateAudioRenderer is the SDK's own (lifted, sdklift_roots.txt): it serializes the game's voices, pools, effects
+ * and sinks into the config's input buffer, calls the service (audren_request_update below) and unpacks the reply into the
+ * game's objects: played samples and released wave buffers of each voice, the elapsed frame count (render info). Before,
+ * the public function itself was answered here and the game's voices never moved (any wait for a sound to end hung). */
 /* The audren update, as the console's service answers it (layouts: Eden audio_core, renderer/behavior/info_updater.cpp).
  * Input (config +0x48, the SDK's own serialization): header 0x40 {revision, behaviour, memory pools, voices, voice
  * resources, effects, mixes, sinks, performance, splitter, render info sizes; total at +0x3c}, then the sections in that
@@ -287,12 +330,9 @@ static void audio_work_size(Ctx *c) { RET(0x100000); }
  * 48 kHz) so the game's streaming and sound-state logic run as on the console. */
 typedef struct { uint64_t played; uint32_t consumed, popped, pos, last_index, seen; } SilentVoice;
 static SilentVoice g_sv[1024];
-static void audio_update(Ctx *c) {
+static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t frames) {
     static int said;
-    uint64_t cfg = A1;
-    if (!cfg) { if (said++ < 3) printf("audio: update with no config (handle %llu)\n", (unsigned long long)A0); RET(0); return; }
-    uint64_t in = rd64(cfg + 0x48), out = rd64(cfg + 0x58), cap = rd64(cfg + 0x60), frames = rd64(cfg + 0x40);
-    if (!in || !out) { RET(0); return; }
+    if (!in || !out) return 0;
     uint32_t rev = (rd32(in) >> 24) - '0';
     uint32_t vsz = rev >= 15 ? 0x188 : 0x170, esz_out = rev >= 9 ? 0x90 : 0x10;
     uint32_t npool = rd32(in + 8) / 0x20, nvoice = rd32(in + 0xc) / vsz, neffect = rd32(in + 0x14) / 0xc0, nsink = rd32(in + 0x1c) / 0x140;
@@ -300,7 +340,7 @@ static void audio_update(Ctx *c) {
     uint64_t iv = ip + rd32(in + 8) + rd32(in + 0x10);   /* voices follow the voice channel resources */
     uint64_t ie = iv + rd32(in + 0xc);
     uint64_t total = 0x40 + npool * 0x10 + nvoice * 0x10 + neffect * esz_out + nsink * 0x20 + 0x10 + 0xb0 + 0x10;
-    if (total > cap) { if (said++ < 3) printf("audio: update output needs %llu bytes, the buffer holds %llu\n", (unsigned long long)total, (unsigned long long)cap); RET(0x5299); return; }
+    if (total > cap) { if (said++ < 3) printf("audio: update output needs %llu bytes, the buffer holds %llu\n", (unsigned long long)total, (unsigned long long)cap); return 0x5299; }
     if (total != cap && said++ < 3) printf("audio: update output %llu bytes, buffer %llu (revision %u, %u pools %u voices %u effects %u sinks)\n", (unsigned long long)total, (unsigned long long)cap, rev, npool, nvoice, neffect, nsink);
     memset((void *)(uintptr_t)out, 0, (size_t)cap);
     uint64_t op = out + 0x40;
@@ -330,8 +370,22 @@ static void audio_update(Ctx *c) {
                 s->consumed++; pending++; avail--;
             }
         }
+        {   static int log = -1; static unsigned long long upd;    /* TOMO_AUDIOLOG=1: the voices in use, every 1000 updates (5 s) */
+            if (log < 0) log = getenv("TOMO_AUDIOLOG") != NULL;
+            if (log && i == 0) upd++;
+            if (log && upd % 1000 == 0 && in_use)
+                printf("audio: voice %u play %u rate %u buffers %u index %u consumed %u popped %u played %llu new %u\n", id, play, rate, count, index, s->consumed, s->popped, (unsigned long long)s->played, is_new);
+        }
         wr64(op, is_new ? 0 : s->played);
         wr32(op + 8, is_new ? 0 : s->consumed);
+    }
+    {   static int log = -1; static unsigned long long n;
+        if (log < 0) log = getenv("TOMO_AUDIOLOG") != NULL;
+        if (log && n++ % 1000 == 0) {
+            unsigned used = 0, playing = 0;
+            for (uint32_t i = 0; i < nvoice; i++) { uint64_t v = iv + i * vsz; used += rd8(v + 9) != 0; playing += rd8(v + 9) && rd8(v + 0xa) == 0; }
+            printf("audio: update %llu: revision %u, %u voices (%u in use, %u playing), %u pools, %u effects, %u sinks\n", n, rev, nvoice, used, playing, npool, neffect, nsink);
+        }
     }
     wr32(out + 0xc, nvoice * 0x10);
     for (uint32_t i = 0; i < neffect; i++, op += esz_out) wr8(op, rd8(ie + i * 0xc0 + 2) ? 3 : 2);   /* enabled: Used, else Initialized */
@@ -342,7 +396,16 @@ static void audio_update(Ctx *c) {
     wr64(op, frames + 1); wr32(out + 0x28, 0x10);
     wr32(out + 0x3c, (uint32_t)total);
     wr32(out, rd32(in));
-    RET(0);
+    return 0;
+}
+/* IAudioRenderer::RequestUpdate (vtable +0x40), called by the lifted SDK [sdk 0x221164]: x1 -> {output, size},
+ * x2 -> {performance buffer, size}, x3 -> {input, size}; 0 = success */
+static void audren_request_update(Ctx *c, void *user) {
+    (void)user;
+    Renderer *r = ren_of(A0);
+    uint64_t out = rd64(A1), cap = rd64(A1 + 8), in = rd64(A3);
+    uint64_t frames = r ? r->frames++ : 0;
+    RET(audren_core(in, out, cap, frames));
 }
 static void ret_float1(Ctx *c) { c->v[0].d[0] = 0; c->v[0].d[1] = 0; c->v[0].f[0] = 1.0f; }
 static void audio_device_list(Ctx *c) {                  /* (AudioDeviceName *out, int count) -> count written; a name is 256 bytes */
@@ -359,7 +422,6 @@ static const ImportDef tomo_imports[] = {
     {"_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", audio_start},
     {"_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", audio_stop},
     {"_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", audio_close},
-    {"_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE", audio_update},
     {"_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE", audio_work_size},
     {"_ZN2nn5audio34GetAudioRendererVoiceDropParameterENS0_19AudioRendererHandleE", ret_float1},
     {"_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", audio_device_list},

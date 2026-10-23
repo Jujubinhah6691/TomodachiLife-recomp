@@ -264,6 +264,9 @@ static DWORD WINAPI sampler(LPVOID arg) {
                 fflush(stdout);
             }
         }
+        static long long from = -1;                   /* TOMO_SAMPLE_FROM=<frame>: count only from that presented frame on */
+        if (from < 0) { const char *e = getenv("TOMO_SAMPLE_FROM"); from = e ? atoll(e) : 0; }
+        if (from && display_frame_count() < from) continue;
         for (int i = 0; i < 64; i++) {
             Ctx *c = i == 63 ? g_smp_main : i < g_threads_n ? g_threads[i].c : NULL;
             if (!c || c->in_import) continue;
