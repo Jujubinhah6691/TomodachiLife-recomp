@@ -74,7 +74,10 @@ static void time_difference(Ctx *c) { RET(0); }          /* TimeSpan between two
 /* ---- nn::fs extras */
 static void fs_free_space(Ctx *c) { wr64(A0, 0x40000000ull); RET(0); }       /* 1 GiB free */
 static void fs_save_size_max(Ctx *c) { wr64(A0, 0x10000000ull); wr64(A1, 0x10000000ull); RET(0); }
-static void fs_save_exists(Ctx *c) { RET(1); }
+/* IsSaveDataExisting(ApplicationId, Uid): the game asks for the demo version's save (application 0100ca502552a000) to offer
+ * a transfer. There is no other application's save data here: answering yes showed the offer in every new game, and
+ * "Transfer Data" then aborted (MountSaveDataReadOnly fails and the game's result check aborts). */
+static void fs_save_exists(Ctx *c) { RET(0); }
 static void fs_read_file_opt(Ctx *c) {                   /* ReadFile(size_t *out, handle, offset, buf, size, ReadOption): the 5-argument form */
     ImportFn f = import_lookup("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm");
     if (!f) { RET(RESULT_UNAVAILABLE); return; }
