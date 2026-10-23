@@ -37,14 +37,16 @@ static void controller_support(Ctx *c) {                 /* ControllerSupportRes
     RET(0);
 }
 
-/* ---- nn::time: ClockSnapshot and the adjustable clocks, from the host's clock (UTC as the device's time zone) */
+/* ---- nn::time: ClockSnapshot and the adjustable clocks, from the host's clock in the Windows time zone (nntime.c). The island's
+ * time of day comes from these: with UTC as the device's zone the island was hours off (evening light in the afternoon). */
+void nntime_location(char out[0x24]); void nntime_local_calendar(int64_t posix, uint64_t out); void nntime_to_posix_rule(Ctx *c);
 static int64_t posix_now(void) {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     return (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000000ull);
 }
 static void time_user_clock_now(Ctx *c) { wr64(A0, (uint64_t)posix_now()); RET(0); }
-static void time_location_name(Ctx *c) { memset((void *)(uintptr_t)A0, 0, 0x24); memcpy((void *)(uintptr_t)A0, "UTC", 3); }
+static void time_location_name(Ctx *c) { nntime_location((char *)(uintptr_t)A0); }
 /* ClockSnapshot (0xd0 bytes in SDK 20, opaque to the game): our own layout, read only by the accessors below */
 #define SNAP_TIME 0x00
 #define SNAP_CAL 0x08                                    /* CalendarTime: year (16), month, day, hour, minute, second (8 each) */
@@ -53,10 +55,7 @@ static void time_snapshot_create(Ctx *c) {
     uint64_t s = A0;
     memset((void *)(uintptr_t)s, 0, 0xd0);
     wr64(s + SNAP_TIME, (uint64_t)t);
-    SYSTEMTIME st;
-    GetSystemTime(&st);
-    wr16(s + SNAP_CAL, st.wYear); wr8(s + SNAP_CAL + 2, (uint8_t)st.wMonth); wr8(s + SNAP_CAL + 3, (uint8_t)st.wDay);
-    wr8(s + SNAP_CAL + 4, (uint8_t)st.wHour); wr8(s + SNAP_CAL + 5, (uint8_t)st.wMinute); wr8(s + SNAP_CAL + 6, (uint8_t)st.wSecond);
+    nntime_local_calendar(t, s + SNAP_CAL);
     RET(0);
 }
 static void snap_posix(Ctx *c) { RET(rd64(A0 + SNAP_TIME)); }
@@ -68,21 +67,9 @@ static void snap_context(Ctx *c) {                       /* SystemClockContext (
 }
 static void snap_location(Ctx *c) {                      /* LocationName (0x24) through x8 */
     uint64_t out = c->x[8];
-    memset((void *)(uintptr_t)out, 0, 0x24);
-    memcpy((void *)(uintptr_t)out, "UTC", 3);
+    nntime_location((char *)(uintptr_t)out);
 }
 static void time_difference(Ctx *c) { RET(0); }          /* TimeSpan between two snapshots of the user clock: none adjusted */
-static void time_to_posix(Ctx *c) {                      /* (int *count, PosixTime *out, int max, CalendarTime const &, TimeZoneRule const &) */
-    uint64_t cal = A3;
-    SYSTEMTIME st = {0};
-    st.wYear = rd16(cal); st.wMonth = rd8(cal + 2); st.wDay = rd8(cal + 3); st.wHour = rd8(cal + 4); st.wMinute = rd8(cal + 5); st.wSecond = rd8(cal + 6);
-    FILETIME ft;
-    if (!SystemTimeToFileTime(&st, &ft)) { wr32(A0, 0); RET(RESULT_UNAVAILABLE); return; }
-    int64_t t = (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000000ull);
-    if ((int)A2 > 0) wr64(A1, (uint64_t)t);
-    wr32(A0, 1);
-    RET(0);
-}
 
 /* ---- nn::fs extras */
 static void fs_free_space(Ctx *c) { wr64(A0, 0x40000000ull); RET(0); }       /* 1 GiB free */
@@ -590,7 +577,7 @@ static const ImportDef tomo_imports[] = {
     {"_ZNK2nn4time13ClockSnapshot33GetStandardUserSystemClockContextEv", snap_context},
     {"_ZNK2nn4time13ClockSnapshot15GetLocationNameEv", snap_location},
     {"_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", time_difference},
-    {"_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeERKNS0_12TimeZoneRuleE", time_to_posix},
+    {"_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeERKNS0_12TimeZoneRuleE", nntime_to_posix_rule},
     {"_ZN2nn2fs16GetFreeSpaceSizeEPlPKc", fs_free_space},
     {"_ZN2nn2fs18GetSaveDataSizeMaxEPlS1_", fs_save_size_max},
     {"_ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll", ret0},

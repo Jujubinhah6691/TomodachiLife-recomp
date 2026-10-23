@@ -127,6 +127,7 @@ static void vk_shutdown_at_exit(void);
     X(uint64_t, GetTextureHandleARB, (GLuint)) \
     X(void, MakeTextureHandleResidentARB, (uint64_t)) \
     X(void, MakeTextureHandleNonResidentARB, (uint64_t)) \
+    X(GLboolean, IsTextureHandleResidentARB, (uint64_t)) \
     X(void, VertexAttribFormat, (GLuint, GLint, GLenum, GLboolean, GLuint)) \
     X(void, VertexAttribIFormat, (GLuint, GLint, GLenum, GLuint)) \
     X(void, VertexAttribBinding, (GLuint, GLuint)) \
@@ -1160,6 +1161,13 @@ static uint64_t handle_make(Tex *t, View v, SamplerParams p, int have_sampler, u
         dims[3] = (uint32_t)(nl > 0 ? nl : 1) | ((uint32_t)is3d << 16);
         if (fmt_get((v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format, &f) && f.kind == 0 && (f.format == 0x8D94 || f.format == 0x8228 || f.format == 0x8D98 || f.format == 0x8D99))
             *isint = f.type == 0x1400 || f.type == 0x1402 || f.type == 0x1404 ? 2 : 1;
+    }
+    {   /* Maxwell compares depth only when the shader's instruction asks (TEX.DC); the game shares a comparison sampler between
+         * its shadow map and colour textures. In GL a compare mode on a sampler makes a colour texture incomplete: it read
+         * (0,0,0,1) (Tomodachi Life's sun mask on the island: no sunlight on the ground). Colour textures get the sampler
+         * without the comparison. */
+        Fmt cf;
+        if (have_sampler && p.cmode && fmt_get((v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format, &cf) && cf.kind == 0) p.cmode = 0;
     }
     GLuint smp = have_sampler ? sampler_gl(&p) : 0;
     for (int i = 0; i < o->nh; i++) if (o->h[i].smp == smp) return o->h[i].h;
@@ -3004,6 +3012,31 @@ static int draw_prepare(void) {
                 if (!t) continue;
                 printf("    texture %d: id 0x%x target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u uploaded %d rendered %d view set 0x%x format 0x%x\n", n, tid, t->b.target, t->b.format, t->b.width,
                        t->b.height, t->b.depth, t->b.levels, t->b.flags, t->o.gl, t->uploaded, t->gpu_written, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format);
+                {   uint32_t dims2[4]; int isint2 = 0;
+                    uint64_t fresh = resolve_handle(S.tpool, S.spool, S.nvn_tex[s][n], dims2, &isint2);
+                    if (fresh != S.gl_tex[s][4 + n]) printf("      STALE handle: bound %llx, now %llx\n", (unsigned long long)S.gl_tex[s][4 + n], (unsigned long long)fresh);
+                    uint32_t sid2 = (uint32_t)(S.nvn_tex[s][n] >> 20) & 0xfff;
+                    if (!S.spool || sid2 >= (uint32_t)S.spool->count || !S.spool->used[sid2])
+                        printf("      no sampler: handle %llx sampler id 0x%x, pool of %d, used %d\n", (unsigned long long)S.nvn_tex[s][n], sid2, S.spool ? S.spool->count : -1,
+                               S.spool && sid2 < (uint32_t)S.spool->count ? S.spool->used[sid2] : -1);
+                }
+                if (t->b.target == 1 && t->gpu_written && t->o.gl && t->b.width >= 64) {     /* the centre texel through the texture and through the view sampled */
+                    TexObj *vo = tex_view_obj(t, &S.tpool->e[tid].view);
+                    float a[4] = {-1, -1, -1, -1}, b[4] = {-1, -1, -1, -1};
+                    glGetTextureSubImage(t->o.gl, 0, t->b.width / 2, t->b.height / 2, 0, 1, 1, 1, GL_RGBA, GL_FLOAT, sizeof a, a);
+                    if (vo && vo->gl) glGetTextureSubImage(vo->gl, 0, t->b.width / 2, t->b.height / 2, 0, 1, 1, 1, GL_RGBA, GL_FLOAT, sizeof b, b);
+                    while (glGetError()) {}
+                    printf("      centre texel: texture gl %u %g %g %g %g | view gl %u%s %g %g %g %g\n", t->o.gl, a[0], a[1], a[2], a[3], vo ? vo->gl : 0, vo && vo->alias ? " (alias)" : "", b[0], b[1], b[2], b[3]);
+                    {   Tex *t2; View v2; SamplerParams p2;
+                        int hs2 = handle_lookup(S.tpool, S.spool, S.nvn_tex[s][n], &t2, &v2, &p2);
+                        uint64_t hh = vo && vo->gl ? (hs2 ? glGetTextureSamplerHandleARB(vo->gl, sampler_gl(&p2)) : glGetTextureHandleARB(vo->gl)) : 0;
+                        printf("      handle check: bound %llx, driver's for view gl %u now %llx%s; view handles cached %d\n", (unsigned long long)S.gl_tex[s][4 + n], vo ? vo->gl : 0,
+                               (unsigned long long)hh, hh == S.gl_tex[s][4 + n] ? "" : "  MISMATCH", vo ? vo->nh : -1);
+                        if (S.gl_tex[s][4 + n] && !glIsTextureHandleResidentARB(S.gl_tex[s][4 + n])) printf("      NOT RESIDENT: handle %llx\n", (unsigned long long)S.gl_tex[s][4 + n]);
+                    }
+                }
+                printf("      swizzle: view %d %d %d %d, texture %d %d %d %d\n", S.tpool->e[tid].view.swz[0], S.tpool->e[tid].view.swz[1], S.tpool->e[tid].view.swz[2], S.tpool->e[tid].view.swz[3],
+                       t->b.swz[0], t->b.swz[1], t->b.swz[2], t->b.swz[3]);
                 if (t->mem && t->storage >= 65536)     /* other live textures over the same memory (a target written under another object) */
                     for (Tex *o = g_all_tex; o; o = o->all_next)
                         if (o != t && !o->dead && o->mem && o->mem < t->mem + t->storage && o->mem + o->storage > t->mem)
@@ -3012,7 +3045,7 @@ static int draw_prepare(void) {
                 {   uint32_t sid = (uint32_t)(S.nvn_tex[s][n] >> 20) & 0xfff;
                     if (S.spool && sid < (uint32_t)S.spool->count) {
                         const SamplerParams *sp = &S.spool->e[sid];
-                        printf("      sampler 0x%x: min %d mag %d wrap %d %d %d lod %g..%g border %g %g %g %g (kind %d)\n", sid, sp->min, sp->mag, sp->ws, sp->wt, sp->wr, sp->lodmin, sp->lodmax, sp->border[0], sp->border[1], sp->border[2], sp->border[3], sp->border_kind);
+                        printf("      sampler 0x%x: min %d mag %d wrap %d %d %d lod %g..%g border %g %g %g %g (kind %d) compare %d func %d reduction %d aniso %g\n", sid, sp->min, sp->mag, sp->ws, sp->wt, sp->wr, sp->lodmin, sp->lodmax, sp->border[0], sp->border[1], sp->border[2], sp->border[3], sp->border_kind, sp->cmode, sp->cfunc, sp->reduction, sp->aniso);
                     }
                 }
                 if (tid < sizeof seen && !seen[tid] && t->o.gl && t->b.target == 1 && t->b.samples <= 1 && t->b.width <= 4096) {
@@ -3978,6 +4011,11 @@ static void exec(const Cmd *m, int depth) {
         compute_flush();                       /* the indirect data may have been written by a dispatch */
         if (a[6] & 2) { uint64_t param; memcpy(&param, blob, 8); uint32_t cnt = param ? rd32(param) : 0; if (cnt < n) n = cnt; }
         if (!stride) stride = elements ? 20 : 16;
+        if (drawlog_now()) {
+            printf("indirect draw: %s, %u draws (max %u%s), stride %u, data %llx:", elements ? "elements" : "arrays", n, (unsigned)a[4], (a[6] & 2) ? ", count from memory" : "", stride, (unsigned long long)a[3]);
+            for (unsigned k = 0; k < n && k < 4 && a[3]; k++) { const uint32_t *q = P(a[3] + (uint64_t)k * stride); printf(" [%u %u %u %u %u]", q[0], q[1], q[2], q[3], elements ? q[4] : 0); }
+            printf("\n");
+        }
         for (unsigned k = 0; k < n && a[3]; k++) {
             uint32_t d[5];                     /* arrays: count, instances, first, base instance; elements: count, instances, first index, base vertex, base instance */
             memcpy(d, P(a[3] + (uint64_t)k * stride), elements ? 20 : 16);
@@ -4005,13 +4043,19 @@ static void exec(const Cmd *m, int depth) {
     case OP_RENDER_ENABLE:                     /* a1 = 0: a0 is the switch; otherwise mode + 1 and a2 the address of two counters (16 bytes each) to compare */
         if (!a[1]) S.render_off = !(a[0] & 1);
         else { compute_flush(); int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16); S.render_off = a[1] == 1 ? !eq : eq; }
+        if (drawlog_now()) printf("render enable: %s mode %d counters %llu %llu -> %s\n", a[1] ? "conditional" : "switch", (int)a[1] - 1,
+                                  a[1] && a[2] ? (unsigned long long)rd64(a[2]) : 0ull, a[1] && a[2] ? (unsigned long long)rd64(a[2] + 16) : 0ull, S.render_off ? "OFF" : "on");
         break;
     case OP_COUNTER_RESET: counter_stop((int)a[0]); if (a[0] < 17) g_counter[a[0]].acc = 0; counter_start((int)a[0]); break;
     case OP_COUNTER_REPORT: {                  /* (type, address of an NVNcounterData {counter, timestamp}) */
         uint64_t d[2] = {0, gpu_ts()};
         int type = (int)a[0];
+        /* type 16 (TIMESTAMP_TOP): a timestamp in the counter field too. Tomodachi Life reports it twice and draws its island
+         * objects (palm trees, shrubs) under SetRenderEnableConditional(not equal) of the pair: two zeros culled them all. */
+        if (type == 16) d[0] = d[1];
         if (type > 0 && type < 16 && counter_target(type)) { counter_stop(type); d[0] = g_counter[type].acc; counter_start(type); }
         if (a[1]) { compute_flush(); memcpy(P(a[1]), d, 16); g_arena_gen++; }
+        if (drawlog_now()) printf("counter report: type %d value %llu at %llx (draw %d)\n", type, (unsigned long long)d[0], (unsigned long long)a[1], g_frame_draw_index);
         break;
     }
     case OP_REPORT_VALUE: if (a[1]) { uint64_t d[2] = {(uint32_t)a[0], gpu_ts()}; compute_flush(); memcpy(P(a[1]), d, 16); g_arena_gen++; } break;

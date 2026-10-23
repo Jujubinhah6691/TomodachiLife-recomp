@@ -474,6 +474,7 @@ static void calendar_out(Ctx *c, const TzRule *r) {
     TzTm t;
     if (tz_validate(r)) { RET(TZ_OUT_OF_RANGE); return; }
     if (tz_local(r, (int64_t)rd64(A2), &t)) { RET(TZ_OVERFLOW); return; }
+    { static int said; if (said < 6 && getenv("TOMO_TIMELOG")) { said++; printf("nn::time: calendar %04d-%02d-%02d %02d:%02d utc offset %d zone %.8s\n", t.year, t.mon, t.mday, t.hour, t.min, (int)t.utoff, t.zone); } }
     if (A0) {
         wr16(A0, (uint16_t)(int16_t)t.year); wr8(A0 + 2, (uint8_t)t.mon); wr8(A0 + 3, (uint8_t)t.mday);
         wr8(A0 + 4, (uint8_t)t.hour); wr8(A0 + 5, (uint8_t)t.min); wr8(A0 + 6, (uint8_t)t.sec); wr8(A0 + 7, 0);
@@ -528,6 +529,27 @@ static void time_ToPosixTime(Ctx *c) {                    /* (int *outCount, Pos
     for (int i = 0; i < n; i++) wr64(A1 + (uint64_t)i * 8, (uint64_t)v[i]);
     if (A0) wr32(A0, (uint32_t)n);
     RET(0);
+}
+/* ToPosixTime with the rule the game loaded (the form tomo.c registers) */
+void nntime_to_posix_rule(Ctx *c) {                       /* (int *outCount, PosixTime *out, int count, const CalendarTime &, const TimeZoneRule &) */
+    int64_t v[2];
+    const TzRule *r = c->x[4] ? (const TzRule *)(uintptr_t)c->x[4] : my_rule();
+    if (tz_validate(r)) r = my_rule();
+    int max = (int32_t)A2 < 2 ? (int32_t)A2 : 2;
+    int n = tz_to_posix(r, (int16_t)rd16(A3), (int8_t)rd8(A3 + 2), (int8_t)rd8(A3 + 3), (int8_t)rd8(A3 + 4), (int8_t)rd8(A3 + 5), (int8_t)rd8(A3 + 6), v);
+    if (n > max) n = max < 0 ? 0 : max;
+    for (int i = 0; i < n; i++) wr64(A1 + (uint64_t)i * 8, (uint64_t)v[i]);
+    if (A0) wr32(A0, (uint32_t)n);
+    RET(0);
+}
+/* tomo.c: the device's location (IANA name of the Windows zone) and a local CalendarTime of a posix time */
+void nntime_location(char out[0x24]) { location_name(out); }
+void nntime_local_calendar(int64_t posix, uint64_t out) {
+    TzTm t;
+    memset((void *)(uintptr_t)out, 0, 8);
+    if (tz_local(my_rule(), posix, &t)) return;
+    wr16(out, (uint16_t)(int16_t)t.year); wr8(out + 2, (uint8_t)t.mon); wr8(out + 3, (uint8_t)t.mday);
+    wr8(out + 4, (uint8_t)t.hour); wr8(out + 5, (uint8_t)t.min); wr8(out + 6, (uint8_t)t.sec);
 }
 static int days_in_month(int y, int m) {
     static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
