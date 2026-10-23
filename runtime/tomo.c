@@ -365,6 +365,14 @@ static void audio_out_frame(void) {
         }
     if (SDL_GetAudioStreamQueued(g_audio_out) < 48000 * 4 / 6)          /* at most ~170 ms queued: the game runs ahead otherwise */
         SDL_PutAudioStreamData(g_audio_out, pcm, (int)sizeof pcm);
+    {   /* TOMO_AUDIO_WAV=<file>: everything mixed, as a 48 kHz stereo WAV (the header is rewritten every second) */
+        static FILE *wav; static int tried; static uint32_t bytes;
+        if (!tried) { tried = 1; const char *e = getenv("TOMO_AUDIO_WAV"); if (e && e[0]) { wav = fopen(e, "wb"); if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x80\xbb\0\0\0\xee\x02\0\x04\0\x10\0data\0\0\0\0", 1, 44, wav); } }
+        if (wav) {
+            fwrite(pcm, 1, sizeof pcm, wav); bytes += sizeof pcm;
+            if (bytes % (48000 * 4) < sizeof pcm) { uint32_t r = bytes + 36; long pos = ftell(wav); fseek(wav, 4, SEEK_SET); fwrite(&r, 4, 1, wav); fseek(wav, 40, SEEK_SET); fwrite(&bytes, 4, 1, wav); fseek(wav, pos, SEEK_SET); fflush(wav); }
+        }
+    }
 }
 static void adpcm_frame(SilentVoice *s, uint64_t data, int32_t f, uint64_t coef) {
     uint64_t base = data + (uint64_t)f * 8;

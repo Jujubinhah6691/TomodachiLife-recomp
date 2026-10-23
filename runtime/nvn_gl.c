@@ -1121,6 +1121,13 @@ static GLuint sampler_gl(const SamplerParams *p) {
     if (p->cmode == 1) {
         glSamplerParameteri(s, GL_TEXTURE_COMPARE_MODE_, GL_COMPARE_REF_TO_TEXTURE_);
         glSamplerParameteri(s, GL_TEXTURE_COMPARE_FUNC_, GL_NEVER + (p->cfunc ? p->cfunc - 1 : 7));
+        {   static int ns = -1;                         /* TOMO_NOSHADOW=1 (diagnosis): every depth comparison passes */
+            if (ns < 0) ns = getenv("TOMO_NOSHADOW") != NULL;
+            if (ns) glSamplerParameteri(s, GL_TEXTURE_COMPARE_FUNC_, 0x0207 /* ALWAYS */);
+        }
+        {   static int said;
+            if (said++ < 8) printf("nvn_gl: comparison sampler: func %d (GL 0x%x)\n", p->cfunc, GL_NEVER + (p->cfunc ? p->cfunc - 1 : 7));
+        }
     }
     if (g_sampler_count < 512) { g_samplers[g_sampler_count].p = *p; g_samplers[g_sampler_count++].gl = s; }
     return s;
@@ -1921,7 +1928,7 @@ static void shd_workers_start(void) {
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
     if (g_shd_mode <= 0 || !g_shw_n || stage > 1 || code_len <= 0) return;
-    uint64_t h = sh_hash(0xcbf29ce484222325ULL ^ 0x20261022ULL ^ (uint64_t)stage, code, (size_t)code_len);
+    uint64_t h = sh_hash(0xcbf29ce484222325ULL ^ 0x20261023ULL ^ (uint64_t)stage, code, (size_t)code_len);
     if (cdata) h = sh_hash(h ^ cdata_size, cdata, cdata_size);
     if (!h) h = 1;
     ShJob *j = malloc(sizeof *j + (size_t)code_len + cdata_size);
@@ -2182,7 +2189,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     if (st->cdata_copy) { in.cdata = st->cdata_copy; in.cdata_size = st->ctl[3]; }
     uint64_t h1 = 0, h0 = 0;
     if (!g_shc_off) {
-        h1 = sh_hash(0xcbf29ce484222325ULL ^ 0x20261022ULL ^ (uint64_t)s, st->code, (size_t)st->code_len);
+        h1 = sh_hash(0xcbf29ce484222325ULL ^ 0x20261023ULL ^ (uint64_t)s, st->code, (size_t)st->code_len);
         if (in.cdata) h1 = sh_hash(h1 ^ in.cdata_size, in.cdata, in.cdata_size);
         h0 = h1 ? h1 : 1;                           /* the workers' name for this stage (shd_prewarm) */
         h1 = sh_hash(h1, key, 16);
@@ -2385,6 +2392,16 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
             if (cb->len + need > cb->cap) { cb->cap = (cb->cap + need) * 2 + 4096; cb->data = realloc(cb->data, cb->cap); }
         }
         cb->cmd_used += use; cb->rec_cmd += use;
+    }
+    {   /* TOMO_RECLOG=<frame>: while the game builds that frame, its vertex binds, indexed draws, program binds and calls */
+        static long long rl = -2;
+        if (rl == -2) rl = getenv("TOMO_RECLOG") ? atoll(getenv("TOMO_RECLOG")) : -1;
+        if (rl >= 0 && (op == OP_VBUF || op == OP_DRAW_ELEMENTS || op == OP_CALL || op == OP_PROGRAM)) {
+            long long display_frame_count(void);
+            long long f = display_frame_count();
+            if (rl == 0 || (f >= rl && f <= rl + 1))
+                printf("rec: frame %lld cmdbuf %llx %s a1 %llx a2 %llx a3 %llx\n", f, (unsigned long long)A0, k_op_name[op], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);
+        }
     }
     Cmd *m = (Cmd *)(cb->data + cb->len);
     cb->len += need;
@@ -2589,7 +2606,53 @@ static int layered_rt(Tex *t, const View *v) {
 /* One layer of an array / cube texture as a render target: a 2D (1D) view of that level and layer, its own texture object. The
  * game samples the whole cube map array while it draws its next mip level (a feedback loop in GL terms); drawn through the
  * texture itself (glFramebufferTextureLayer) that hung the GPU in the driver (TDR), through a view it does not. */
+/* Rendering into a block-compressed texture through an uncompressed view of the block's size (BC3 as RGBA32UI: the game
+ * compresses its Mii face textures on the GPU, one fragment = one 4x4 block). OpenGL has no such view ("internal formats
+ * neither compatible nor identical": the framebuffer was incomplete, the texture stayed empty and Mii faces black). The
+ * target is a scratch texture of the view's format, a quarter the size, and its texels are copied into the compressed
+ * texture (glCopyImageSubData: an uncompressed texel of the block's size is one block) when the render targets change. */
+typedef struct { Tex *t; int level, layer, w, h; GLuint gl; TexObj o; int pending; } BcShadow;
+static BcShadow g_bcsh[64];
+static int g_bcsh_n;
+static void bc_flush(void) {
+    for (int i = 0; i < g_bcsh_n; i++) {
+        BcShadow *b = &g_bcsh[i];
+        if (!b->pending) continue;
+        b->pending = 0;
+        if (!b->t || b->t->dead || !b->t->o.gl || !gl_has(glCopyImageSubData, "glCopyImageSubData")) continue;
+        GLenum tg = gl_target(b->t->b.target, b->t->b.samples);
+        while (glGetError()) {}
+        glCopyImageSubData(b->gl, GL_TEXTURE_2D, 0, 0, 0, 0, b->t->o.gl, tg, b->level, 0, 0, tg == GL_TEXTURE_2D ? 0 : b->layer, b->w, b->h, 1);
+        GLenum e = glGetError();
+        static int nlog;
+        if (e) logf_limited(&nlog, 10, "nvn_gl: compressed render target: the copy into the texture failed (GL error 0x%x, level %d %dx%d blocks)\n", e, b->level, b->w, b->h);
+    }
+}
+static TexObj *bc_target(Tex *t, const View *v) {     /* NULL: not a render target view of a compressed texture */
+    Fmt tf, vf;
+    if (!(v->set & 0x80) || !(v->set & 4) || !v->format || !fmt_get(t->b.format, &tf) || tf.kind != 4) return NULL;
+    if (!fmt_get(v->format, &vf) || vf.kind != 0 || vf.bpb != tf.bpb) return NULL;
+    int level = (v->set & 1) ? v->lvl0 : 0, layer = (v->set & 2) ? v->lay0 : 0;
+    int w = (lvl(t->b.width, level) + 3) / 4, h = (lvl(t->b.height, level) + 3) / 4;
+    for (int i = 0; i < g_bcsh_n; i++) {
+        BcShadow *b = &g_bcsh[i];
+        if (b->t == t && b->level == level && b->layer == layer && b->w == w && b->h == h) { b->pending = 1; return &b->o; }
+    }
+    BcShadow *b = g_bcsh_n < 64 ? &g_bcsh[g_bcsh_n++] : &g_bcsh[(g_bcsh_n++) & 63];
+    if (b->gl) { fbo_purge(b->gl); glDeleteTextures(1, &b->gl); }
+    memset(b, 0, sizeof *b);
+    b->t = t; b->level = level; b->layer = layer; b->w = w; b->h = h;
+    glGenTextures(1, &b->gl);
+    glBindTexture(GL_TEXTURE_2D, b->gl);
+    glTexStorage2D(GL_TEXTURE_2D, 1, vf.internal, w, h);
+    b->o.gl = b->gl; b->o.alias = 1;                  /* not counted, not freed with the texture */
+    b->pending = 1;
+    static int nlog;
+    logf_limited(&nlog, 5, "nvn_gl: compressed render target: texture format 0x%x %dx%d level %d drawn through a %dx%d scratch of format 0x%x\n", t->b.format, t->b.width, t->b.height, level, w, h, v->format);
+    return &b->o;
+}
 static TexObj *rt_view(Tex *t, const View *v) {
+    {   TexObj *o = bc_target(t, v); if (o) return o; }
     int tg = t->b.target;
     if (!(tg == 3 || tg == 4 || tg == 8 || tg == 9) || t->b.samples > 1) return tex_view_obj(t, v);
     if ((v->set & 0x82) == 0x82 ? v->nlay > 1 : tex_layers(&t->b) > 1) return tex_view_obj(t, v);      /* layered rendering */
@@ -2603,6 +2666,7 @@ static TexObj *rt_view(Tex *t, const View *v) {
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
     Fmt f;
+    if (g_bcsh_n) bc_flush();                         /* what was drawn into compressed textures goes into them now */
     memset(&k, 0, sizeof k);
     S.have_fbo = 0; S.color0 = NULL; S.depth_tex = NULL; S.fbo_w = S.fbo_h = 0;
     memset(S.color, 0, sizeof S.color);
@@ -3504,6 +3568,13 @@ static void exec(const Cmd *m, int depth) {
     }
     case OP_VBUF:
         for (int i = 0; i < (int)a[1] && (int)a[0] + i < 32; i++) memcpy(&S.vbuf[a[0] + i], blob + i * 16, 16);
+        {   static long long dl = -2;                   /* SSBU_DRAWLOG: the vertex buffer bindings of that frame too */
+            if (dl == -2) dl = getenv("SSBU_DRAWLOG") ? atoll(getenv("SSBU_DRAWLOG")) : -1;
+            if (dl >= 0 && (long long)g_st.frames + 1 == dl) {
+                uint64_t ad; memcpy(&ad, blob, 8);
+                printf("vbuf: before draw %d: first %d count %d, first address %llx\n", g_frame_draw_index, (int)a[0], (int)a[1], (unsigned long long)ad);
+            }
+        }
         break;
     case OP_VATTR:
         S.nattr = (int)a[0] < 32 ? (int)a[0] : 32;
@@ -3554,6 +3625,10 @@ static void exec(const Cmd *m, int depth) {
         if (b[3] & 1) glEnable(GL_POLYGON_OFFSET_POINT); else glDisable(GL_POLYGON_OFFSET_POINT);
         if (b[3] & 2) glEnable(GL_POLYGON_OFFSET_LINE); else glDisable(GL_POLYGON_OFFSET_LINE);
         if (b[3] & 4) glEnable(GL_POLYGON_OFFSET_FILL); else glDisable(GL_POLYGON_OFFSET_FILL);
+        {   static long long dl = -2;
+            if (dl == -2) dl = getenv("SSBU_DRAWLOG") ? atoll(getenv("SSBU_DRAWLOG")) : -1;
+            if (dl >= 0 && (long long)g_st.frames + 1 == dl) printf("polygon: before draw %d: cull %d front %d mode %d offset enables %x\n", g_frame_draw_index, b[0], b[1], b[2], b[3]);
+        }
         break;
     }
     case OP_DEPTHSTENCIL: {
@@ -3595,7 +3670,12 @@ static void exec(const Cmd *m, int depth) {
     case OP_ALPHAREF: memcpy(&S.alpha_ref, &a[0], 4); break;                       /* applied per draw (draw_prepare) */
     case OP_POINTSIZE: { float v; memcpy(&v, &a[0], 4); glPointSize(v); break; }
     case OP_LINEWIDTH: { float v; memcpy(&v, &a[0], 4); glLineWidth(v); break; }
-    case OP_POLYOFFSET: { float v[3]; memcpy(v, &a[0], 12); glPolygonOffsetClamp(v[0], v[1], v[2]); break; }      /* (factor, units, clamp) */
+    case OP_POLYOFFSET: { float v[3]; memcpy(v, &a[0], 12); glPolygonOffsetClamp(v[0], v[1], v[2]);
+        {   static long long dl = -2;
+            if (dl == -2) dl = getenv("SSBU_DRAWLOG") ? atoll(getenv("SSBU_DRAWLOG")) : -1;
+            if (dl >= 0 && (long long)g_st.frames + 1 == dl) printf("polyoffset: before draw %d: factor %g units %g clamp %g\n", g_frame_draw_index, v[0], v[1], v[2]);
+        }
+        break; }      /* (factor, units, clamp) */
     case OP_SAMPLEMASK: if ((uint32_t)a[0] == 0xffffffffu) glDisable(0x8E51); else { glEnable(0x8E51); glSampleMaski(0, (GLbitfield)a[0]); } break;
     case OP_RASTDISCARD: g_fd_rdisc = a[0] & 1; if (a[0] & 1) glEnable(GL_RASTERIZER_DISCARD_); else glDisable(GL_RASTERIZER_DISCARD_); break;
     case OP_DEPTHCLAMP: g_fd_dclamp = a[0] & 1; if (a[0] & 1) glEnable(GL_DEPTH_CLAMP_); else glDisable(GL_DEPTH_CLAMP_); break;
@@ -3671,7 +3751,12 @@ static void exec(const Cmd *m, int depth) {
         size_t off = arena_put(a[3], (uint64_t)count << t);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER_, g_arena);
         pf_add(PF_PREP, pf0);
-        if (drawlog_now()) printf("  DrawElements mode %d type %d count %d base vertex %d base instance %d instances %d%c", (int)a[0], (int)t, count, (int)a[4], (int)a[5], (int)a[6], 10);
+        if (drawlog_now()) {
+            printf("  DrawElements mode %d type %d count %d base vertex %d base instance %d instances %d%c", (int)a[0], (int)t, count, (int)a[4], (int)a[5], (int)a[6], 10);
+            uint32_t mx = 0, mn = 0xffffffffu, first[6] = {0};
+            for (int k = 0; k < count; k++) { uint32_t ix = t == 0 ? rd8(a[3] + (uint64_t)k) : t == 1 ? rd16(a[3] + (uint64_t)k * 2) : rd32(a[3] + (uint64_t)k * 4); if (k < 6) first[k] = ix; if (ix > mx) mx = ix; if (ix < mn) mn = ix; }
+            printf("  indices at %llx: %u %u %u %u %u %u ... range %u..%u%c", (unsigned long long)a[3], first[0], first[1], first[2], first[3], first[4], first[5], mn, mx, 10);
+        }
         if (getenv("SSBU_DRAWSHOT_CLEAR") && getenv("SSBU_DRAWSHOT") && g_st.frames == atoi(getenv("SSBU_DRAWSHOT"))) { glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); glEnable(GL_SCISSOR_TEST); }
         drawlog_begin();
         first_draw_warm();

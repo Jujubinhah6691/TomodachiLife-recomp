@@ -1662,6 +1662,12 @@ int mx_translate(const MxIn *in, MxOut *out) {
                 if (inv < 0) inv = getenv("SSBU_VK_INVARIANT") ? atoi(getenv("SSBU_VK_INVARIANT")) : 0;
                 if (vk && inv) emit(&h, "invariant gl_Position;\n");
                 if (vk && inv >= 2) emit(&h, "precise gl_Position;\nprecise mx_position;\n");
+                /* OpenGL: always (TOMO_INVARIANT=0 turns it off). Tomodachi Life draws a Mii's face in a colour pass with a
+                 * depth test for equality after a depth-only pass by another program: 0 fragments passed and every Mii face
+                 * stayed black. */
+                static int glinv = -1;
+                if (glinv < 0) glinv = !(getenv("TOMO_INVARIANT") && getenv("TOMO_INVARIANT")[0] == '0');
+                if (!vk && glinv) emit(&h, "invariant gl_Position;\nprecise gl_Position;\n");
             }
             for (unsigned n = 0; n < 32; n++)
                 if (e->in_attr >> n & 1) emit(&h, "layout(location = %u) in %s in_attr%u;\n", n, n < 16 && (in->int_attrs >> (16 + n) & 1) ? "uvec4" : n < 16 && (in->int_attrs >> n & 1) ? (in->sint_attrs >> n & 1 ? "ivec4" : "uvec4") : "vec4", n);
