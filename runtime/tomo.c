@@ -328,8 +328,59 @@ static void audio_work_size(Ctx *c) { RET(0x100000); }
  * The client [sdk 0x22116c..0x221238] checks every section size and that the total equals the capacity.
  * A SILENT renderer: no mixing; a playing voice consumes its wave buffers at its sample rate (240 samples a frame at
  * 48 kHz) so the game's streaming and sound-state logic run as on the console. */
-typedef struct { uint64_t played; uint32_t consumed, popped, pos, last_index, seen; } SilentVoice;
+typedef struct { uint64_t played; uint32_t consumed, popped, pos, last_index, seen; float frac; int32_t af; int16_t yn1, yn2, abuf[14]; } SilentVoice;
 static SilentVoice g_sv[1024];
+/* ---- the mixer: what the console's DSP does, cut down. Each playing voice is read from its wave buffers (PCM16, or
+ * Nintendo's DSP-ADPCM: 8-byte frames of 14 samples, coefficients at the voice's source data, history from the wave
+ * buffer's context or carried over), resampled to 48 kHz by its rate and pitch, scaled by its volume and by the left /
+ * right mix volumes of its channel resources, and summed into one stereo frame of 240 samples per update (5 ms). The
+ * mixes, effects and splitters behind a voice are not applied (a voice routed through a splitter plays centred).
+ * TOMO_AUDIO=0: silent (the voices still advance). */
+#include <SDL3/SDL.h>
+static SDL_AudioStream *g_audio_out;
+static int g_audio_on = -1;
+static float g_mix[240][2];
+static float rdf(uint64_t a) { uint32_t u = rd32(a); float f; memcpy(&f, &u, 4); return f; }
+static int audio_out_open(void) {
+    if (g_audio_on >= 0) return g_audio_on;
+    const char *e = getenv("TOMO_AUDIO");
+    g_audio_on = 0;
+    if (e && e[0] == '0') return 0;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { printf("audio: SDL audio cannot start: %s (silent)\n", SDL_GetError()); return 0; }
+    SDL_AudioSpec spec = {SDL_AUDIO_S16LE, 2, 48000};
+    g_audio_out = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_audio_out) { printf("audio: no playback device: %s (silent)\n", SDL_GetError()); return 0; }
+    SDL_ResumeAudioStreamDevice(g_audio_out);
+    printf("audio: output 48 kHz stereo through SDL (TOMO_AUDIO=0 silences it)\n");
+    g_audio_on = 1;
+    return 1;
+}
+static void audio_out_frame(void) {
+    if (!g_audio_out) return;
+    int16_t pcm[240 * 2];
+    for (int k = 0; k < 240; k++)
+        for (int ch = 0; ch < 2; ch++) {
+            float x = g_mix[k][ch] * 0.8f;
+            pcm[k * 2 + ch] = (int16_t)(x > 32767.0f ? 32767 : x < -32768.0f ? -32768 : x);
+        }
+    if (SDL_GetAudioStreamQueued(g_audio_out) < 48000 * 4 / 6)          /* at most ~170 ms queued: the game runs ahead otherwise */
+        SDL_PutAudioStreamData(g_audio_out, pcm, (int)sizeof pcm);
+}
+static void adpcm_frame(SilentVoice *s, uint64_t data, int32_t f, uint64_t coef) {
+    uint64_t base = data + (uint64_t)f * 8;
+    uint8_t h = rd8(base);
+    int scale = 1 << (h & 0xf), ci = (h >> 4) & 7;
+    int c1 = (int16_t)rd16(coef + (uint64_t)ci * 4), c2 = (int16_t)rd16(coef + (uint64_t)ci * 4 + 2);
+    for (int k = 0; k < 14; k++) {
+        int nib = (rd8(base + 1 + (uint64_t)(k >> 1)) >> ((k & 1) ? 0 : 4)) & 0xf;
+        if (nib >= 8) nib -= 16;
+        int v = ((nib * scale) << 11) + 1024 + c1 * s->yn1 + c2 * s->yn2;
+        v >>= 11;
+        if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+        s->yn2 = s->yn1; s->yn1 = (int16_t)v; s->abuf[k] = (int16_t)v;
+    }
+    s->af = f;
+}
 static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t frames) {
     static int said;
     if (!in || !out) return 0;
@@ -338,6 +389,10 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
     uint32_t npool = rd32(in + 8) / 0x20, nvoice = rd32(in + 0xc) / vsz, neffect = rd32(in + 0x14) / 0xc0, nsink = rd32(in + 0x1c) / 0x140;
     uint64_t ip = in + 0x40 + rd32(in + 4);              /* memory pools follow the behaviour parameter */
     uint64_t iv = ip + rd32(in + 8) + rd32(in + 0x10);   /* voices follow the voice channel resources */
+    uint64_t ires = ip + rd32(in + 8);                   /* voice channel resources: {id, 24 mix volumes, in use} 0x70 each */
+    uint32_t nres = rd32(in + 0x10) / 0x70;
+    int mixing = audio_out_open();
+    memset(g_mix, 0, sizeof g_mix);
     uint64_t ie = iv + rd32(in + 0xc);
     uint64_t total = 0x40 + npool * 0x10 + nvoice * 0x10 + neffect * esz_out + nsink * 0x20 + 0x10 + 0xb0 + 0x10;
     if (total > cap) { if (said++ < 3) printf("audio: update output needs %llu bytes, the buffer holds %llu\n", (unsigned long long)total, (unsigned long long)cap); return 0x5299; }
@@ -355,19 +410,75 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
         uint32_t count = rev >= 15 ? rd32(v + 0x54) : rd32(v + 0x3c), index = rev >= 15 ? rd32(v + 0x58) : rd16(v + 0x40);
         uint64_t wb = v + (rev >= 15 ? 0x78 : 0x60);
         SilentVoice *s = &g_sv[id < 1024 ? id : 0];
-        if (is_new || !s->seen) { memset(s, 0, sizeof *s); s->seen = 1; s->last_index = index; }
+        if (is_new || !s->seen) { memset(s, 0, sizeof *s); s->seen = 1; s->last_index = index; s->af = -1; }
         if (in_use && play == 0 && !is_new) {
             s->popped += (index - s->last_index) & 3;    /* the client released that many buffers since the last update */
             s->last_index = index;
             uint32_t pending = s->consumed - s->popped, avail = count > pending ? count - pending : 0;
-            uint32_t n = rate ? rate / 200 : 240;
-            while (n && avail) {
+            uint32_t fmt = rd8(v + 0xb), cc = rd32(v + 0x18);
+            float step = (float)(rate ? rate : 48000) / 48000.0f * rdf(v + 0x1c), vol = rdf(v + 0x20);
+            if (!(step > 0.0f && step < 16.0f)) step = (float)(rate ? rate : 48000) / 48000.0f;
+            if (cc < 1 || cc > 6) cc = 1;
+            uint64_t coef = rd64(v + (rev >= 15 ? 0x60 : 0x48));
+            float gl[6], gr[6];                          /* left / right gain of each channel: its channel resource's mix volumes */
+            {   uint64_t ids = v + (rev >= 15 ? 0x158 : 0x140);
+                uint32_t splitter = rd32(v + (rev >= 15 ? 0x74 : 0x5c));
+                for (uint32_t ch = 0; ch < cc; ch++) {
+                    gl[ch] = gr[ch] = cc == 1 ? 0.7f : (ch == 0 ? 1.0f : 0.0f);
+                    if (cc == 2 && ch == 1) { gl[1] = 0.0f; gr[1] = 1.0f; }
+                    uint32_t rid = rd32(ids + ch * 4);
+                    for (uint32_t k = 0; splitter == 0xffffffffu && k < nres; k++) {
+                        uint64_t r = ires + k * 0x70;
+                        if (rd32(r) == rid && rd8(r + 0x64)) { gl[ch] = rdf(r + 4); gr[ch] = rdf(r + 8); break; }
+                    }
+                    gl[ch] *= vol; gr[ch] *= vol;
+                }
+            }
+            int mix = mixing && (fmt == 2 || (fmt == 6 && coef > 0x10000)) && (vol > 0.0f);
+            if (mixing && fmt == 6 && coef <= 0x10000) {       /* an ADPCM voice without coefficients where they were looked for: the layout */
+                static int said_v;
+                if (said_v++ < 2) {
+                    printf("audio: ADPCM voice %u without coefficients at +0x%x; the voice (revision %u):\n", id, rev >= 15 ? 0x60 : 0x48, rev);
+                    for (uint32_t o = 0; o < vsz; o += 0x20) printf("  +%03x: %016llx %016llx %016llx %016llx\n", o, (unsigned long long)rd64(v + o), (unsigned long long)rd64(v + o + 8),
+                                                                    (unsigned long long)rd64(v + o + 16), (unsigned long long)rd64(v + o + 24));
+                }
+            }
+            uint32_t guard = 0;
+            for (int o = 0; o < 240 && avail && guard++ < 4096; ) {
                 uint64_t b = wb + ((index + pending) & 3) * 0x38;
-                uint32_t len = rd32(b + 0x14) - rd32(b + 0x10), left = len > s->pos ? len - s->pos : 0;
-                if (left > n) { s->pos += n; s->played += n; n = 0; break; }
-                s->played += left; n -= left; s->pos = 0;
-                if (rd8(b + 0x18)) continue;             /* a looping buffer plays again */
-                s->consumed++; pending++; avail--;
+                int32_t start = (int32_t)rd32(b + 0x10), end = (int32_t)rd32(b + 0x14);
+                uint32_t len = end > start ? (uint32_t)(end - start) : 0;
+                if (s->pos >= len) {                     /* this buffer is played */
+                    s->pos = 0; s->frac = 0; s->af = -1;
+                    if (rd8(b + 0x18) && len) continue;  /* a looping buffer plays again */
+                    s->consumed++; pending++; avail--;
+                    continue;
+                }
+                if (mix && rd64(b) > 0x10000) {          /* a buffer without data plays as silence */
+                    uint64_t data = rd64(b);
+                    uint32_t idx = (uint32_t)start + s->pos;
+                    for (uint32_t ch = 0; ch < cc; ch++) {
+                        int smp = 0;
+                        if (fmt == 2) smp = (int16_t)rd16(data + ((uint64_t)idx * cc + ch) * 2);
+                        else if (ch == 0) {
+                            int32_t f = (int32_t)(idx / 14);
+                            if (s->af == -1) {                       /* a new buffer: its context, else the history carried on */
+                                uint64_t ctx = rd64(b + 0x28);
+                                if (ctx > 0x10000) { s->yn1 = (int16_t)rd16(ctx + 2); s->yn2 = (int16_t)rd16(ctx + 4); }      /* not a pointer: no context */
+                                adpcm_frame(s, data, f, coef);
+                            } else if (f < s->af) adpcm_frame(s, data, f, coef);
+                            else while (s->af < f) adpcm_frame(s, data, s->af + 1, coef);
+                            smp = s->abuf[idx % 14];
+                        }
+                        g_mix[o][0] += (float)smp * gl[ch];
+                        g_mix[o][1] += (float)smp * gr[ch];
+                    }
+                }
+                s->frac += step;
+                uint32_t adv = (uint32_t)s->frac;
+                s->frac -= (float)adv;
+                s->pos += adv; s->played += adv;
+                o++;
             }
         }
         {   static int log = -1; static unsigned long long upd;    /* TOMO_AUDIOLOG=1: the voices in use, every 1000 updates (5 s) */
@@ -396,6 +507,7 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
     wr64(op, frames + 1); wr32(out + 0x28, 0x10);
     wr32(out + 0x3c, (uint32_t)total);
     wr32(out, rd32(in));
+    if (mixing) audio_out_frame();
     return 0;
 }
 /* IAudioRenderer::RequestUpdate (vtable +0x40), called by the lifted SDK [sdk 0x221164]: x1 -> {output, size},

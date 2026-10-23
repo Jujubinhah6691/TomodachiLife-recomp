@@ -267,6 +267,19 @@ extern volatile uint64_t g_hitch_rt_arg;
 void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int battle); void hitch_report(FILE *out); void hitch_set_render(void);
 #define HS_IN(name, arg) const char *hs_p_ = (const char *)g_hitch_rt; uint64_t hs_a_ = g_hitch_rt_arg; g_hitch_rt_arg = (uint64_t)(arg); g_hitch_rt = (name)
 #define HS_OUT() (g_hitch_rt = hs_p_, g_hitch_rt_arg = hs_a_)
+/* GPU timestamps (counter reports) within a frame: the frame's start plus 1 us per report. Taken when the render thread
+ * reached the command, a stall of the render thread (a shader compiled on first use, a texture upload) read as GPU time,
+ * and the game then lowered its render resolution for a while (dynamic resolution: a new render target size every frame,
+ * the churn that crashed the NVIDIA driver). Between frames the stamps follow the real clock. TOMO_REAL_GPU_TIME=1: the
+ * old stamps. */
+static uint64_t g_gpu_ts_base, g_gpu_ts_k;
+static uint64_t now_ns(void);
+static uint64_t gpu_ts(void) {
+    static int real = -1;
+    if (real < 0) real = getenv("TOMO_REAL_GPU_TIME") != NULL;
+    if (real || !g_gpu_ts_base) return now_ns();
+    return g_gpu_ts_base + ++g_gpu_ts_k * 1000;
+}
 
 static struct { void (*fn)(void *); volatile LONG64 ticks, n; } g_wj[16];
 static void gl_run(void (*fn)(void *), void *arg) {
@@ -975,16 +988,43 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
 }
 
 static int g_texfree_skip = -1;                        /* TOMO_TEXFREE=<bits> (diagnosis): 1 keep base textures, 2 keep views, 4 keep handles resident */
+/* Freed GL textures wait GRAVE_FRAMES presented frames before their bindless handles go non-resident and the texture is
+ * deleted: commands the GPU has not run yet may still use the handles, and making a handle non-resident or deleting its
+ * texture under them is undefined (ARB_bindless_texture). Done at once, the NVIDIA driver crashed inside glDeleteTextures
+ * when the game freed many render targets in a few frames (a scene change, dynamic resolution). */
+#define GRAVE_FRAMES 4
+typedef struct { GLuint gl; int nh, del; uint64_t *h; long long frame; } Grave;
+static Grave *g_grave;
+static int g_grave_n, g_grave_cap;
+static long long grave_now(void) { return (long long)g_st.frames; }
+static void grave_bury(const TexObj *o, int del) {
+    if (g_grave_n == g_grave_cap) { g_grave_cap = g_grave_cap ? g_grave_cap * 2 : 256; g_grave = realloc(g_grave, sizeof *g_grave * (size_t)g_grave_cap); }
+    Grave *g = &g_grave[g_grave_n++];
+    g->gl = o->gl; g->del = del; g->nh = o->nh; g->frame = grave_now();
+    g->h = NULL;
+    if (o->nh) { g->h = malloc(sizeof *g->h * (size_t)o->nh); for (int i = 0; i < o->nh; i++) g->h[i] = o->h[i].h; }
+}
+static void grave_sweep(int all) {                  /* render thread: the textures freed GRAVE_FRAMES frames ago (all: every one) */
+    long long now = grave_now();
+    int k = 0;
+    for (int i = 0; i < g_grave_n; i++) {
+        Grave *g = &g_grave[i];
+        if (!all && now - g->frame < GRAVE_FRAMES) { g_grave[k++] = *g; continue; }
+        HS_IN("texture free (handles non-resident)", g->gl);
+        if (!(g_texfree_skip & 4)) for (int j = 0; j < g->nh; j++) glMakeTextureHandleNonResidentARB(g->h[j]);
+        HS_OUT();
+        free(g->h);
+        if (g->del) { HS_IN("texture free (framebuffers, glDeleteTextures)", g->gl); fbo_purge(g->gl); glDeleteTextures(1, &g->gl); HS_OUT(); }
+    }
+    g_grave_n = k;
+}
 static void texobj_free(TexObj *o, int is_view) {
     if (g_texfree_skip < 0) { const char *e = getenv("TOMO_TEXFREE"); g_texfree_skip = e ? atoi(e) : 0; }
-    HS_IN("texture free (handles non-resident)", o->gl);
-    if (!(g_texfree_skip & 4)) for (int i = 0; i < o->nh; i++) glMakeTextureHandleNonResidentARB(o->h[i].h);
-    HS_OUT();
     InterlockedExchangeAdd64(&g_handles_live, -(LONG64)o->nh);
     if (o->gl && !o->alias) InterlockedDecrement64(&g_tex_live);
+    if (o->gl || o->nh) grave_bury(o, o->gl && !o->alias && !(g_texfree_skip & (is_view ? 2 : 1)));
     free(o->h);
     o->h = NULL; o->nh = 0;
-    if (o->gl && !o->alias && !(g_texfree_skip & (is_view ? 2 : 1))) { HS_IN("texture free (framebuffers, glDeleteTextures)", o->gl); fbo_purge(o->gl); glDeleteTextures(1, &o->gl); HS_OUT(); }
     o->gl = 0;
 }
 static struct { GLuint gl; int target, format, w, h, d, levels, nh, views, gpu; uint32_t flags; char vinfo[160]; } g_freed[16];
@@ -2236,6 +2276,7 @@ static void defer_free(int kind, void *p) {
     LeaveCriticalSection(&g_dead_lock);
 }
 static void gl_housekeeping(void) {
+    if (g_grave_n) grave_sweep(0);
     if (!g_dead_n) return;
     EnterCriticalSection(&g_dead_lock);
     for (int i = 0; i < g_dead_n; i++) {
@@ -3830,13 +3871,13 @@ static void exec(const Cmd *m, int depth) {
         break;
     case OP_COUNTER_RESET: counter_stop((int)a[0]); if (a[0] < 17) g_counter[a[0]].acc = 0; counter_start((int)a[0]); break;
     case OP_COUNTER_REPORT: {                  /* (type, address of an NVNcounterData {counter, timestamp}) */
-        uint64_t d[2] = {0, now_ns()};
+        uint64_t d[2] = {0, gpu_ts()};
         int type = (int)a[0];
         if (type > 0 && type < 16 && counter_target(type)) { counter_stop(type); d[0] = g_counter[type].acc; counter_start(type); }
         if (a[1]) { compute_flush(); memcpy(P(a[1]), d, 16); g_arena_gen++; }
         break;
     }
-    case OP_REPORT_VALUE: if (a[1]) { uint64_t d[2] = {(uint32_t)a[0], now_ns()}; compute_flush(); memcpy(P(a[1]), d, 16); g_arena_gen++; } break;
+    case OP_REPORT_VALUE: if (a[1]) { uint64_t d[2] = {(uint32_t)a[0], gpu_ts()}; compute_flush(); memcpy(P(a[1]), d, 16); g_arena_gen++; } break;
     case OP_FENCE: if (a[0]) fence_now(P(a[0]), (int)a[2]); break;
     case OP_WAITSYNC: { SyncObj *o = P(a[0]); if (o && o->s && !o->dead) glWaitSync(o->s, 0, 0xFFFFFFFFFFFFFFFFull); break; }
     case OP_EVENT_SIGNAL: event_signal_at(a[0], (int)a[1], (uint32_t)a[4]); break;
@@ -4252,6 +4293,7 @@ static void job_present(void *arg) {
     glEnable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
     g_st.frames = frame;
+    g_gpu_ts_base = now_ns(); g_gpu_ts_k = 0;
     if (frame <= 3 || frame % 600 == 0 || g_frame_draws != 0 && g_logn < 40 && (g_logn++, 1))
         printf("nvn_gl: frame %lld: %lld draws (%lld skipped), %lld clears | totals: %lld lists, %lld textures, %lld uploads (%lld MB), %lld programs ok, %lld rejected, %lld GL errors\n",
                (long long)frame, (long long)g_frame_draws, (long long)g_frame_skipped, (long long)g_frame_clears, (long long)g_st.lists, (long long)g_st.tex_created,
