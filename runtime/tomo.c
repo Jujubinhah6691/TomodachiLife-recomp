@@ -477,6 +477,216 @@ static void amix_parse(uint64_t in, uint64_t isp, uint64_t imx) {
         memcpy(m->vol, (void *)(uintptr_t)(p + 0x24), sizeof m->vol);
     }
 }
+
+/* ---- effects on mix buffers (after the reference implementation, yuzu/eden audio_core command/effect/*.cpp, ported to
+ * float): delay (3), reverb (4; also used for I3DL2 reverb, 5, with its own parameters mapped onto it) and biquad filter
+ * (6) are applied; aux (2), limiter (7), capture (8) and compressor (9) pass the mix through. An effect runs on the
+ * buffers of its mix, in the game's process order, before the mix goes on to its destination. Parameters are Q14 fixed
+ * point (value / 16384) unless noted. */
+#define AFX_MAX 32
+typedef struct { float *buf; int max, count, end, in, out; float decay; } RLine;
+static void rl_init(RLine *l, int n, float decay) {
+    if (n < 1) n = 1;
+    free(l->buf); l->buf = calloc((size_t)n + 1, sizeof(float));
+    l->max = l->count = l->end = n; l->in = l->out = 0; l->decay = decay;
+}
+static float rl_read(const RLine *l) { return l->buf[l->out]; }
+static void rl_write(RLine *l, float x) { l->buf[l->in] = x; if (++l->in >= l->end) l->in = 0; }
+static float rl_tick(RLine *l, float x) { float o = l->buf[l->out]; if (++l->out >= l->end) l->out = 0; rl_write(l, x); return o; }
+static float rl_tap(const RLine *l, int idx) { int p = l->in - (idx + 1); if (p < 0) p += l->count; if (p < 0) p = 0; return l->buf[p]; }
+typedef struct {
+    int type, ready;
+    float *dl[6]; int dlen[6], dpos[6]; float fb, fbd, fbx, lpg, lpf, lpz[6];            /* delay */
+    RLine pre, center, dec[4], fdn[4]; int early_t[10], pre_t; float early_g[10], hf_g[4], hf_pg[4], prev[4], cosv;   /* reverb */
+    double bq[6][4];                                                                     /* biquad state */
+} AFx;
+static AFx g_afx[AFX_MAX];
+static uint64_t g_efx_in; static uint32_t g_efx_n;       /* this update's effect parameters (input memory) */
+static float q14(uint64_t a) { return (float)(int32_t)rd32(a) / 16384.0f; }
+static void fx_delay(AFx *x, uint64_t pp, float *const *io, int nch) {
+    float sr = q14(pp + 0x18); if (sr > 1000.0f) sr /= 1000.0f;   /* kHz */
+    if (!x->ready) {
+        for (int c = 0; c < nch; c++) {
+            int n = (int)((float)rd32(pp + 0x14) * sr); if (n < 1) n = 1; if (n > 48000 * 2) n = 48000 * 2;
+            free(x->dl[c]); x->dl[c] = calloc((size_t)n, sizeof(float)); x->dlen[c] = n; x->dpos[c] = 0; x->lpz[c] = 0;
+        }
+        x->ready = 1;
+    }
+    float spread = q14(pp + 0x2c), in_gain = q14(pp + 0x1c), wet = q14(pp + 0x24), dry = q14(pp + 0x28);
+    x->fb = q14(pp + 0x20) * 0.97998046875f; x->fbd = x->fb * (1.0f - spread);
+    if (nch == 4 || nch == 6) spread *= 0.5f;
+    x->fbx = spread * x->fb; x->lpf = q14(pp + 0x30) * 0.949951171875f; x->lpg = 1.0f - x->lpf;
+    for (int k = 0; k < 240; k++) {
+        float in[6], d[6], g[6];
+        for (int c = 0; c < nch; c++) { in[c] = io[c][k]; d[c] = x->dl[c][x->dpos[c]]; }
+        for (int c = 0; c < nch; c++) {
+            float acc = 0;
+            for (int j = 0; j < nch; j++) {
+                float m;
+                if (nch == 1) m = x->fb;
+                else if (nch == 2) m = j == c ? x->fbd : x->fbx;
+                else if (nch == 4) { static const int M4[4][4] = {{1, 2, 2, 0}, {2, 1, 0, 2}, {2, 0, 1, 2}, {0, 2, 2, 1}}; int t = M4[j][c]; m = t == 1 ? x->fbd : t == 2 ? x->fbx : 0; }
+                else { static const int M6[6][6] = {{1, 0, 2, 0, 2, 0}, {0, 1, 2, 0, 0, 2}, {2, 2, 1, 0, 0, 0}, {0, 0, 0, 3, 0, 0}, {2, 0, 0, 0, 1, 2}, {0, 2, 0, 0, 2, 1}}; int t = M6[j][c]; m = t == 1 ? x->fbd : t == 2 ? x->fbx : t == 3 ? q14(pp + 0x20) : 0; }
+                acc += d[j] * m;
+            }
+            g[c] = in[c] * in_gain + acc;
+        }
+        for (int c = 0; c < nch; c++) {
+            x->lpz[c] = g[c] * x->lpg + x->lpz[c] * x->lpf;
+            x->dl[c][x->dpos[c]] = x->lpz[c]; if (++x->dpos[c] >= x->dlen[c]) x->dpos[c] = 0;
+            io[c][k] = in[c] * dry + d[c] * wet;
+        }
+    }
+}
+static const float RV_FDN_MAX[4] = {53.9532470703125f, 79.19256591796875f, 116.23876953125f, 170.61529541015625f};
+static const float RV_DEC_MAX[4] = {7.0f, 9.0f, 13.0f, 17.0f};
+static const float RV_EARLY_T[5][11] = {{0.0f, 3.5f, 2.799988f, 3.899963f, 2.699951f, 13.399963f, 7.899963f, 8.399963f, 9.899963f, 12.0f, 12.5f},
+    {0.0f, 11.799988f, 5.5f, 11.199951f, 10.399963f, 38.099976f, 22.199951f, 29.599976f, 21.199951f, 24.799988f, 40.0f},
+    {0.0f, 41.5f, 20.5f, 41.299988f, 0.0f, 29.5f, 33.799988f, 45.199951f, 46.799988f, 0.0f, 50.0f},
+    {33.099976f, 43.299988f, 22.799988f, 37.899963f, 14.899963f, 35.299988f, 17.899963f, 34.199951f, 0.0f, 43.299988f, 50.0f}, {0}};
+static const float RV_EARLY_G[5][10] = {{0.699951f, 0.679993f, 0.699951f, 0.679993f, 0.699951f, 0.679993f, 0.699951f, 0.679993f, 0.679993f, 0.679993f},
+    {0.699951f, 0.679993f, 0.699951f, 0.679993f, 0.699951f, 0.679993f, 0.679993f, 0.679993f, 0.679993f, 0.679993f},
+    {0.5f, 0.699951f, 0.699951f, 0.679993f, 0.5f, 0.679993f, 0.679993f, 0.699951f, 0.679993f, 0.0f},
+    {0.929993f, 0.919983f, 0.869995f, 0.859985f, 0.939941f, 0.809998f, 0.799988f, 0.769958f, 0.759949f, 0.649963f}, {0}};
+static const float RV_FDN_T[5][4] = {{53.953247f, 79.192566f, 116.238770f, 130.615295f}, {53.953247f, 79.192566f, 116.238770f, 170.615295f},
+    {5.0f, 10.0f, 5.0f, 10.0f}, {47.029968f, 71.0f, 103.0f, 170.0f}, {53.953247f, 79.192566f, 116.238770f, 170.615295f}};
+static const float RV_DEC_T[5][4] = {{7.0f, 9.0f, 13.0f, 17.0f}, {7.0f, 9.0f, 13.0f, 17.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, {7.0f, 7.0f, 13.0f, 9.0f}, {7.0f, 9.0f, 13.0f, 17.0f}};
+typedef struct { int nch, early_mode, late_mode; float sr, early_gain, pre_delay, late_gain, decay_time, hf_ratio, colouration, base_gain, wet, dry; } RvP;
+static float pow10c(float v) { return v >= 0.0f ? 1.0f : v <= -5.3f ? 0.0f : powf(10.0f, v); }
+static void rv_update(AFx *x, const RvP *p) {
+    float sr = p->sr < 1.0f ? 1.0f : p->sr, pre = p->pre_delay < 0 ? 0 : p->pre_delay;
+    int em = p->early_mode >= 0 && p->early_mode < 5 ? p->early_mode : 0, lm = p->late_mode >= 0 && p->late_mode < 5 ? p->late_mode : 0;
+    for (int i = 0; i < 10; i++) {
+        int t = (int)((pre + RV_EARLY_T[em][i]) * sr); if (t < 0) t = 0; if (t > x->pre.max) t = x->pre.max;
+        int old = x->early_t[i] - 1; x->early_t[i] = old + (t - old) / 4 + 1;
+        float g = p->early_gain * RV_EARLY_G[em][i]; if (g < 0) g = 0; if (g > 1) g = 1;
+        x->early_g[i] += (g - x->early_g[i]) / 4;
+    }
+    if (p->nch == 2) { x->early_g[4] *= 0.5f; x->early_g[5] *= 0.5f; }
+    int tp = (int)((pre + RV_EARLY_T[em][10]) * sr); if (tp < 0) tp = 0; if (tp > x->pre.max) tp = x->pre.max;
+    x->pre_t += (tp - x->pre_t) / 4;
+    if (!x->cosv) x->cosv = cosf(1280.0f / sr * 3.14159265f / 180.0f);
+    for (int i = 0; i < 4; i++) {
+        int t = (int)(RV_FDN_T[lm][i] * sr); if (t < 0) t = 0; if (t > x->fdn[i].max) t = x->fdn[i].max;
+        x->fdn[i].count += (t - x->fdn[i].count) / 4; if (x->fdn[i].count < 1) x->fdn[i].count = 1; x->fdn[i].end = x->fdn[i].count - 1 > 0 ? x->fdn[i].count - 1 : 1;
+        if (x->fdn[i].in >= x->fdn[i].end) x->fdn[i].in = 0; if (x->fdn[i].out >= x->fdn[i].end) x->fdn[i].out = 0;
+        int d = (int)(RV_DEC_T[lm][i] * sr); if (d < 0) d = 0; if (d > x->dec[i].max) d = x->dec[i].max;
+        x->dec[i].count += (d - x->dec[i].count) / 4; if (x->dec[i].count < 1) x->dec[i].count = 1; x->dec[i].end = x->dec[i].count - 1 > 0 ? x->dec[i].count - 1 : 1;
+        if (x->dec[i].in >= x->dec[i].end) x->dec[i].in = 0; if (x->dec[i].out >= x->dec[i].end) x->dec[i].out = 0;
+        float col = p->colouration < 0 ? 0 : p->colouration > 1 ? 1 : p->colouration;
+        x->dec[i].decay += (0.5999755859375f * (1.0f - col) - x->dec[i].decay) / 4;
+        float dt = p->decay_time <= 0 ? 0.0001f : p->decay_time;
+        float a = (float)(x->fdn[i].max + x->dec[i].max) * -3.0f, b = a / (dt * sr);
+        float hf = p->hf_ratio < 0.001f ? 0.001f : p->hf_ratio > 0.999f ? 0.999f : p->hf_ratio, c, dd;
+        if (hf > 0.9949f) { c = 0; dd = 1; }
+        else {
+            float e = pow10c(((1.0f / hf) - 1.0f) * 2 / 100 * (b / 10)); if (e < 0.0001f) e = 0.0001f; if (e > 1) e = 1;
+            float f = 1.0f - e; if (f < 0.0001f) f = 0.0001f;
+            float g = 2.0f - x->cosv * e * 2, h2 = g * g - f * f * 4; if (h2 < 0) h2 = 0;
+            c = (g - sqrtf(h2)) / (f * 2.0f); dd = 1.0f - c;
+        }
+        x->hf_pg[i] += (c - x->hf_pg[i]) / 4;
+        x->hf_g[i] += (pow10c(b / 1000) * dd * 0.70709228515625f - x->hf_g[i]) / 4;
+        x->prev[i] = 0;
+    }
+}
+static void fx_reverb(AFx *x, const RvP *p, float *const *io, int nch) {
+    if (!x->ready) {
+        float sr = p->sr < 1.0f ? 1.0f : p->sr;
+        memset(x->early_t, 0, sizeof x->early_t); memset(x->early_g, 0, sizeof x->early_g); x->pre_t = 0;
+        memset(x->hf_g, 0, sizeof x->hf_g); memset(x->hf_pg, 0, sizeof x->hf_pg); x->cosv = 0;
+        for (int i = 0; i < 4; i++) { rl_init(&x->fdn[i], (int)(RV_FDN_MAX[i] * sr), 1.0f); rl_init(&x->dec[i], (int)(RV_DEC_MAX[i] * sr), 0.0f); }
+        rl_init(&x->pre, (int)(350.0f * sr), 1.0f); rl_init(&x->center, (int)(5 * sr), 1.0f);
+        rv_update(x, p);
+        x->ready = 1;
+    } else rv_update(x, p);
+    static const int T1[10] = {0}, T2[10] = {0, 0, 1, 1, 0, 1, 0, 0, 1, 1}, T4[10] = {0, 0, 1, 1, 0, 1, 2, 2, 3, 3}, T6[10] = {0, 0, 1, 1, 2, 2, 4, 4, 5, 5};
+    const int *tap = nch == 1 ? T1 : nch == 2 ? T2 : nch == 4 ? T4 : T6;
+    for (int k = 0; k < 240; k++) {
+        float o[6] = {0}, in = 0;
+        for (int t = 0; t < 10; t++) { float v = rl_tap(&x->pre, x->early_t[t]) * x->early_g[t]; o[tap[t]] += v; if (nch == 6) o[3] += v; }
+        if (nch == 6) o[3] *= 0.2f;
+        for (int c = 0; c < nch; c++) in += io[c][k];
+        rl_write(&x->pre, in * p->base_gain);
+        for (int i = 0; i < 4; i++) x->prev[i] = x->prev[i] * x->hf_pg[i] + rl_read(&x->fdn[i]) * x->hf_g[i];
+        float ps = rl_tap(&x->pre, x->pre_t) * p->late_gain;
+        float mm[4] = {x->prev[2] + x->prev[1] + ps, -x->prev[0] - x->prev[3] + ps, x->prev[0] - x->prev[3] + ps, x->prev[1] - x->prev[2] + ps}, ap[4];
+        for (int i = 0; i < 4; i++) {
+            float v = rl_read(&x->dec[i]), mixed = mm[i] - v * x->dec[i].decay;
+            ap[i] = rl_tick(&x->dec[i], mixed) + mixed * x->dec[i].decay;
+            rl_tick(&x->fdn[i], ap[i]);
+        }
+        if (nch == 6) {
+            float apo[6] = {ap[0], ap[1], ap[2] - ap[3], ap[3], ap[2], ap[3]};
+            for (int c = 0; c < 6; c++) { float a = c == 2 ? rl_tick(&x->center, apo[c] * 0.5f) : apo[c]; io[c][k] = io[c][k] * p->dry + (o[c] + a) * p->wet; }
+        } else for (int c = 0; c < nch; c++) io[c][k] = io[c][k] * p->dry + (o[c] + ap[c < 4 ? c : 0]) * p->wet;
+    }
+}
+static void fx_biquad(AFx *x, uint64_t pp, float *const *io, int nch) {
+    double b[3], a[2];
+    if (rd32(pp + 0xc) == 0 && rdf(pp + 0x10) != 0.0f) { for (int i = 0; i < 3; i++) b[i] = rdf(pp + 0x10 + (uint64_t)i * 4); a[0] = rdf(pp + 0x1c); a[1] = rdf(pp + 0x20); }
+    else { for (int i = 0; i < 3; i++) b[i] = (int16_t)rd16(pp + 0xc + (uint64_t)i * 2) / 16384.0; a[0] = (int16_t)rd16(pp + 0x12) / 16384.0; a[1] = (int16_t)rd16(pp + 0x14) / 16384.0; }
+    for (int c = 0; c < nch; c++) {
+        double *st = x->bq[c];
+        for (int k = 0; k < 240; k++) {
+            double in = io[c][k], y = in * b[0] + st[0] * b[1] + st[1] * b[2] + st[2] * a[0] + st[3] * a[1];
+            if (!(y > -1e7 && y < 1e7)) { y = 0; memset(st, 0, sizeof x->bq[c]); }
+            st[1] = st[0]; st[0] = in; st[3] = st[2]; st[2] = y;
+            io[c][k] = (float)y;
+        }
+    }
+}
+static void afx_run_mix(int mix) {                       /* the effects of one mix, in process order, on its buffers */
+    static int off = -1;
+    if (off < 0) off = getenv("TOMO_AUDIO_FX") && getenv("TOMO_AUDIO_FX")[0] == '0';
+    if (off || !g_efx_in) return;
+    for (uint32_t order = 0; order < 8; order++)
+        for (uint32_t e = 0; e < g_efx_n && e < AFX_MAX; e++) {
+            uint64_t ep = g_efx_in + e * 0xc0, pp = ep + 0x20;
+            int type = rd8(ep);
+            if (!type || (int)rd32(ep + 4) != mix || rd32(ep + 0x18) != order) continue;
+            AFx *x = &g_afx[e];
+            if (x->type != type || rd8(ep + 1)) { x->type = type; x->ready = 0; memset(x->bq, 0, sizeof x->bq); }
+            if (!rd8(ep + 2) || type == 2 || type >= 7) continue;   /* disabled, or passed through */
+            int nch = type == 6 ? (int8_t)rd8(pp + (rd32(pp + 0xc) == 0 && rdf(pp + 0x10) != 0.0f ? 0x24 : 0x16)) : (int)rd16(pp + 0xe);
+            if (nch != 1 && nch != 2 && nch != 4 && nch != 6) continue;
+            float *io[6];
+            int bad = 0;
+            for (int c = 0; c < nch; c++) {                 /* in place: the reference reads inputs[c] and writes outputs[c] */
+                int bi = (int8_t)rd8(pp + (uint64_t)c), bo = (int8_t)rd8(pp + 6 + (uint64_t)c);
+                if (bi < 0 || bi >= g_amix[mix].buffers || bo < 0 || bo >= g_amix[mix].buffers) { bad = 1; break; }
+                if (bi != bo) memcpy(g_abuf[mix][bo], g_abuf[mix][bi], sizeof g_abuf[mix][bo]);
+                io[c] = g_abuf[mix][bo];
+            }
+            if (bad) continue;
+            {   static int log = -1; static uint32_t said;      /* TOMO_AUDIOLOG: each effect's parameters once, as read */
+                if (log < 0) log = getenv("TOMO_AUDIOLOG") != NULL;
+                if (log && e < 32 && !(said >> e & 1)) {
+                    said |= 1u << e;
+                    printf("audio: effect %u type %d on mix %d, %d channels:", e, type, mix, nch);
+                    for (int w = 0x10; w < 0x48; w += 4) printf(" %08x", rd32(pp + (uint64_t)w));
+                    printf("\n");
+                }
+            }
+            if (type == 3) fx_delay(x, pp, io, nch);
+            else if (type == 6) fx_biquad(x, pp, io, nch);
+            else if (type == 4) {
+                RvP p = {nch, (int)rd32(pp + 0x14), (int)rd32(pp + 0x20), q14(pp + 0x10), q14(pp + 0x18), q14(pp + 0x1c), q14(pp + 0x24), q14(pp + 0x28),
+                         q14(pp + 0x2c), q14(pp + 0x30), q14(pp + 0x34), q14(pp + 0x38), q14(pp + 0x3c)};
+                if (p.sr > 1000.0f) p.sr /= 1000.0f;
+                fx_reverb(x, &p, io, nch);
+            } else if (type == 5) {                         /* I3DL2 (floats, millibels and seconds) mapped onto the reverb above */
+                float sr = (float)rd32(pp + 0x14) / 1000.0f, decay = rdf(pp + 0x20), hfr = rdf(pp + 0x24), room = rdf(pp + 0x28), refl = rdf(pp + 0x2c),
+                      rev = rdf(pp + 0x30), rdel = rdf(pp + 0x38), dry = rdf(pp + 0x44);
+                if (sr < 1.0f) sr = 48.0f;
+                if (!(dry >= 0.0f && dry <= 2.0f)) dry = 1.0f;
+                RvP p = {nch, 1, 1, sr, powf(10.0f, refl / 2000.0f), rdel * 1000.0f, powf(10.0f, rev / 2000.0f), decay, hfr, 0.0f,
+                         powf(10.0f, room / 2000.0f), 1.0f, dry};
+                if (!(p.decay_time > 0.0f && p.decay_time < 30.0f)) continue;
+                fx_reverb(x, &p, io, nch);
+            }
+        }
+}
 static int amix_depth(int m) {                           /* hops to the final mix (cycles cut at 16) */
     int d = 0;
     for (int guard = 0; m != 0 && guard < 16; guard++, d++) {
@@ -496,6 +706,7 @@ static void amix_run(void) {                            /* sub-mixes into their 
     for (int i = 1; i < n; i++) for (int j = i; j > 0 && depth[order[j]] > depth[order[j - 1]]; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
     for (int i = 0; i < n; i++) {
         AMix *m = &g_amix[order[i]];
+        afx_run_mix(order[i]);
         if (amix_ok(m->dest_mix)) {
             AMix *dm = &g_amix[m->dest_mix];
             for (int a = 0; a < m->buffers; a++)
@@ -516,6 +727,7 @@ static void amix_run(void) {                            /* sub-mixes into their 
         }
     }
     AMix *f = &g_amix[0];
+    afx_run_mix(0);
     for (int k = 0; k < 240; k++) {
         float l, r;
         if (f->buffers >= 6) { l = g_abuf[0][0][k] + 0.707f * (g_abuf[0][2][k] + g_abuf[0][4][k]); r = g_abuf[0][1][k] + 0.707f * (g_abuf[0][2][k] + g_abuf[0][5][k]); }
@@ -708,7 +920,9 @@ static uint32_t audren_core(uint64_t in, uint64_t out, uint64_t cap, uint64_t fr
     wr64(op, frames + 1); wr32(out + 0x28, 0x10);
     wr32(out + 0x3c, (uint32_t)total);
     wr32(out, rd32(in));
+    g_efx_in = ie; g_efx_n = neffect;
     if (mixing && graph) amix_run();
+    g_efx_in = 0;
     if (mixing) audio_out_frame();
     return 0;
 }

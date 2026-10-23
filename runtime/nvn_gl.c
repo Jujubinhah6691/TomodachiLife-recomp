@@ -2876,6 +2876,20 @@ static int g_dbg_noscissor, g_dbg_skipdraw = -1, g_frame_draw_index;      /* deb
  * the game bound handle 0 to the unit / never bound it, or the handle names a texture that is gone or was never registered. */
 static long long g_dummy_draws, g_dummy_unbound, g_dummy_dead;
 static void count_dummy_samples(void) {
+    {   /* TOMO_GLERR_DRAW=1 (diagnosis): a GL error after a draw, with the framebuffer it went to */
+        static int on = -1, nlog;
+        if (on < 0) on = getenv("TOMO_GLERR_DRAW") != NULL;
+        GLenum e;
+        if (on && (e = glGetError()) != 0 && nlog++ < 40) {
+            GLint fb = 0; glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+            GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER_);
+            printf("glerr: GL error 0x%x after draw %d of frame %lld (fs #%d): framebuffer %d status 0x%x, colour target %s%dx%d format 0x%x gl %u, depth %s%dx%d format 0x%x gl %u\n", e, g_frame_draw_index,
+                   (long long)g_st.frames + 1, S.prog[1] ? S.prog[1]->serial : -1, fb, st, S.color0 && S.color0->dead ? "DEAD " : "", S.color0 ? S.color0->b.width : 0, S.color0 ? S.color0->b.height : 0,
+                   S.color0 ? S.color0->b.format : 0, S.color0 ? S.color0->o.gl : 0, S.depth_tex && S.depth_tex->dead ? "DEAD " : "", S.depth_tex ? S.depth_tex->b.width : 0, S.depth_tex ? S.depth_tex->b.height : 0,
+                   S.depth_tex ? S.depth_tex->b.format : 0, S.depth_tex ? S.depth_tex->o.gl : 0);
+            while (glGetError()) {}
+        }
+    }
     int hit = 0;
     for (int s = 0; s < 6; s++) {
         uint32_t m = S.prog[s] ? S.prog[s]->st[s].glsl_tex : 0;
@@ -4226,6 +4240,20 @@ static void replay(uint64_t handle, int depth) {
         const Cmd *m = (const Cmd *)(data + off);
         if (m->size < sizeof(Cmd)) break;
         exec(m, depth);
+        {   static int on = -1, nlog;                   /* TOMO_GLERR_DRAW: a GL error after any command, with its framebuffer */
+            if (on < 0) on = getenv("TOMO_GLERR_DRAW") != NULL;
+            GLenum e;
+            if (on && (e = glGetError()) != 0) {
+                if (nlog++ < 40) {
+                    GLint fb = 0; glGetIntegerv(0x8CA6, &fb);
+                    printf("glerr: GL error 0x%x after %s (frame %lld): framebuffer %d status 0x%x, colour 0 %dx%d format 0x%x gl %u, depth %dx%d format 0x%x gl %u, have_fbo %d\n", e,
+                           k_op_name[m->op < OP_COUNT ? m->op : 0], (long long)g_st.frames + 1, fb, glCheckFramebufferStatus(GL_FRAMEBUFFER_),
+                           S.color0 ? S.color0->b.width : 0, S.color0 ? S.color0->b.height : 0, S.color0 ? S.color0->b.format : 0, S.color0 ? S.color0->o.gl : 0,
+                           S.depth_tex ? S.depth_tex->b.width : 0, S.depth_tex ? S.depth_tex->b.height : 0, S.depth_tex ? S.depth_tex->b.format : 0, S.depth_tex ? S.depth_tex->o.gl : 0, S.have_fbo);
+                }
+                while (glGetError()) {}
+            }
+        }
         off += m->size;
     }
 }
