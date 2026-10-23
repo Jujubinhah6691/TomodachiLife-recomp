@@ -326,6 +326,22 @@ static uint64_t kbd_store(uint64_t string, const wchar_t *text, int utf8) {
     wr16(ptr + chars * 2, 0);
     return (chars + 1) * 2;
 }
+/* tomo.c (nn::swkbd::InlineKeyboard): one text answer, as ShowKeyboard gets it (SSBU_SWKBD=text:<answer> / cancel /
+ * dialog; scripted runs cancel). 1 = `out` holds the text, 0 = cancelled. Blocks: run it off the game thread. */
+int swkbd_prompt(const wchar_t *guide, const wchar_t *initial, int max_len, wchar_t *out) {
+    static KbdDialog k;
+    static wchar_t fixed[SWKBD_MAX_CHARS + 2];
+    if (max_len <= 0 || max_len > SWKBD_MAX_CHARS) max_len = SWKBD_MAX_CHARS;
+    int mode = kbd_mode(fixed);
+    if (mode == 1) return 0;
+    if (mode == 2) { wcsncpy(out, fixed, (size_t)max_len); out[max_len] = 0; return 1; }
+    memset(&k, 0, sizeof k);
+    k.header = L""; k.sub = L""; k.guide = guide ? guide : L""; k.initial = initial ? initial : L"";
+    k.max_len = max_len; k.min_len = 0; k.password = 0;
+    if (!kbd_run_dialog(&k)) return 0;
+    wcsncpy(out, k.text, (size_t)max_len); out[max_len] = 0;
+    return 1;
+}
 static void swkbd_ShowKeyboard(Ctx *c) {
     uint64_t string = A0, arg = A1;
     static KbdDialog k;                                    /* one keyboard at a time, as on the console */

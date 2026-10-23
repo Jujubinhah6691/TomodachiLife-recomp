@@ -61,11 +61,14 @@ answers live in `runtime/tomo.c`. What works:
 - SDK 20 services: light semaphores / message queues, timer events, the nn::os memory heap, SdkMutex / SdkConditionVariable
   cut to host locks, ~300 pure SDK functions lifted (prepo, mii values, vibration, png/jpeg, the nn::audio client).
 
-**Where it is (2026-10-22, evening): in the game world.** The loading screen, the "demo save data detected" dialog
-(OK), "transfer the demo save?" (Don't Transfer, then its confirmation) and the date-and-time check (Yes, Proceed) are
-passed; the game loads its world and shows the island in the sea with the "take a look around the island" prompt,
-at 14 fps while its shaders are first prepared, 30 fps on the dialogs. The scripted path:
-`SSBU_SEQ="900:Z 500:l 60:Z 500:r 60:Z 800:Z 500:Z"` (poll-counted presses, nnhid.c) with `scripts/ps_run.ps1`.
+**Where it is (2026-10-22, afternoon): in the game world, through its intro.** The loading screen, the "demo save data
+detected" dialog (OK), "transfer the demo save?" (Don't Transfer, then its confirmation) and the date-and-time check
+(Yes, Proceed) are passed; the game loads its world, shows the island in the sea ("You've found a tiny island", OK),
+the "take a look around the island" prompt (cursor on the left stick, camera on the right: both move), then its intro
+dialogs ("Let's invite some folks to live here!", "There are no rules!"...), at the game's 30 fps cap. The scripted
+path (poll-counted presses, nnhid.c; `@draws:` waits for the world's draw count): `SSBU_SEQ="900:Z 500:l 60:Z 500:r 60:Z
+800:Z 600:r 60:Z @draws:280-420/30 300:Z 500:H/60 100:F/60 100:T/60 100:G/60 100:r/60 100:l/60 100:u/60 100:Z 300:Z
+..."` with `scripts/ps_run.ps1` (Z = A, X = B, u/d/l/r = left stick, T/F/G/H = right stick, I/J/K/L = d-pad).
 
 Host bugs fixed on the way, each one a hang:
 
@@ -97,18 +100,31 @@ the game's heap, no game-thread barrier for texture finalize / pool registration
 shaders of earlier runs are compiled before the game starts behind a "preparing shaders" screen with a bar (text-only
 loading screen; `SSBU_PREPARE=0` skips it); shaders first met during play still hold a present while they compile.
 `nvn_perf` (every 300 frames) now lists the costliest command types, the jobs the game thread waits for and the barriers
-by caller. Known: views of ASTC textures are refused by the driver (sampled as the plain texture); a driver-side crash
-(nvoglv64 reading NULL, on a host thread while the render thread is idle) was seen twice near frame 5000; the retire
-barrier (buffer / pool finalize) stays, without it the sea foam drew wrong. Not touched yet: audio output, rumble, the
-Vulkan back end.
+by caller. The retire barrier (buffer / pool finalize) stays, without it the sea foam drew wrong.
+
+**The driver crash (2026-10-22, afternoon):** every run died on the render thread some 2,400 frames into the island,
+inside `glDeleteTextures` (the crash report now names the hitch scope and lists the textures freed last; the minidump
+reader `mdscan.py` showed nvoglv64 jumping through a garbage pointer). The game makes its render targets anew every
+frame, a dozen a frame, and deleting and recreating their GL textures, views, bindless handles and framebuffers each
+frame is what the driver could not take. Two changes: finalized GPU-written textures are kept as spares and the next
+texture of the same shape takes their GL objects over (`tex_take_spare`: 2,100 textures made in a 5 minute run instead
+of 29,000, the framebuffer cache then hits); and no framebuffer ever names a texture at the time it is deleted (cache
+entries are detached and their names reused instead of deleted; the static blit / clear / present framebuffers are
+detached after each use). Views of software-decoded (ASTC) textures name the decoded storage format. Not touched yet:
+audio output, rumble, the Vulkan back end. Visible gaps: dialog text has an offset blue copy under lines with
+highlighted words; the island's buildings are flat black blocks; thin vertical lines near signs.
 
 Diagnostics: `TOMO_SAMPLE=1` (1 ms function sampler of every guest thread and the main thread, report at exit, and a
 thread / wait report after 3 s without a present), `TOMO_GPUTIME=<ms>` (every draw and dispatch finished and timed; with
 `TOMO_GPUTIME_EVERY=<n>` only every n-th; the last 256 commands are kept in `gputime_last.txt` through a file mapping
 that survives a GPU reset), `scripts/ps_run.ps1` (runs the game from PowerShell with the real exit code: under the bash
 `timeout` wrapper a driver reset showed as exit 127 and a truncated log), `TOMO_EVLOG=1` (events waited on for over 2 s and who signals them), `TOMO_TASKLOG=1` (scene task states),
-`TOMO_HEAPLOG=1|<heap name>`, `TOMO_ALIASLOG=1`, `SSBU_PEEK=<addr,...>` in the crash report, `tools/debug/*.py`
-(disassemble main or sdk by address / name, callers, relocation of a slot, cross-references, host code at a DLL RVA).
+`TOMO_HEAPLOG=1|<heap name>`, `TOMO_ALIASLOG=1`, `TOMO_TEXFREE=<bits>` (1 / 2 / 4: keep base textures / views /
+resident handles instead of freeing them), `SSBU_GLDEBUG=1`, `SSBU_PEEK=<addr,...>` in the crash report,
+`tools/debug/*.py` (disassemble main or sdk by address / name, callers, relocation of a slot, cross-references, host
+code at a DLL RVA). `scripts/dev_build.sh [dll]` stages and rebuilds without running; `scripts/ps_run.ps1` pins the
+process directory to `build/work` (PowerShell's Set-Location does not move it, and the exe then lost `../cache`: the
+shader preparation waited for a pair list that never loaded). Screenshot folders (`SSBU_SHOT_DIR`) must exist.
 
 ## Reproduce
 
@@ -139,10 +155,8 @@ The keys must cover key generation 0x0f or newer, since this game is newer than 
 
 ## Next steps
 
-1. Play from the island prompt on (cursor and camera; the game believes a demo save exists, which the fs / save
-   answers in tomo.c decide) and look at what the world is missing visually.
-2. Translate `TEX (b)` (bindless handle in a register: a table from NVN handle to GL bindless handle, filled by
-   nvnDeviceGetTextureHandle).
-3. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
-4. The Vulkan back end: `nvnCommandBufferReportCounter`.
-5. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).
+1. Play through the intro dialogs into Mii creation and look at what the world is missing visually (the blue ghost
+   text under highlighted dialog lines first: `SSBU_DRAWLOG=<frame>` of a dialog frame).
+2. Audio mixing in the silent renderer (voices -> a host audio device) once the game is past loading.
+3. The Vulkan back end: `nvnCommandBufferReportCounter`.
+4. Rumble (the cut `SendVibrationValue` calls can drive nnhid.c's SDL rumble).

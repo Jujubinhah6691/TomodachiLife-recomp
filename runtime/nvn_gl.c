@@ -188,6 +188,7 @@ GLF(X)
     X(void, InvalidateFramebuffer, (GLenum, GLsizei, const GLenum *)) \
     X(void, FramebufferTextureLayer, (GLenum, GLenum, GLuint, GLint, GLint)) \
     X(void, CopyImageSubData, (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei)) \
+    X(void, ClearTexImage, (GLuint, GLint, GLenum, GLenum, const void *)) \
     X(void *, FenceSync, (GLenum, GLbitfield)) \
     X(GLenum, ClientWaitSync, (void *, GLbitfield, uint64_t)) \
     X(void, WaitSync, (void *, GLbitfield, uint64_t)) \
@@ -631,19 +632,41 @@ static volatile LONG64 g_handles_live, g_tex_live;       /* resident bindless ha
  * their GL objects each frame crashed the driver in glDeleteTextures after some 2400 frames. Only GPU-written textures
  * (CPU_NO_ACCESS pools) are kept: nothing is ever uploaded into them, so stale texels are what the pool memory holds too. */
 #define SPARE_KEY (offsetof(TexBuilder, layout))        /* flags .. has_layout, swz: what tex_realize makes the storage from */
-static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[256];
+#define SPARE_MAX 96
+static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[SPARE_MAX];
 static int g_spare_n;
 static LONG64 g_spare_hits, g_spare_kept, g_spare_full;
+static LONG64 g_spare_same_mem, g_spare_cleared;
+/* The game remakes a render target over the same pool memory and may read what the last one there held (a UI layer
+ * kept from frame to frame): a spare made at the same memory is taken first, its texels are the right ones. A spare from
+ * other memory holds another target's picture: it is cleared to zero (a new GL texture would start out that way). */
 static int tex_take_spare(Tex *t) {
     if (!t->gpu_written || g_rb == &rb_vk) return 0;
+    int pick = -1;
     for (int i = g_spare_n - 1; i >= 0; i--) {
         if (memcmp(&g_spare[i].b, &t->b, SPARE_KEY)) continue;
-        t->o = g_spare[i].o; t->views = g_spare[i].views; t->glevels = g_spare[i].glevels;
-        memmove(&g_spare[i], &g_spare[i + 1], sizeof g_spare[0] * (size_t)(g_spare_n - 1 - i)); g_spare_n--;
-        g_spare_hits++;
-        return 1;
+        if (g_spare[i].b.pool == t->b.pool && g_spare[i].b.offset == t->b.offset) { pick = i; break; }
+        if (pick < 0) pick = i;
     }
-    return 0;
+    if (pick < 0) return 0;
+    int same = g_spare[pick].b.pool == t->b.pool && g_spare[pick].b.offset == t->b.offset;
+    t->o = g_spare[pick].o; t->views = g_spare[pick].views; t->glevels = g_spare[pick].glevels;
+    memmove(&g_spare[pick], &g_spare[pick + 1], sizeof g_spare[0] * (size_t)(g_spare_n - 1 - pick)); g_spare_n--;
+    g_spare_hits++;
+    if (same) g_spare_same_mem++;
+    else {
+        Fmt f;
+        if (fmt_get(t->b.format, &f) && gl_has(glClearTexImage, "glClearTexImage")) {
+            GLenum fm = f.format, ty = f.type;
+            if (f.kind == 1) { fm = 0x1902; ty = 0x1406; }                 /* DEPTH_COMPONENT, FLOAT */
+            else if (f.kind == 2) { fm = 0x1901; ty = 0x1401; }            /* STENCIL_INDEX, UNSIGNED_BYTE */
+            else if (f.kind == 3) { fm = 0x84F9; ty = f.internal == 0x8CAD ? 0x8DAD : 0x84FA; }   /* DEPTH_STENCIL: 32F_8 or 24_8 */
+            if (f.kind != 4) for (int l = 0; l < t->glevels; l++) glClearTexImage(t->o.gl, l, fm, ty, NULL);
+            while (glGetError()) {}
+            g_spare_cleared++;
+        }
+    }
+    return 1;
 }
 static void tex_realize(Tex *t) {
     static int nlog, nbad;
@@ -990,7 +1013,18 @@ static void tex_free_gl(Tex *t) {
         g_freed_n++;
     }
     if (t->gpu_written && t->o.gl && !t->o.alias && g_rb != &rb_vk) {
-        if (g_spare_n < (int)(sizeof g_spare / sizeof g_spare[0])) {
+        /* dynamic resolution (the game lowers its render size while frames are slow, a new size every frame): at most a few
+         * spares of one shape and SPARE_MAX in all; the oldest goes (freed for real) to make room */
+        int same = 0, oldest_same = -1;
+        for (int i = 0; i < g_spare_n; i++) if (!memcmp(&g_spare[i].b, &t->b, SPARE_KEY)) { if (oldest_same < 0) oldest_same = i; same++; }
+        int drop = same >= 4 ? oldest_same : g_spare_n >= SPARE_MAX ? 0 : -1;
+        if (drop >= 0) {
+            for (VNode *n = g_spare[drop].views, *next; n; n = next) { next = n->next; texobj_free(&n->o, 1); free(n); }
+            texobj_free(&g_spare[drop].o, 0);
+            memmove(&g_spare[drop], &g_spare[drop + 1], sizeof g_spare[0] * (size_t)(g_spare_n - 1 - drop)); g_spare_n--;
+            g_spare_full++;
+        }
+        if (g_spare_n < SPARE_MAX) {
             g_spare[g_spare_n].b = t->b; g_spare[g_spare_n].o = t->o; g_spare[g_spare_n].views = t->views; g_spare[g_spare_n].glevels = t->glevels;
             g_spare_n++; g_spare_kept++;
             memset(&t->o, 0, sizeof t->o); t->views = NULL;
@@ -4090,8 +4124,9 @@ static void pf_frame_mark(LONG64 frame) {
                 wsnap[i] = g_wj[i].ticks; wsnapn[i] = g_wj[i].n;
             }
             static LONG64 bsnap[16], bsnapn[16];
-            printf("\nnvn_perf: alive: %lld GL textures, %lld resident handles, %d dead objects pending; spare render targets %d (%lld reused, %lld kept, %lld not kept: full)", (long long)g_tex_live, (long long)g_handles_live, g_dead_n,
+            printf("\nnvn_perf: alive: %lld GL textures, %lld resident handles, %d dead objects pending; spare render targets %d (%lld reused, %lld kept, %lld old ones freed)", (long long)g_tex_live, (long long)g_handles_live, g_dead_n,
                    g_spare_n, (long long)g_spare_hits, (long long)g_spare_kept, (long long)g_spare_full);
+            printf(" (%lld at the same memory, %lld cleared)", (long long)g_spare_same_mem, (long long)g_spare_cleared);
             { int mx = 0; for (int i = 0; i < g_spare_n; i++) { int nh = g_spare[i].o.nh; for (VNode *n = g_spare[i].views; n; n = n->next) nh += n->o.nh; if (nh > mx) mx = nh; }
               printf("; %d samplers, %lld framebuffers made, most handles on one spare %d", g_sampler_count, (long long)g_st.fbo_made, mx); }
             printf("\nnvn_perf: barriers by caller:");
@@ -4802,7 +4837,14 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     memcpy(&t->b, P(A1), sizeof t->b);
     if (t->b.pool && nvn_pool_range(t->b.pool, &mem, &size) && mem) { t->mem = (uint8_t *)P(mem) + t->b.offset; t->limit = (uint8_t *)P(mem) + size; }
     t->storage = tex_storage_size2(&t->b, &t->data_size);
-    if (t->b.pool && (nvn_pool_flags_of(t->b.pool) & 1) && !t->b.packaged) t->gpu_written = 1;      /* CPU_NO_ACCESS pool: only the GPU writes it, nothing to upload or hash (Tomodachi Life makes its render targets anew every frame) */
+    {   /* CPU_NO_ACCESS pool: only the GPU writes it, nothing to upload or hash (the game makes its render targets anew each
+         * frame). Not a block-compressed format: no GPU renders those, their texels are written by the CPU through a physical
+         * pool a virtual one aliases (the texture streaming threads), or by a copy (which marks the texture itself). */
+        Fmt f0;
+        const TexFormat *tf0 = tex_format(t->b.format);
+        int compressed = (fmt_get(t->b.format, &f0) && f0.kind == 4) || (tf0 && tf0->sw_decode);
+        if (t->b.pool && (nvn_pool_flags_of(t->b.pool) & 1) && !t->b.packaged && !compressed) t->gpu_written = 1;
+    }
     if (!tex_capture_packaged(t)) {                /* PR #41, changed: no copy = the old behaviour (the game's own storage is read) */
         static int said;
         if (said++ < 5) printf("nvn: packaged texture %dx%d format 0x%x: its source %llx + %llu could not be copied: read in place as before\n",

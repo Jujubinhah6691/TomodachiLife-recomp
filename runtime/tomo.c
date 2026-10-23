@@ -100,10 +100,141 @@ static void mii_db_get_index(Ctx *c) { wr32(A0, (uint32_t)-1); RET(RESULT_UNAVAI
 /* ---- nn::ngc::ProfanityFilter: no word is profane */
 static void ngc_check_words(Ctx *c) { if (A0) memset((void *)(uintptr_t)A0, 0, (size_t)(uint32_t)A1 * 4); RET(0); }
 
-/* ---- nn::swkbd::InlineKeyboard: no software keyboard; the work buffer is still sized and the image is empty */
+/* ---- nn::swkbd::InlineKeyboard. The console draws its keyboard into an image the game shows and reports through
+ * callbacks; here the text comes from the host's text prompt (nnapplet.c swkbd_prompt: a dialog, or SSBU_SWKBD=text:<..>)
+ * and the image stays empty (transparent). Order the game relies on [0x710209b8d4, 0x710209b9f0]: Initialize, then the
+ * callbacks are set; Calc runs only once the game wants the keyboard (+0x4b1) and FinishedInitialize (which sets +0x4b0
+ * and calls Appear) must come from a Calc. Then ChangedString carries the text (UTF-16 at +0, two ints at +0x3f0 / +0x3f4
+ * [0x710209dd6c]) and DecidedEnter / DecidedCancel close the keyboard (their argument is not read [0x710209bd18]).
+ * FinishedKeyboard is never sent: it means the keyboard applet ended, and the game initializes a new one [0x710209dcbc].
+ * Calc returns the state (see ik_calc): 0 idle (the game then sets up its text box, [0x71020999e8] -> 0x710209af7c, which the text
+ * callbacks need), 3 shown. One keyboard at a time. */
+int swkbd_prompt(const wchar_t *guide, const wchar_t *initial, int max_len, wchar_t *out);      /* nnapplet.c */
+#define IK_W 1280
+#define IK_H 720
+static struct {
+    uint64_t cb_init, cb_finished, cb_changed, cb_moved, cb_enter, cb_cancel;
+    int initialized, init_reported, shown, max_len, shown_frames, text_sent, closed_frames;
+    volatile LONG answer;                                 /* 0 none yet, 1 text ready, 2 cancelled */
+    HANDLE thread;
+    wchar_t initial[512], text[512];
+    int image_sent;
+} g_ik;
+static uint8_t g_ik_arg[0x400] __attribute__((aligned(16)));
+static void ik_call(Ctx *c, uint64_t fn, uint64_t arg) {
+    if (!fn) return;
+    uint64_t saved[12];
+    for (int i = 0; i < 12; i++) saved[i] = c->x[19 + i];
+    c->x[0] = arg;
+    call_guest(c, fn);
+    for (int i = 0; i < 12; i++) c->x[19 + i] = saved[i];
+}
+static DWORD WINAPI ik_prompt_thread(void *p) {
+    (void)p;
+    wchar_t out[512];
+    int ok = swkbd_prompt(L"Enter text", g_ik.initial, g_ik.max_len, out);
+    if (ok) { wcsncpy(g_ik.text, out, 511); g_ik.text[511] = 0; }
+    InterlockedExchange(&g_ik.answer, ok ? 1 : 2);
+    return 0;
+}
+static void ik_ctor(Ctx *c) { (void)c; memset(&g_ik, 0, sizeof g_ik); }
 static void swkbd_work_size(Ctx *c) { RET(0x1000); }
-static void swkbd_image_req(Ctx *c) { wr64(A0, 0x1000); wr64(A1, 0x1000); }
-static void swkbd_window_size(Ctx *c) { wr32(A1, 1280); wr32(A2, 720); }
+static void swkbd_image_req(Ctx *c) { wr64(A1, (uint64_t)IK_W * IK_H * 4); wr64(A2, 0x1000); }
+static void swkbd_window_size(Ctx *c) { wr32(A1, IK_W); wr32(A2, IK_H); }
+static void ik_initialize(Ctx *c) { g_ik.initialized = 1; g_ik.init_reported = 0; RET(1); }
+static void ik_finalize(Ctx *c) { (void)c; g_ik.initialized = 0; g_ik.shown = 0; }
+static void ik_set_init_cb(Ctx *c) { g_ik.cb_init = A1; }
+static void ik_set_finished_cb(Ctx *c) { g_ik.cb_finished = A1; }
+static void ik_set_changed_cb(Ctx *c) { g_ik.cb_changed = A1; }
+static void ik_set_moved_cb(Ctx *c) { g_ik.cb_moved = A1; }
+static void ik_set_enter_cb(Ctx *c) { g_ik.cb_enter = A1; }
+static void ik_set_cancel_cb(Ctx *c) { g_ik.cb_cancel = A1; }
+static void ik_input_text_set(Ctx *c) {                   /* InputText::Set(const char16_t *): the text at +0 of the InputText */
+    uint64_t it = A0, s = A1;
+    int n = 0;
+    for (; s && n < 0x1f7; n++) { uint16_t ch = rd16(s + (uint64_t)n * 2); if (!ch) break; wr16(it + (uint64_t)n * 2, ch); }
+    wr16(it + (uint64_t)n * 2, 0);
+}
+static void ik_set_input_text(Ctx *c) {
+    uint64_t it = A1;
+    int n = 0;
+    for (; it && n < 500; n++) { uint16_t ch = rd16(it + (uint64_t)n * 2); if (!ch) break; g_ik.initial[n] = ch; }
+    g_ik.initial[n] = 0;
+}
+static void ik_appear(Ctx *c) {                           /* AppearArg: +0x1c the most characters the game allows */
+    int ml = (int)rd32(A1 + 0x1c);
+    g_ik.max_len = ml > 0 && ml <= 500 ? ml : 32;
+    if (g_ik.shown) return;
+    g_ik.shown = 1; g_ik.shown_frames = 0; g_ik.text_sent = 0;
+    InterlockedExchange(&g_ik.answer, 0);
+    g_ik.thread = CreateThread(NULL, 0, ik_prompt_thread, NULL, 0, NULL);
+    printf("nn::swkbd: inline keyboard shown (at most %d characters, initial text \"%ls\")\n", g_ik.max_len, g_ik.initial);
+}
+static void ik_disappear(Ctx *c) {
+    (void)c;
+    if (g_ik.shown) { printf("nn::swkbd: inline keyboard: Disappear\n"); g_ik.closed_frames = 30; }
+    g_ik.shown = 0;
+    InterlockedExchange(&g_ik.answer, 0);
+}
+/* TOMO_IKLOG=1 (diagnosis): the game's keyboard owner (x19 at Calc [0x7100359e8c]) printed when it changes, from Calc and
+ * from a watcher thread once a second (Calc stops being called when the keyboard layer hides) */
+static volatile uint64_t g_ik_owner;
+static void ik_print(const char *what) {
+    static uint32_t last[9];
+    uint64_t o = g_ik_owner;
+    if (!o) return;
+    uint32_t v[9] = {rd32(o + 0x348), rd8(o + 0x4b0), rd8(o + 0x4b1), rd8(o + 0x4b2), rd32(o + 0x4b4), rd32(o + 0x1c18), (uint32_t)(rd64(o + 0x4d8) != 0), (uint32_t)g_ik.shown, rd32(o + 0x470)};
+    if (!memcmp(v, last, sizeof v)) return;
+    memcpy(last, v, sizeof v);
+    printf("ik: %s state %u init %u want %u decided %u 4b4 %u 1c18 %u textbox %u shown %u calc %u\n", what, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+    fflush(stdout);
+}
+static DWORD WINAPI ik_watch(void *p) { (void)p; for (;;) { Sleep(1000); ik_print("watch"); } }
+static void ik_trace(Ctx *c, const char *what) {
+    static int on = -1;
+    if (on < 0) { on = getenv("TOMO_IKLOG") != NULL; if (on) CloseHandle(CreateThread(NULL, 0, ik_watch, NULL, 0, NULL)); }
+    if (!on) return;
+    g_ik_owner = c->x[19];
+    ik_print(what);
+}
+static void ik_calc(Ctx *c) {
+    ik_trace(c, "calc");
+    if (!g_ik.initialized) { RET(0); return; }
+    if (!g_ik.init_reported) { g_ik.init_reported = 1; ik_call(c, g_ik.cb_init, 0); }
+    LONG a = g_ik.answer;
+    if (g_ik.shown) g_ik.shown_frames++;
+    /* the text some frames after Appear (the game makes its text box then), the decision some frames after the text */
+    if (g_ik.shown && a == 1 && !g_ik.text_sent && g_ik.shown_frames >= 10) {
+        uint64_t arg = (uint64_t)(uintptr_t)g_ik_arg;
+        int n = 0;
+        memset(g_ik_arg, 0, sizeof g_ik_arg);
+        for (; g_ik.text[n] && n < 0x1f7; n++) wr16(arg + (uint64_t)n * 2, (uint16_t)g_ik.text[n]);
+        for (int k = 0; k < 4; k++) wr32(arg + 0x3f0 + (uint64_t)k * 4, (uint32_t)n);
+        printf("nn::swkbd: inline keyboard text \"%ls\"\n", g_ik.text);
+        ik_call(c, g_ik.cb_changed, arg);
+        g_ik.text_sent = g_ik.shown_frames;
+    }
+    if (g_ik.shown && (a == 2 || (a == 1 && g_ik.text_sent && g_ik.shown_frames >= g_ik.text_sent + 10))) {
+        InterlockedExchange(&g_ik.answer, 0);
+        if (g_ik.thread) { CloseHandle(g_ik.thread); g_ik.thread = NULL; }
+        /* decided: the keyboard closes in this same Calc (state 1). The game's closing step [0x7102099a80] waits for a 1 and
+         * otherwise calls Disappear, after which Calc is no longer called: a later 1 would never arrive. */
+        g_ik.shown = 0; g_ik.closed_frames = 30;
+        if (a == 1) { printf("nn::swkbd: inline keyboard: decided\n"); ik_call(c, g_ik.cb_enter, (uint64_t)(uintptr_t)g_ik_arg); }
+        else { printf("nn::swkbd: inline keyboard cancelled\n"); ik_call(c, g_ik.cb_cancel, 0); }
+    }
+    /* 3 shown; 1 closed (after Disappear the game calls Disappear again each frame until it sees 1 [0x7102099a98]);
+     * 0 idle (the game sets up its text box then [0x71020999e8]) */
+    if (g_ik.shown) { RET(3); return; }
+    if (g_ik.closed_frames > 0) { g_ik.closed_frames--; RET(1); return; }
+    RET(0);
+}
+static void ik_get_image(Ctx *c) {                        /* (void *image, size_t size): transparent, sent once */
+    if (g_ik.image_sent || !A1) { RET(0); return; }
+    memset((void *)(uintptr_t)A1, 0, (size_t)A2);
+    g_ik.image_sent = 1;
+    RET(1);
+}
 
 /* ---- nn::prepo: the report is dropped; the "over frequency" event is one that is never signalled */
 static uint8_t g_prepo_event[0x40];
@@ -292,25 +423,25 @@ static const ImportDef tomo_imports[] = {
     {"_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", ret1},
     {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKDsm", ngc_check_words},
     {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", ngc_check_words},
-    {"_ZN2nn5swkbd14InlineKeyboardC1Ev", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard10InitializeEPv", ret1},
-    {"_ZN2nn5swkbd14InlineKeyboard8FinalizeEv", keep},
+    {"_ZN2nn5swkbd14InlineKeyboardC1Ev", ik_ctor},
+    {"_ZN2nn5swkbd14InlineKeyboard10InitializeEPv", ik_initialize},
+    {"_ZN2nn5swkbd14InlineKeyboard8FinalizeEv", ik_finalize},
     {"_ZN2nn5swkbd14InlineKeyboard25GetRequiredWorkBufferSizeEv", swkbd_work_size},
     {"_ZN2nn5swkbd14InlineKeyboard25GetImageMemoryRequirementEPmS2_", swkbd_image_req},
-    {"_ZN2nn5swkbd14InlineKeyboard8GetImageEPvm", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard4CalcEv", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard6AppearERKNS0_9AppearArgE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard9DisappearEv", keep},
+    {"_ZN2nn5swkbd14InlineKeyboard8GetImageEPvm", ik_get_image},
+    {"_ZN2nn5swkbd14InlineKeyboard4CalcEv", ik_calc},
+    {"_ZN2nn5swkbd14InlineKeyboard6AppearERKNS0_9AppearArgE", ik_appear},
+    {"_ZN2nn5swkbd14InlineKeyboard9DisappearEv", ik_disappear},
     {"_ZN2nn5swkbd14InlineKeyboard12SetCursorPosEi", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard12SetInputTextERKNS0_9InputTextE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard22SetMovedCursorCallbackEPFvPKNS0_14MovedCursorArgEE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard23SetDecidedEnterCallbackEPFvPKNS0_15DecidedEnterArgEE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard24SetChangedStringCallbackEPFvPKNS0_16ChangedStringArgEE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard24SetDecidedCancelCallbackEPFvvE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard27SetFinishedKeyboardCallbackEPFvvE", keep},
-    {"_ZN2nn5swkbd14InlineKeyboard29SetFinishedInitializeCallbackEPFvvE", keep},
+    {"_ZN2nn5swkbd14InlineKeyboard12SetInputTextERKNS0_9InputTextE", ik_set_input_text},
+    {"_ZN2nn5swkbd14InlineKeyboard22SetMovedCursorCallbackEPFvPKNS0_14MovedCursorArgEE", ik_set_moved_cb},
+    {"_ZN2nn5swkbd14InlineKeyboard23SetDecidedEnterCallbackEPFvPKNS0_15DecidedEnterArgEE", ik_set_enter_cb},
+    {"_ZN2nn5swkbd14InlineKeyboard24SetChangedStringCallbackEPFvPKNS0_16ChangedStringArgEE", ik_set_changed_cb},
+    {"_ZN2nn5swkbd14InlineKeyboard24SetDecidedCancelCallbackEPFvvE", ik_set_cancel_cb},
+    {"_ZN2nn5swkbd14InlineKeyboard27SetFinishedKeyboardCallbackEPFvvE", ik_set_finished_cb},
+    {"_ZN2nn5swkbd14InlineKeyboard29SetFinishedInitializeCallbackEPFvvE", ik_set_init_cb},
     {"_ZNK2nn5swkbd14InlineKeyboard13GetWindowSizeEPiS2_", swkbd_window_size},
-    {"_ZN2nn5swkbd9InputText3SetEPKDs", keep},
+    {"_ZN2nn5swkbd9InputText3SetEPKDs", ik_input_text_set},
     {"_ZN2nn5prepo10PlayReport4SaveEv", ret0},
     {"_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", ret0},
     {"_ZN2nn5prepo30GetOverSaveFrequencyLimitEventEv", prepo_limit_event},

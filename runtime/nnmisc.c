@@ -329,7 +329,9 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
         int ours = oe_observe_foreground();
         if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); continue; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
-        int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
+        static int scripted = -1;                       /* a scripted test run (SSBU_SEQ / SSBU_SCRIPT / SSBU_PRESS) never suspends */
+        if (scripted < 0) scripted = getenv("SSBU_SEQ") || getenv("SSBU_SCRIPT") || getenv("SSBU_PRESS");
+        int runnable = ours || scripted || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
             frozen_at = GetTickCount64(); polls_at = g_oe_poll_count;
