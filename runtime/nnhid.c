@@ -345,6 +345,10 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly, int *rx, int *
                 printf("input replay: poll %lld (anchor %d + %lld) buttons %llx stick %d %d\n", g_rec_poll, g_anchor, since, (unsigned long long)g_play[g_play_pos].buttons, g_play[g_play_pos].lx, g_play[g_play_pos].ly);
             g_play_pos++;
         }
+        if (!g_play_done && (*buttons || *lx || *ly || *rx || *ry)) {     /* the player pressed something: the replay stops, the player plays on */
+            g_play_done = 1;
+            printf("input replay: the player took over at poll %lld\n", g_rec_poll);
+        }
         if (g_play_pos >= g_play_count && !g_play_done) {       /* the rest is the sequence's (seq_tick), or the player's */
             g_play_done = 1;
             printf("input replay: end of the recording at poll %lld: SSBU_SEQ or the player continues\n", g_rec_poll);
