@@ -31,7 +31,7 @@ typedef struct {                                                                
 
 typedef struct { GLuint gl; int nh, alias; struct { GLuint smp; uint64_t h; } *h; } TexObj;
 typedef struct { int target, format, lvl0, nlvl, lay0, nlay, dsmode; uint8_t swz[4]; } EView;
-typedef struct VNode { EView e; TexObj o; struct VNode *next; } VNode;
+typedef struct VNode { EView e; TexObj o; struct VNode *next; uint32_t copy_gen; int is_copy; } VNode;   /* is_copy: a copy of a render target refreshed when copy_gen != the texture's rt_gen (nvn_gl.c tex_view_obj) */
 typedef struct Tex {
     TexBuilder b;
     volatile LONG dead;
@@ -49,6 +49,7 @@ typedef struct Tex {
     void *vk;                              /* the Vulkan back end's record of this texture (nvn_vk_draw.c: VTex), NULL until first used */
     uint8_t *packaged_copy;                /* PR #41: owned until the initial upload consumes packaged texels */
     long long ahead_seen;                  /* session 8 (nvn_vk_draw.c tex_ahead): 1 + the frame the render thread first saw this record; -1 = looked at, not taken */
+    uint32_t rt_gen;                       /* nvn_gl.c: bumped each time the texture becomes a render target */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; } TexPoolEnt;

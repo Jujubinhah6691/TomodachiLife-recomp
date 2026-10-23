@@ -941,6 +941,32 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
         if (tf && tf->sw_decode && tf->gl_sw_internal) { const TexFormat *vf = e.format ? tex_format(e.format) : NULL; f.internal = vf && vf->sw_decode && vf->gl_sw_internal ? vf->gl_sw_internal : tf->gl_sw_internal; }
     }
     GLenum tg = gl_target(e.target, t->b.samples);
+    {   /* A render target seen through a view that only changes the swizzle: sampled through its bindless handle, such a view
+         * kept giving texels from before the latest rendering (the NVIDIA driver resolves what was drawn for the texture
+         * object that was the render target, not for other objects over its storage): Tomodachi Life's sun mask read 0
+         * and the island had no sunlight in a new game. Such a view is a copy of the texture with the view's swizzle,
+         * copied again before a draw that samples it whenever the texture was a render target since (view_copies_refresh). */
+        int same_shape = e.target == base.target && e.lvl0 == 0 && e.nlvl == base.nlvl && e.lay0 == 0 && e.nlay == base.nlay && (!e.format || e.format == base.format) && e.dsmode == base.dsmode;
+        if (t->gpu_written && same_shape && memcmp(e.swz, base.swz, 4) && t->b.samples <= 1 && f.kind == 0 && (tg == GL_TEXTURE_2D || tg == GL_TEXTURE_2D_ARRAY_)
+            && gl_has(glCopyImageSubData, "glCopyImageSubData")) {
+            int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1;
+            while (glGetError()) {}
+            glGenTextures(1, &n->o.gl);
+            glBindTexture(tg, n->o.gl);
+            if (tg == GL_TEXTURE_2D_ARRAY_) glTexStorage3D(tg, e.nlvl, f.internal, w, hgt, e.nlay); else glTexStorage2D(tg, e.nlvl, f.internal, w, hgt);
+            if (!glGetError()) {
+                glTexParameteri(tg, GL_TEXTURE_MIN_FILTER, e.nlvl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
+                glTexParameteri(tg, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                set_swizzle(tg, e.swz);
+                n->is_copy = 1; n->copy_gen = t->rt_gen - 1;          /* filled by view_copies_refresh */
+                InterlockedIncrement64(&g_tex_live);
+                g_st.views++;
+                return &n->o;
+            }
+            glDeleteTextures(1, &n->o.gl); n->o.gl = 0;
+            while (glGetError()) {}
+        }
+    }
     while (glGetError()) {}
     glGenTextures(1, &n->o.gl);
     glTextureView(n->o.gl, tg, t->o.gl, f.internal, (GLuint)e.lvl0, (GLuint)e.nlvl, (GLuint)e.lay0, (GLuint)e.nlay);
@@ -2572,7 +2598,28 @@ static void feedback_restore(void) {
     g_fb_active = 0;
 }
 static int feedback_copy_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOMO_FEEDBACK_COPY"); v = e ? atoi(e) : 0; } return v; }
+static void view_copy_fill(Tex *t, VNode *n) {
+    GLenum tg = gl_target(n->e.target, t->b.samples);
+    int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1;
+    for (int l = 0; l < n->e.nlvl; l++)
+        glCopyImageSubData(t->o.gl, tg, l, 0, 0, 0, n->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(hgt, l), tg == GL_TEXTURE_2D ? 1 : n->e.nlay);
+    n->copy_gen = t->rt_gen;
+}
+static void view_copies_refresh(void) {               /* the copies standing for views of render targets (tex_view_obj), before a draw */
+    for (int s = 0; s < 5; s++)
+        for (unsigned u = 0; u < 32; u++) {
+            uint64_t nh = S.nvn_tex[s][u];
+            Tex *t;
+            View v;
+            SamplerParams p;
+            if (!nh) continue;
+            handle_lookup(S.tpool, S.spool, nh, &t, &v, &p);
+            if (!t || t->dead || !t->views || !t->o.gl) continue;
+            for (VNode *n = t->views; n; n = n->next) if (n->is_copy && n->copy_gen != t->rt_gen) view_copy_fill(t, n);
+        }
+}
 static void feedback_guard(void) {
+    view_copies_refresh();
     feedback_restore();
     if (!S.have_fbo) return;
     if (!feedback_copy_mode()) {                 /* GL's own rule for a draw that samples its render target: a texture barrier before it */
@@ -2700,7 +2747,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = col[i].tex;
         if (!t || t->dead) continue;
         tex_sync(t);
-        t->gpu_written = 1;
+        t->gpu_written = 1; t->rt_gen++;
         k.layer[i] = -1;
         if (layered_rt(t, &col[i].view)) {
             k.color[i] = t->o.gl;
@@ -2716,7 +2763,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = depth->tex;
         S.depth_tex = t;
         tex_sync(t);
-        t->gpu_written = 1;
+        t->gpu_written = 1; t->rt_gen++;
         k.dlayer = -1;
         if (layered_rt(t, &depth->view)) {
             k.depth = t->o.gl;
