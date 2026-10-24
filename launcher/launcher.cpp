@@ -444,6 +444,9 @@ static void page_display(ImVec2 avail) {
     static const char *const rv[] = {"1.0", "1.5", "2.0", "3.0"}, *const rl[] = {"1080p (the console's)", "1620p", "2160p (4K)", "3240p"};
     label_col("Internal resolution"); ini_combo("resolution_scale", "1.0", rv, rl, 4);
     hint("The game's 3D picture is drawn at this size and fitted to the window. 4K needs a recent graphics card.");
+    static const char *const fv[] = {"30", "60"}, *const fl[] = {"30 fps (as the console)", "60 fps"};
+    label_col("Frame rate"); ini_combo("frame_rate", "30", fv, fl, 2);
+    hint("At 60 fps the game keeps its normal speed; busy scenes may not hold 60 on every PC yet.");
     static const char *const vv[] = {"auto", "display", "clock", "off"}, *const vl[] = {"Automatic", "Follow the display (smoothest)", "Own 60 Hz clock", "Off (lowest latency, may tear)"};
     label_col("Vertical sync"); ini_combo("vsync", "auto", vv, vl, 4);
     static const char *const lv[] = {"normal", "low", "lowest"}, *const ll[] = {"Normal", "Low", "Lowest"};
