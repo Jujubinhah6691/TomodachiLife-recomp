@@ -3365,14 +3365,14 @@ static Range g_draw_ibuf;                     /* the index buffer of the draw be
  * screen-sized target that gets 3D draws (with a depth target) is copied at its first draw without one in that frame (the
  * picture before the 2D on top); in a later frame with no 3D draws, the copy goes back into it before its first draw.
  * TOMO_FREEZE_RESTORE=0 turns this off. */
-static void frozen_scene(void) {
+static void frozen_scene(int has_depth) {
     static int on = -1;
     if (on < 0) on = !getenv("TOMO_FREEZE_RESTORE") || atoi(getenv("TOMO_FREEZE_RESTORE"));
     Tex *t = S.color0;
     if (!on || !t || t->dead || !t->o.gl || t->b.target != 1 || t->b.samples > 1 || t->b.width < 1280 || t->b.height < 720 || g_rt0_level > 0) return;
     for (int i = 1; i < 8; i++) if (S.color[i]) return;
     long long frame = (long long)g_st.frames + 1;
-    if (S.depth_tex) { t->frz_depth = frame; return; }
+    if (has_depth) { t->frz_depth = frame; return; }
     if (!t->frz_depth) return;
     Fmt f;
     if (!gl_has(glCopyImageSubData, "glCopyImageSubData") || !fmt_get(t->b.format, &f) || f.kind != 0) return;
@@ -3448,7 +3448,7 @@ static int draw_prepare(void) {
     PP(0);
     if (!S.have_fbo || S.render_off) return 0;
     if (g_frame_draw_index++ == g_dbg_skipdraw) return 0;
-    frozen_scene();
+    frozen_scene(S.depth_tex != NULL);
     for (int i = 0; i < 16 && i < S.nattr; i++) {
         int size, norm, integer = 0;
         GLenum type;
@@ -5060,6 +5060,7 @@ static void exec(const Cmd *m, int depth) {
         GLuint tex = 0, smp = 0;
         static int nlog;
         if (!S.have_fbo || S.render_off) break;
+        frozen_scene(0);                         /* DrawTexture disables depth even with a depth attachment bound. */
         {   /* the source takes the texels of the texture drawn last over its memory first, as a draw's textures do (view_copies_refresh) */
             uint32_t tid = (uint32_t)a[0] & 0xfffff;
             Tex *st = S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
@@ -5142,12 +5143,12 @@ static void frozen_clear_selftest(void) {
     const float red[4] = {1, 0, 0, 1};
     glClearTexImage(target.o.gl, 0, GL_RGBA, GL_FLOAT, red);
     S.color0 = S.color[0] = &target; S.depth_tex = &depth;
-    g_st.frames = 0; frozen_scene();
-    S.depth_tex = NULL; frozen_scene();           /* keep the red 3D picture */
+    g_st.frames = 0; frozen_scene(S.depth_tex != NULL);
+    S.depth_tex = NULL; frozen_scene(S.depth_tex != NULL);           /* keep the red 3D picture */
     const float green[4] = {0, 1, 0, 1};
     uint8_t pixel[4] = {0};
     glClearTexImage(target.o.gl, 0, GL_RGBA, GL_FLOAT, green);
-    g_st.frames = 1; frozen_scene();              /* unchanged scenes still restore their saved background */
+    g_st.frames = 1; frozen_scene(S.depth_tex != NULL);              /* unchanged scenes still restore their saved background */
     glGetTextureSubImage(target.o.gl, 0, 640, 360, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sizeof pixel, pixel);
     int restore_bad = pixel[0] != 255 || pixel[1] != 0 || pixel[2] != 0 || pixel[3] != 255;
     glGenFramebuffers(1, &S.fbo); glBindFramebuffer(GL_FRAMEBUFFER_, S.fbo);
@@ -5158,12 +5159,50 @@ static void frozen_clear_selftest(void) {
     clear.cmd.op = OP_CLEARCOLOR; clear.cmd.size = sizeof clear; clear.cmd.a[2] = 15;
     clear.rgba[2] = clear.rgba[3] = 1;
     g_st.frames = 2; exec(&clear.cmd, 0);          /* the game replaces it with a blue UI background */
-    g_st.frames = 3; frozen_scene();              /* the following UI frame must not resurrect the red scene */
+    g_st.frames = 3; frozen_scene(S.depth_tex != NULL);              /* the following UI frame must not resurrect the red scene */
     glGetTextureSubImage(target.o.gl, 0, 640, 360, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sizeof pixel, pixel);
     GLenum error = glGetError();
     int bad = restore_bad || pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 255 || pixel[3] != 255 || error;
     printf("frozen-clear self-test: unchanged background restoration: %s\n", restore_bad ? "FAIL" : "PASS");
     printf("frozen-clear self-test: next frame is %u,%u,%u,%u (expected 0,0,255,255), GL error 0x%x: %s\n",
+           pixel[0], pixel[1], pixel[2], pixel[3], error, bad ? "FAIL" : "PASS");
+    fflush(stdout); ExitProcess(bad ? 1 : 0);
+}
+static void frozen_drawtexture_selftest(void) {
+    if (!getenv("SSBU_FROZEN_DRAWTEXTURE_SELFTEST")) return;
+    Tex target = {0}, source = {0}, depth = {0};
+    target.b.target = source.b.target = 1;
+    target.b.width = 1280; target.b.height = 720; source.b.width = source.b.height = 4;
+    target.b.depth = source.b.depth = target.b.levels = source.b.levels = target.glevels = source.glevels = 1;
+    target.b.format = source.b.format = 0x25; target.gpu_written = source.gpu_written = 1;
+    glGenTextures(1, &target.o.gl); glBindTexture(GL_TEXTURE_2D, target.o.gl);
+    glTexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* RGBA8 */, 1280, 720);
+    glGenTextures(1, &source.o.gl); glBindTexture(GL_TEXTURE_2D, source.o.gl);
+    glTexStorage2D(GL_TEXTURE_2D, 1, 0x8058, 4, 4);
+    const float red[4] = {1, 0, 0, 1}, blue[4] = {0, 0, 1, 1};
+    glClearTexImage(target.o.gl, 0, GL_RGBA, GL_FLOAT, red);
+    glClearTexImage(source.o.gl, 0, GL_RGBA, GL_FLOAT, blue);
+    S.color0 = S.color[0] = &target; S.depth_tex = &depth;
+    g_st.frames = 0; frozen_scene(S.depth_tex != NULL);
+    S.depth_tex = NULL; frozen_scene(S.depth_tex != NULL);
+    glGenFramebuffers(1, &S.fbo); glBindFramebuffer(GL_FRAMEBUFFER_, S.fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, target.o.gl, 0);
+    S.have_fbo = 1; S.fbo_w = 1280; S.fbo_h = 720;
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    TexPoolEnt entry = {0}; entry.tex = &source;
+    TexPool pool = {0}; pool.count = 1; pool.e = &entry; S.tpool = &pool;
+    struct { Cmd cmd; NvnC4DrawTexture rect; } draw = {0};
+    draw.cmd.op = OP_DRAW_TEXTURE; draw.cmd.size = sizeof draw; draw.cmd.a[0] = UINT64_C(1) << 32;
+    const float dst[4] = {0, 0, 1280, 720}, src[4] = {0, 0, 4, 4};
+    nvn_c4_draw_texture_words(dst, src, &draw.rect);
+    g_st.frames = 1; S.depth_tex = &depth;
+    exec(&draw.cmd, 0);                          /* DrawTexture is 2D even with a depth attachment */
+    S.depth_tex = NULL; frozen_scene(S.depth_tex != NULL);          /* the next ordinary UI draw must retain the blue background */
+    uint8_t pixel[4] = {0};
+    glGetTextureSubImage(target.o.gl, 0, 640, 360, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sizeof pixel, pixel);
+    GLenum error = glGetError();
+    int bad = pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 255 || pixel[3] != 255 || error;
+    printf("frozen-drawtexture self-test: background %u,%u,%u,%u (expected 0,0,255,255), GL error 0x%x: %s\n",
            pixel[0], pixel[1], pixel[2], pixel[3], error, bad ? "FAIL" : "PASS");
     fflush(stdout); ExitProcess(bad ? 1 : 0);
 }
@@ -5805,6 +5844,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     arena_selftest();                            /* SSBU_ARENA_SELFTEST: rollover must preserve this draw's inputs */
     bc_cache_selftest();                         /* SSBU_BC_CACHE_SELFTEST: wrap the scratch cache twice and check its copies */
     frozen_clear_selftest();                     /* SSBU_FROZEN_CLEAR_SELFTEST: a new UI must outlive an old snapshot */
+    frozen_drawtexture_selftest();               /* SSBU_FROZEN_DRAWTEXTURE_SELFTEST: restore before the first 2D draw */
     nvn_c4_gl_selftest_hook();                  /* SSBU_NVN_GLTEST: OpenGL self-test of nvn_c4.c, then exit */
     SetEvent(g_ready_event);
     render_loop();
