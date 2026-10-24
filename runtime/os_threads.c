@@ -168,6 +168,34 @@ static int console_cores(void) {
         if (getenv("SSBU_OS_CONSOLE_CORES")) {
             DWORD_PTR proc = 0, sys = 0;
             GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+            {   /* Hybrid CPUs: three performance cores, one hardware thread each, from the top. "Every second processor from the
+                 * top" took two efficiency cores of an i5-13400F (processors 12-15 are its efficiency cores): the game ran at
+                 * 15-18 fps on the island, its thread on an efficiency core at every present (2026-10-24). */
+                ULONG len = 0;
+                GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+                uint8_t *buf = len ? malloc(len) : NULL;
+                int lp[64], core[64], cls[64], k = 0, top = 0;
+                if (buf && GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0))
+                    for (ULONG at = 0; at + sizeof(SYSTEM_CPU_SET_INFORMATION) <= len && k < 64; ) {
+                        PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)(buf + at);
+                        if (!s->Size) break;
+                        if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < sizeof(DWORD_PTR) * 8 && (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
+                            lp[k] = s->CpuSet.LogicalProcessorIndex; core[k] = s->CpuSet.CoreIndex; cls[k] = s->CpuSet.EfficiencyClass;
+                            if (cls[k] > top) top = cls[k];
+                            k++;
+                        }
+                        at += s->Size;
+                    }
+                free(buf);
+                for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0 && n < 3; b--) {
+                    int i = 0, dup = 0;
+                    while (i < k && lp[i] != b) i++;
+                    if (i == k || cls[i] != top) continue;
+                    for (int j = 0; j < k; j++) for (int m = 0; m < n; m++) if (g_cc_core[m] == (DWORD_PTR)1 << lp[j] && core[j] == core[i]) dup = 1;
+                    if (!dup) g_cc_core[n++] = (DWORD_PTR)1 << b;
+                }
+                if (n < 3) n = 0;
+            }
             for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0 && n < 3; b--)      /* from the top, every second processor: not two hardware threads of one core */
                 if (proc >> b & 1) { g_cc_core[n++] = (DWORD_PTR)1 << b; b--; }
             on = n == 3;
@@ -178,6 +206,7 @@ static int console_cores(void) {
     }
     return g_cc;
 }
+uint64_t os_console_lp_mask(void) { return console_cores() ? (uint64_t)(g_cc_core[0] | g_cc_core[1] | g_cc_core[2]) : 0; }      /* display.c: host threads stay off these cores */
 static void apply_sched(HANDLE h, uint64_t core_mask) {
     DWORD_PTR m = 0;
     if (!console_cores() || !h) return;

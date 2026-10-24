@@ -164,7 +164,7 @@ static void vk_shutdown_at_exit(void);
     X(void, CopyNamedBufferSubData, (GLuint, GLuint, ptrdiff_t, ptrdiff_t, ptrdiff_t)) \
     X(void, MemoryBarrier, (GLbitfield)) \
     X(void, BindImageTexture, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum)) \
-    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, ProgramUniform1f, (GLuint, GLint, GLfloat))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))
+    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, ProgramUniform1f, (GLuint, GLint, GLfloat))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))     X(void, QueryCounter, (GLuint, GLenum))
 #define X(ret, name, args) static ret (APIENTRY *gl##name) args;
 GLF(X)
 #undef X
@@ -4343,8 +4343,10 @@ static void draw_shot(void) {
     static int want = -2;
     Tex fake;
     char path[64];
+    static int rtshot = -1;                      /* per draw: getenv only once (a scan of the environment, 2700 draws a frame) */
     if (want == -2) want = getenv("SSBU_DRAWSHOT") ? atoi(getenv("SSBU_DRAWSHOT")) : -1;
-    if (S.fbo_w && getenv("SSBU_DRAWLOG_RT_SHOT") && g_dlrt_n > 0 && S.color0 && S.color0->b.width == S.fbo_w && dlrt_match()) {      /* level 0 only */
+    if (rtshot < 0) rtshot = getenv("SSBU_DRAWLOG_RT_SHOT") != NULL;
+    if (S.fbo_w && rtshot && g_dlrt_n > 0 && S.color0 && S.color0->b.width == S.fbo_w && dlrt_match()) {      /* level 0 only */
         memset(&fake, 0, sizeof fake);
         fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prs + 0.5f); }
         glBindFramebuffer(GL_READ_FRAMEBUFFER_, S.fbo);
@@ -4447,6 +4449,45 @@ static void hitch_draw(LONG64 t0) {
 const char *nvn_front_cur_op(void) { return g_cur_op ? g_cur_op : "-"; }      /* hostrt.c: the crash report */
 static LONG64 g_optime[OP_COUNT], g_opn[OP_COUNT];       /* render thread: time and count per command type (nvn_perf) */
 static void gputime_note(const Cmd *m);
+/* TEST ONLY, TOMO_GPUPROF=1: GPU time by kind of command. A timestamp before each draw, dispatch, clear and copy; at each
+ * present the intervals are charged to the command that began them; every 300 frames the 24 costliest kinds (ms a frame). */
+#define GP_Q 16384
+static GLuint g_gp_q[GP_Q];
+static char g_gp_key[GP_Q][40];
+static int g_gp_n, g_gp_on = -1, g_gp_frames, g_gp_tn;
+static struct { char key[40]; double ms; long long n; } g_gp_tab[1024];
+static void gpuprof_mark(const char *key) {
+    if (g_gp_on < 0) g_gp_on = getenv("TOMO_GPUPROF") != NULL;
+    if (!g_gp_on || g_gp_n >= GP_Q) return;
+    if (!g_gp_q[0]) glGenQueries(GP_Q, g_gp_q);
+    glQueryCounter(g_gp_q[g_gp_n], 0x8E28 /* TIMESTAMP */);
+    snprintf(g_gp_key[g_gp_n++], sizeof g_gp_key[0], "%s", key);
+}
+static int gp_cmp(const void *x, const void *y) { double a = ((const typeof(g_gp_tab[0]) *)x)->ms, b = ((const typeof(g_gp_tab[0]) *)y)->ms; return a < b ? 1 : a > b ? -1 : 0; }
+static void gpuprof_frame(void) {
+    if (g_gp_on <= 0) return;
+    gpuprof_mark("(end)");
+    uint64_t prev = 0;
+    for (int i = 0; i < g_gp_n; i++) {
+        uint64_t t = 0;
+        glGetQueryObjectui64v(g_gp_q[i], 0x8866 /* QUERY_RESULT */, &t);
+        if (i) {
+            int k = 0;
+            while (k < g_gp_tn && strcmp(g_gp_tab[k].key, g_gp_key[i - 1])) k++;
+            if (k == g_gp_tn && g_gp_tn < 1024) { memset(&g_gp_tab[k], 0, sizeof g_gp_tab[k]); snprintf(g_gp_tab[g_gp_tn++].key, sizeof g_gp_tab[0].key, "%s", g_gp_key[i - 1]); }
+            if (k < 1024) { g_gp_tab[k].ms += (double)(t - prev) / 1e6; g_gp_tab[k].n++; }
+        }
+        prev = t;
+    }
+    g_gp_n = 0;
+    if (++g_gp_frames % 300) return;
+    qsort(g_gp_tab, (size_t)g_gp_tn, sizeof g_gp_tab[0], gp_cmp);
+    double all = 0; for (int k = 0; k < g_gp_tn; k++) all += g_gp_tab[k].ms;
+    printf("gpuprof: frame %lld: %.2f ms of GPU a frame;", (long long)g_st.frames, all / 300);
+    for (int k = 0; k < g_gp_tn && k < 24; k++) printf(" | %s %.2f (%.0f)", g_gp_tab[k].key, g_gp_tab[k].ms / 300, (double)g_gp_tab[k].n / 300);
+    printf("%c", 10);
+    g_gp_tn = 0;
+}
 static void gputime_check(const Cmd *m, LONG64 t0) {
     static LARGE_INTEGER fq;
     static int nlog;
@@ -4494,6 +4535,16 @@ static void exec(const Cmd *m, int depth) {
     static int every = -1;
     static unsigned nth;
     if (every < 0) { const char *e = getenv("TOMO_GPUTIME_EVERY"); every = e ? atoi(e) : 0; }
+    if (g_gp_on) {
+        char key[40];
+        switch (m->op) {
+        case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: case OP_DRAW_INDIRECT:
+            snprintf(key, sizeof key, "draw %dx%d #%d", S.fbo_w, S.fbo_h, S.prog[1] ? S.prog[1]->serial : S.prog[0] ? S.prog[0]->serial : 0); gpuprof_mark(key); break;
+        case OP_DISPATCH: case OP_DISPATCH_INDIRECT: case OP_CLEARCOLOR: case OP_CLEARDS: case OP_CLEARTEX: case OP_COPY_BUF_TEX: case OP_COPY_TEX_TEX: case OP_COPY_TEX_BUF: case OP_COPY_BUF_BUF: case OP_DRAW_TEXTURE:
+            snprintf(key, sizeof key, "%s %dx%d", g_cur_op, S.fbo_w, S.fbo_h); gpuprof_mark(key); break;
+        default: break;
+        }
+    }
     int noted = gputime_ms() != 0 && m->op != OP_CALL;
     int isdraw = m->op == OP_DRAW_ARRAYS || m->op == OP_DRAW_ELEMENTS || m->op == OP_DRAW_INDIRECT || m->op == OP_DISPATCH || m->op == OP_DISPATCH_INDIRECT;
     int timed = noted && (every ? isdraw && ++nth % (unsigned)every == 0 : 1);
@@ -4818,7 +4869,9 @@ static void exec(const Cmd *m, int depth) {
                 printf("  drawn box: %g..%g %g..%g %g..%g%c", bmn[0], bmx[0], bmn[1], bmx[1], bmn[2], bmx[2], 10);
             }
         }
-        if (getenv("SSBU_DRAWSHOT_CLEAR") && getenv("SSBU_DRAWSHOT") && g_st.frames == atoi(getenv("SSBU_DRAWSHOT"))) { glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); glEnable(GL_SCISSOR_TEST); }
+        static int dsclear = -2;
+        if (dsclear == -2) dsclear = getenv("SSBU_DRAWSHOT_CLEAR") && getenv("SSBU_DRAWSHOT") ? atoi(getenv("SSBU_DRAWSHOT")) : -1;
+        if (dsclear >= 0 && g_st.frames == dsclear) { glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); glEnable(GL_SCISSOR_TEST); }
         drawlog_begin();
         first_draw_warm();
         pf0 = pf_now();
@@ -5621,9 +5674,9 @@ static void job_present(void *arg) {
                     }
                     seen++;
                     if (n) { flick++; printf("flicker: frame %lld: %d cells in x %d..%d y %d..%d (of 48x27)\n", (long long)frame - 1, n, x0, x1, y0, y1); }
-                    {   static int dumps = -2, dfrom;   /* TOMO_FLICKER_DUMP=<n>[,<frame>]: the frames before, of and after the first n flickers of 20 cells or more (past <frame>), 480x270 */
-                        if (dumps == -2) { const char *e = getenv("TOMO_FLICKER_DUMP"); dumps = e ? atoi(e) : 0; dfrom = e && strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 0; }
-                        if (dumps > 0 && n >= 20 && frame > dfrom) {
+                    {   static int dumps = -2, dfrom, dcells = 20;   /* TOMO_FLICKER_DUMP=<n>[,<frame>[,<cells>]]: the frames before, of and after the first n flickers of <cells> (20) cells or more (past <frame>), 480x270 */
+                        if (dumps == -2) { const char *e = getenv("TOMO_FLICKER_DUMP"), *c2 = e && strchr(e, ',') ? strchr(strchr(e, ',') + 1, ',') : NULL; dumps = e ? atoi(e) : 0; dfrom = e && strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 0; if (c2) dcells = atoi(c2 + 1); }
+                        if (dumps > 0 && n >= dcells && frame > dfrom) {
                             dumps--;
                             for (int k = 0; k < 3; k++) {
                                 char path[64]; snprintf(path, sizeof path, "flk_%lld_%c.ppm", (long long)frame - 1, 'a' + k);
@@ -5693,6 +5746,7 @@ static void job_present(void *arg) {
         g_fs_big = g_fs_bigclr = g_fs_rt = g_fs_disp = 0;
     }
     arena_retire();                              /* all draws using the previous stores have been submitted */
+    gpuprof_frame();
     g_st.frames = frame;
     g_gpu_ts_base = now_ns(); g_gpu_ts_k = 0;
     if (frame <= 3 || frame % 600 == 0 || g_frame_draws != 0 && g_logn < 40 && (g_logn++, 1))
@@ -5766,6 +5820,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SSBU_JOBLOG") ? atoi(getenv("SSBU_JOBLOG")) : 0;
+    { void display_perf_host_thread(void); display_perf_host_thread(); }        /* display.c: performance cores the game's threads do not hold */
 #ifdef _WIN32
     PIXELFORMATDESCRIPTOR pfd;
 #else
@@ -6417,7 +6472,7 @@ static void poly_front(Ctx *c) { wr8(A0 + 1, (uint8_t)A1); }
 static void poly_mode(Ctx *c) { wr8(A0 + 2, (uint8_t)A1); }
 static void poly_offset(Ctx *c) {
     wr8(A0 + 3, (uint8_t)A1);
-    { static int n; if (getenv("TOMO_POLYLOG") && A1 && n < 20) { n++; printf("polylog: nvnPolygonStateSetPolygonOffsetEnables(%llx, %llx)\n",(unsigned long long)A0, (unsigned long long)A1); } }
+    { static int n, on = -1; if (on < 0) on = getenv("TOMO_POLYLOG") != NULL; if (on && A1 && n < 20) { n++; printf("polylog: nvnPolygonStateSetPolygonOffsetEnables(%llx, %llx)\n",(unsigned long long)A0, (unsigned long long)A1); } }
 }
 static void poly_get_cull(Ctx *c) { RET(rd8(A0)); }
 static void poly_get_front(Ctx *c) { RET(rd8(A0 + 1)); }

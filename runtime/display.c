@@ -107,7 +107,7 @@ static LONG64 g_ps_phase[10];                          /* where in the refresh t
  * off = high quality of service) and the threads that make a frame (the game's main thread, the render thread, the
  * refresh clock) are restricted to the CPU sets of the highest efficiency class. SSBU_PCORES=0: as before.
  * The report says on which class of core the game's thread was seen at each present. */
-static ULONG g_pc_ids[128];
+static ULONG g_pc_ids[128], g_pc_core[128], g_pc_lp[128];
 static int g_pc_n = -1, g_pc_on = 1;
 static uint8_t g_cpu_class[256], g_class_max;
 static volatile LONG64 g_pc_frames, g_pc_frames_slow;
@@ -127,7 +127,7 @@ static void pcore_init(void) {
             if (!s->Size) break;
             if (s->Type == CpuSetInformation) {
                 if (!pass) { if (s->CpuSet.EfficiencyClass > g_class_max) g_class_max = s->CpuSet.EfficiencyClass; g_cpu_class[s->CpuSet.LogicalProcessorIndex] = s->CpuSet.EfficiencyClass; ncpu++; }
-                else if (s->CpuSet.EfficiencyClass == g_class_max) { if (g_pc_n < 128) g_pc_ids[g_pc_n++] = s->CpuSet.Id; }
+                else if (s->CpuSet.EfficiencyClass == g_class_max) { if (g_pc_n < 128) { g_pc_core[g_pc_n] = s->CpuSet.CoreIndex; g_pc_lp[g_pc_n] = s->CpuSet.LogicalProcessorIndex; g_pc_ids[g_pc_n++] = s->CpuSet.Id; } }
                 else nslow++;
             }
             at += s->Size;
@@ -152,6 +152,26 @@ void display_perf_thread(void) {
     if (g_pc_n < 0) pcore_init();
 #ifdef _WIN32
     if (g_pc_on && g_pc_n > 0) SetThreadSelectedCpuSets(GetCurrentThread(), g_pc_ids, (ULONG)g_pc_n);
+#endif
+}
+/* A host thread that makes frames (the render thread, the refresh clock): the performance cores the console core model
+ * (os_threads.c, SSBU_OS_CONSOLE_CORES) did not take for the game's threads, neither hardware thread of them. On the shared
+ * cores the game's higher-priority threads kept the render thread waiting: 12 ms of preparing draws a frame took 3 ms of
+ * processor time on the island (2026-10-24). */
+void display_perf_host_thread(void) {
+    if (g_pc_n < 0) pcore_init();
+#ifdef _WIN32
+    uint64_t os_console_lp_mask(void);
+    uint64_t cc = os_console_lp_mask();
+    ULONG ids[128];
+    int n = 0;
+    for (int i = 0; i < g_pc_n; i++) {
+        int taken = 0;
+        for (int j = 0; j < g_pc_n; j++) if (g_pc_lp[j] < 64 && (cc >> g_pc_lp[j] & 1) && g_pc_core[j] == g_pc_core[i]) taken = 1;
+        if (!taken) ids[n++] = g_pc_ids[i];
+    }
+    if (g_pc_on && n > 0) SetThreadSelectedCpuSets(GetCurrentThread(), ids, (ULONG)n);
+    else display_perf_thread();
 #endif
 }
 static void precise_wait_until(LONGLONG target, HANDLE timer) {
@@ -558,7 +578,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         int lock_tried = 0;
         LONG64 vb_last = 0;
         pace_options();
-        display_perf_thread();
+        display_perf_host_thread();
         for (;;) {
             if (g_pace_want && !lock_tried && g_vb_state == 2) {                  /* session 14: the refresh is measured: lock to it or not */
                 lock_tried = 1;
