@@ -690,23 +690,32 @@ static volatile LONG g_interval = 1;         /* nvnWindowSetPresentInterval: dis
 int gfx_frame_rate(void);
 /* frame_rate = 60, adaptive: the game steps its logic once per refresh that passed, so a frame that misses a refresh makes the
  * next one heavier (two or three steps): forced to one refresh per frame, a scene that cannot hold 60 fell to 20 fps (the
- * house close-up, 2026-10-24). The busy time of each frame (from the end of its refresh wait to its present) decides: over
- * 15.5 ms on average for 15 frames -> two refreshes per frame (30 fps); under 11 ms for 3 s at two -> one again. */
+ * house close-up, 2026-10-24). Two refreshes per frame (30 fps) when, for a second, the busy time of the frames (from the end
+ * of their refresh wait to their present) is over 15.5 ms on average or 6 presents came a refresh late; one again on a
+ * try every 20 s. */
 static volatile LONG g_adapt;                 /* 1: the interval is the game's halved and adapts (frame_rate = 60) */
 static LARGE_INTEGER g_release_at;            /* end of the last refresh wait */
 static void adapt_frame(LARGE_INTEGER now) {
     static double ema;
-    static int over, under;
+    static int over, at30, window, missed;
+    static LARGE_INTEGER last;
     if (!g_adapt || !g_release_at.QuadPart) return;
     double ms = (double)(now.QuadPart - g_release_at.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
+    double gap = last.QuadPart ? (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)g_freq.QuadPart : 0;      /* since the last present */
+    last = now;
     if (ms < 0 || ms > 500) return;
     ema = ema ? ema * 0.85 + ms * 0.15 : ms;
     if (g_interval == 1) {
-        over = ema > 15.5 ? over + 1 : 0;
-        if (over >= 15) { InterlockedExchange(&g_interval, 2); over = under = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 30 fps for now%c", ema, 10); }
+        /* also: presents a refresh late (the render thread or the GPU, which the busy time does not see): 40-50 fps on a
+         * 60 Hz display judders; 6 late ones in a second -> 30 */
+        missed += gap > 25.0; if (++window >= 60) { if (missed >= 6) over = 60; window = missed = 0; }
+        over = ema > 15.5 || over >= 60 ? over + 1 : 0;
+        if (over >= 60) { window = missed = 0; InterlockedExchange(&g_interval, 2); over = at30 = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 30 fps for now%c", ema, 10); }
     } else if (g_interval == 2) {
-        under = ema < 11.0 ? under + 1 : 0;
-        if (under >= 90) { InterlockedExchange(&g_interval, 1); over = under = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 60 fps again%c", ema, 10); }
+        /* every 20 s at 30, 60 is tried again (a lighter scene, or a GPU idling at low clocks under the 30 fps cap, which
+         * measures slower than it runs once asked for more: nvidia-smi 780 MHz at 30 fps, 1935 MHz under load). The busy
+         * time alone does not decide: it does not see the render thread or the GPU. */
+        if (++at30 >= 600) { InterlockedExchange(&g_interval, 1); over = at30 = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 60 fps again%c", ema, 10); }
     }
 }
 void display_set_interval(int n) {
