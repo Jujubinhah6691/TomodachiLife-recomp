@@ -900,6 +900,56 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     for (uint64_t pg = first; pg <= last; pg++) { uint64_t *s = ww_slot(pg, 0); if (s && *s > newest) newest = *s; }
     return newest;
 }
+/* Uploads kept across batches (arena_put): a guest range streamed into the arena stays there while no page of it is
+ * written. Once per batch every write-watched region is asked which pages were written (ww_scan_regions; they get a
+ * stamp), and the emulator's own writes into guest memory (reports, copies, read-backs) stamp their range (ww_note); a
+ * range's newest stamp is then table lookups. Before, every batch and every such write streamed everything again: about
+ * 3,250 uploads (14 MB) a frame on the island. Memory that is not write-watched streams once per batch, as before. */
+static uint64_t g_wwr_base[64], g_wwr_size[64], g_wwl_base[64], g_wwl_size[64];
+static int g_wwr_n, g_wwl_n;
+static SRWLOCK g_wwl_lock = SRWLOCK_INIT;
+void nvn_ww_region(uint64_t base, uint64_t size, int add) {      /* nnsdk.c: memory reserved with MEM_WRITE_WATCH, made or released */
+    AcquireSRWLockExclusive(&g_wwl_lock);
+    int i = 0;
+    while (i < g_wwl_n && g_wwl_base[i] != base) i++;
+    if (add && i == g_wwl_n && g_wwl_n < 64) { g_wwl_base[g_wwl_n] = base; g_wwl_size[g_wwl_n++] = size; }
+    else if (!add && i < g_wwl_n) { g_wwl_base[i] = g_wwl_base[--g_wwl_n]; g_wwl_size[i] = g_wwl_size[g_wwl_n]; }
+    ReleaseSRWLockExclusive(&g_wwl_lock);
+}
+static void ww_scan_regions(void) {
+    static void *pages[1 << 18];
+    ww_newest(NULL, 0);                          /* (the table) */
+    if (g_ww_off) { g_wwr_n = 0; return; }
+    AcquireSRWLockShared(&g_wwl_lock);
+    g_wwr_n = g_wwl_n;
+    memcpy(g_wwr_base, g_wwl_base, sizeof g_wwr_base); memcpy(g_wwr_size, g_wwl_size, sizeof g_wwr_size);
+    ReleaseSRWLockShared(&g_wwl_lock);
+    uint64_t stamp = 0;
+    for (int r = 0; r < g_wwr_n; r++) {
+        ULONG_PTR count = 1 << 18;
+        DWORD gran = 0;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)g_wwr_base[r], (SIZE_T)g_wwr_size[r], pages, &count, &gran)) continue;
+        if (count == (ULONG_PTR)1 << 18) { g_ww_floor = ++g_ww_stamp; continue; }      /* more than the list holds: everything counts as written */
+        if (count && !stamp) stamp = ++g_ww_stamp;
+        for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
+    }
+    if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; }
+}
+static uint64_t ww_range_stamp(uint64_t addr, uint64_t size) {      /* newest stamp of the range's pages; 0 = not write-watched */
+    int r = 0;
+    while (r < g_wwr_n && !(addr >= g_wwr_base[r] && addr + size <= g_wwr_base[r] + g_wwr_size[r])) r++;
+    if (r == g_wwr_n || !size) return 0;
+    uint64_t newest = g_ww_floor ? g_ww_floor : 1;
+    for (uint64_t pg = addr >> 12, last = (addr + size - 1) >> 12; pg <= last; pg++) { uint64_t *s = ww_slot(pg, 0); if (s && *s > newest) newest = *s; }
+    return newest;
+}
+static uint32_t g_arena_gen;
+static void ww_note(uint64_t addr, uint64_t size) {      /* the emulator wrote guest memory: later reads stream it again */
+    g_arena_gen++;
+    if (!g_ww_tab || !size) return;
+    uint64_t stamp = ++g_ww_stamp;
+    for (uint64_t pg = addr >> 12, last = (addr + size - 1) >> 12; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
+}
 /* Round 16 (nvn_vk_draw.c, SSBU_VK_CBKEEP): the same question for any guest range: has the CPU written a page of it since
  * the stamp the caller remembers? 0 = the memory is not write-watched. Render thread only. */
 uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n); }
@@ -1400,8 +1450,9 @@ static GLuint fbo_get(const FboKey *k) {
 #define ARENA_SIZE ((size_t)96 << 20)
 static GLuint g_arena;
 static size_t g_arena_pos;
-static struct { uint64_t addr, size; size_t off; uint32_t gen; } g_acache[8192];
-static uint32_t g_arena_gen = 1;
+static struct { uint64_t addr, size; size_t off; uint32_t gen, arena; uint64_t stamp; } g_acache[8192];
+static uint32_t g_arena_serial = 1;      /* each new store: a deleted store's GL name comes back for a later one */
+static uint32_t g_arena_gen = 1;      /* (declared above ww_note) */
 /* Redundant state calls skipped: on the island (2760 draws a frame) most of the 80 000 GL calls a frame repeated the draw
  * before. These remember what the render context has bound: every storage buffer range goes through gs_ssbo, and the code
  * that binds pipeline 0 or deletes buffers calls gs_invalidate. TOMO_GSCACHE=0: every call made, as before. */
@@ -1441,7 +1492,7 @@ static size_t arena_put_raw(const void *p, size_t n) {
         HS_IN("buffer streaming: new 96 MB store (glBufferData)", 0);
         glGenBuffers(1, &g_arena); glBindBuffer(GL_ARRAY_BUFFER_, g_arena);
         glBufferData(GL_ARRAY_BUFFER_, (ptrdiff_t)(n > ARENA_SIZE ? n : ARENA_SIZE), NULL, GL_STREAM_DRAW_);
-        HS_OUT(); g_arena_pos = 0; g_arena_gen++;
+        HS_OUT(); g_arena_pos = 0; g_arena_gen++; g_arena_serial++;
     }
     size_t off = g_arena_pos;
     LONG64 pf0 = pf_now();
@@ -1519,6 +1570,7 @@ static void rb_land(int wait) {                    /* land the read-backs the GP
         GLenum r = glClientWaitSync(q->fence, wait ? 1 : 0, wait ? 0xFFFFFFFFFFFFFFFFull : 0);
         if (r == 0x911B /* TIMEOUT_EXPIRED */) break;        /* the later ones are not done either (the GPU finishes in order) */
         gpu_merge(P(q->addr), g_rbs[q->slot].map, q->snap, (size_t)q->size);
+        ww_note(q->addr, q->size);
         free(q->snap); q->snap = NULL;
         g_rbs[q->slot].busy = 0;
         if (i + 1 == g_rbp_n || g_rbp[i + 1].fence != q->fence) glDeleteSync(q->fence);
@@ -1537,15 +1589,22 @@ static size_t arena_put(uint64_t addr, uint64_t size) {
     static int nlog;
     if (g_rbp_n) rb_land_range(addr, size);
     if (size > ARENA_SIZE / 4) { logf_limited(&nlog, 10, "nvn_gl: buffer range of %llu bytes clamped to %llu\n", (unsigned long long)size, (unsigned long long)(ARENA_SIZE / 4)); size = ARENA_SIZE / 4; }
-    unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19;
+    static int keep = -1; if (keep < 0) keep = !(getenv("TOMO_ARENA_KEEP") && getenv("TOMO_ARENA_KEEP")[0] == '0');
+    unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19, pick = 8192;
+    uint64_t now = keep ? ww_range_stamp(addr, size) : 0;
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
-        if (g_acache[i].gen == g_arena_gen && g_acache[i].addr == addr && g_acache[i].size == size) return g_acache[i].off;
-        if (g_acache[i].gen != g_arena_gen) { h = i; break; }
+        if (g_acache[i].addr == addr && g_acache[i].size == size && g_acache[i].arena == g_arena_serial) {
+            if (g_acache[i].gen == g_arena_gen || (now && now <= g_acache[i].stamp)) return g_acache[i].off;
+            pick = i; break;
+        }
+        if (pick == 8192 && (g_acache[i].arena != g_arena_serial || (g_acache[i].gen != g_arena_gen && !g_acache[i].stamp))) pick = i;
     }
-    size_t off = arena_put_raw(P(addr), (size_t)size);      /* may start a new generation */
-    h &= 8191;
-    g_acache[h].addr = addr; g_acache[h].size = size; g_acache[h].off = off; g_acache[h].gen = g_arena_gen;
+    if (pick == 8192) pick = h & 8191;
+    uint64_t stamp = g_ww_stamp;                    /* a later write gets a larger stamp */
+    size_t off = arena_put_raw(P(addr), (size_t)size);      /* may start a new store */
+    g_acache[pick].addr = addr; g_acache[pick].size = size; g_acache[pick].off = off; g_acache[pick].gen = g_arena_gen;
+    g_acache[pick].arena = g_arena_serial; g_acache[pick].stamp = now ? stamp : 0;
     return off;
 }
 
@@ -3904,6 +3963,7 @@ static void compute_flush_at(int line) {
             if (cap < b->size) { cap = (size_t)b->size; tmp = realloc(tmp, cap); }
             HS_IN("compute read-back (glGetNamedBufferSubData)", 0); glGetNamedBufferSubData(b->buf, 0, (ptrdiff_t)b->size, tmp); HS_OUT();
             gpu_merge(P(b->addr), tmp, b->snap, (size_t)b->size);
+            ww_note(b->addr, b->size);
             pf_add(PF_CFLUSH, pf0); g_pf_cflush_bytes += (LONG64)b->size; g_st.compute_bytes += (LONG64)b->size; any = 1;
         }
         b->live = b->dirty = 0;
@@ -5025,13 +5085,13 @@ static void exec(const Cmd *m, int depth) {
         else if (t->rw && d == 1) rs_get(t, level, r[0], r[1], r[3], r[4], f.format, f.type, (GLsizei)bytes, P(a[3]));      /* resolution scale */
         else glGetTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, f.format, f.type, (GLsizei)bytes, P(a[3]));
         glPixelStorei(0x0D02, 0); glPixelStorei(0x806C, 0);
-        g_arena_gen++;
+        ww_note(a[3], bytes);
         g_st.copies++;
         break;
     }
-    case OP_COPY_BUF_BUF: if (a[0] && a[1]) memmove(P(a[1]), P(a[0]), (size_t)a[2]); g_arena_gen++; break;
-    case OP_UPDATE_UBO: if (a[0]) memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); g_arena_gen++; break;
-    case OP_CLEAR_BUF: if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); } g_arena_gen++; break;
+    case OP_COPY_BUF_BUF: if (a[0] && a[1]) memmove(P(a[1]), P(a[0]), (size_t)a[2]); ww_note(a[1], a[2]); break;
+    case OP_UPDATE_UBO: if (a[0]) memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); ww_note(a[0] + a[2], a[3]); break;
+    case OP_CLEAR_BUF: if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); } ww_note(a[0], a[1]); break;
     case OP_ROWSTRIDE: S.row_stride = (int64_t)a[0]; break;      /* PR #14 (xtlg511): no longer read by the copies (they carry their own strides); kept as state */
     case OP_IMAGESTRIDE: S.image_stride = (int64_t)a[0]; break;
     case OP_DEPTHBOUNDS: {                     /* depth bounds test: fragments pass when the depth already in the buffer is inside [near, far] */
@@ -5171,11 +5231,11 @@ static void exec(const Cmd *m, int depth) {
          * objects (palm trees, shrubs) under SetRenderEnableConditional(not equal) of the pair: two zeros culled them all. */
         if (type == 16) { d[0] = d[1]; if (a[1]) { g_tsrep[(a[1] >> 5) & 255].addr = a[1]; g_tsrep[(a[1] >> 5) & 255].frame = (long long)g_st.frames + 1; } }
         if (type > 0 && type < 16 && counter_target(type)) { counter_stop(type); d[0] = g_counter[type].acc; counter_start(type); }
-        if (a[1]) { cbuf_flush_if(a[1], 16); memcpy(P(a[1]), d, 16); g_arena_gen++; }
+        if (a[1]) { cbuf_flush_if(a[1], 16); memcpy(P(a[1]), d, 16); ww_note(a[1], 16); }
         if (drawlog_now()) printf("counter report: type %d value %llu at %llx (draw %d)\n", type, (unsigned long long)d[0], (unsigned long long)a[1], g_frame_draw_index);
         break;
     }
-    case OP_REPORT_VALUE: if (a[1]) { uint64_t d[2] = {(uint32_t)a[0], gpu_ts()}; cbuf_flush_if(a[1], 16); memcpy(P(a[1]), d, 16); g_arena_gen++; } break;
+    case OP_REPORT_VALUE: if (a[1]) { uint64_t d[2] = {(uint32_t)a[0], gpu_ts()}; cbuf_flush_if(a[1], 16); memcpy(P(a[1]), d, 16); ww_note(a[1], 16); } break;
     case OP_FENCE: if (a[0]) fence_now(P(a[0]), (int)a[2]); break;
     case OP_WAITSYNC: { SyncObj *o = P(a[0]); if (o && o->s && !o->dead) glWaitSync(o->s, 0, 0xFFFFFFFFFFFFFFFFull); break; }
     case OP_EVENT_SIGNAL: event_signal_at(a[0], (int)a[1], (uint32_t)a[4]); break;
@@ -5402,6 +5462,7 @@ static void job_submit(void *arg) {
     }
     g_serial++;
     g_arena_gen++;                               /* guest memory may have changed since the last batch */
+    ww_scan_regions();                           /* which: the arena keeps what nobody wrote */
     bl_update();
     LONG64 pf0 = pf_now();
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);

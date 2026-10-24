@@ -84,6 +84,7 @@ static void ldn_MakeIpv4Address(Ctx *c) { RET(((A0 & 0xff) << 24) | ((A1 & 0xff)
 static void os_AllocateAddressRegion(Ctx *c) {
     void *p = VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);      /* write watch: nvn_gl.c asks the OS which texture pages were written (P3) */
     if (p) cxxrt_guest_region((uint64_t)(uintptr_t)p, A1);      /* nncxxrt.c: readable checks inside this region are remembered (P3) */
+    { void nvn_ww_region(uint64_t base, uint64_t size, int add); if (p) nvn_ww_region((uint64_t)(uintptr_t)p, A1, 1); }
     wr64(A0, (uint64_t)p);
     RET(p ? 0 : 0x1015);                                 /* any non-zero nn::Result means failure */
 }
@@ -135,7 +136,7 @@ static void os_FreeMemoryPages(Ctx *c) {
     mp_note(1, n, t0);
     RET(0);
 }
-static void os_FreeAddressRegion(Ctx *c) { cxxrt_mem_changed(A0, 0); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(A0, 0); RET(0); }      // PR #2 (jfb112697): size 0 = the whole region at A0
+static void os_FreeAddressRegion(Ctx *c) { { void nvn_ww_region(uint64_t base, uint64_t size, int add); nvn_ww_region(A0, 0, 0); } cxxrt_mem_changed(A0, 0); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(A0, 0); RET(0); }      // PR #2 (jfb112697): size 0 = the whole region at A0
 
 /* ---- more libc */
 static void c_strtol(Ctx *c) {
@@ -461,10 +462,10 @@ static void os_SetMemoryHeapSize(Ctx *c) {
 }
 static void os_AllocateMemoryBlockHeap(Ctx *c) {         /* (uintptr_t *out, size) */
     void *p = g_heap_used + A1 <= g_heap_size ? VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) : NULL;   /* write watch: nvn_gl.c skips hashing unwritten textures */
-    if (p) { wr64(A0, (uint64_t)(uintptr_t)p); g_heap_used += A1; }
+    if (p) { wr64(A0, (uint64_t)(uintptr_t)p); g_heap_used += A1; { void nvn_ww_region(uint64_t base, uint64_t size, int add); nvn_ww_region((uint64_t)(uintptr_t)p, A1, 1); } }
     RET(p ? 0 : 0x1003);
 }
-static void os_FreeMemoryBlockHeap(Ctx *c) { VirtualFree(P(0), 0, MEM_RELEASE); g_heap_used -= A1 < g_heap_used ? A1 : g_heap_used; }
+static void os_FreeMemoryBlockHeap(Ctx *c) { { void nvn_ww_region(uint64_t base, uint64_t size, int add); nvn_ww_region(A0, 0, 0); } VirtualFree(P(0), 0, MEM_RELEASE); g_heap_used -= A1 < g_heap_used ? A1 : g_heap_used; }
 
 /* ---- nn::mii::detail layout helpers.
  * BufferAllocator { void *current; size_t remaining; }: the game reads `current` directly
