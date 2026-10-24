@@ -213,7 +213,7 @@ static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
         return S(e, "U(in_attr%u[%u])", n, c);
     }
     if (st == MX_FRAGMENT) {
-        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->stage == MX_FRAGMENT) { e->uses_fcs = 1; return S(e, "U(gl_FragCoord[%u] * mx_fcs)", c); }      /* track O: the game's pixel position */
+        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->stage == MX_FRAGMENT) { e->uses_fcs = 1; return e->in->wide && e->in->target != 1 ? S(e, "U(gl_FragCoord[%u] * mx_fcs[%u])", c, c) : S(e, "U(gl_FragCoord[%u] * mx_fcs)", c); }      /* track O: the game's pixel position */
         if (a >= 0x70 && a < 0x80) return S(e, "U(gl_FragCoord[%u])", c);
         if (a == 0x3fc) return "(gl_FrontFacing ? 0xffffffffu : 0u)";
         if ((a == 0x2e0 || a == 0x2e4) && e->in->target == 1 && c == 1) return "U(1.0 - gl_PointCoord[1])";      /* Vulkan: t runs the other way (flipped viewport) */
@@ -1591,7 +1591,8 @@ int mx_translate(const MxIn *in, MxOut *out) {
     }
     if (in->stage != MX_VERTEX && in->stage != MX_FRAGMENT && in->stage != MX_COMPUTE) fail(e, in->stage == MX_GEOMETRY ? "geometry stage" : "tessellation stage", "stage %d is not supported", in->stage);
 
-    /* the code that ends the shader (EXIT): fragment outputs from the registers, alpha test, depth */
+    /* the code that ends the shader (EXIT): fragment outputs from the registers, alpha test, depth; widescreen: the position */
+    if (in->stage == MX_VERTEX && in->wide && in->target != 1) snprintf(e->exitcode, sizeof e->exitcode, "mx_wide_fix(); ");
     if (in->stage == MX_FRAGMENT) {
         uint32_t omap, flags;
         unsigned reg = 0;
@@ -1642,7 +1643,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
-        if (!vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(location = 1) uniform float mx_fcs;\n");      /* resolution scale, OpenGL (nvn_gl.c) */
+        if (!vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, in->wide ? "layout(location = 1) uniform vec2 mx_fcs;\n" : "layout(location = 1) uniform float mx_fcs;\n");      /* resolution scale, OpenGL (nvn_gl.c) */
         if (e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
         if (vk && in->stage == MX_VERTEX) {
             /* PR #47 (v1Ta44): keep position exports outside the translated loop/switch dispatcher. NVIDIA can lose a
@@ -1677,6 +1678,10 @@ int mx_translate(const MxIn *in, MxOut *out) {
             for (unsigned n = 0; n < 32; n++)
                 if (e->in_attr >> n & 1) emit(&h, "layout(location = %u) in %s in_attr%u;\n", n, n < 16 && (in->int_attrs >> (16 + n) & 1) ? "uvec4" : n < 16 && (in->int_attrs >> n & 1) ? (in->sint_attrs >> n & 1 ? "ivec4" : "uvec4") : "vec4", n);
             for (unsigned n = 0; n < 32; n++) if (e->out_attr >> n & 1) emit(&h, "layout(location = %u) out vec4 out_attr%u;\n", n, n);
+            if (!vk && in->wide)
+                emit(&h, "layout(location = 2) uniform float mx_wide = 1.0;\n"
+                         "void mx_wide_fix() { float x = gl_Position.x, w = gl_Position.w;\n"
+                         "  if (mx_wide != 1.0 && !(w == 1.0 && (abs(abs(x) - 1.0) < 1e-5 || abs(abs(x) - 3.0) < 1e-5))) gl_Position.x = x * mx_wide; }\n");
         } else if (in->stage == MX_FRAGMENT) {
             uint32_t omap;
             memcpy(&omap, in->code + 0x48, 4);

@@ -294,6 +294,12 @@ int oe_exit_request(void);                            /* nnmisc.c */
  * borderless window over the whole monitor it is on. */
 #define ASPECT_W 16
 #define ASPECT_H 9
+static double win_aspect(void) {                      /* the window's shape: 16:9, or wider with graphics.ini widescreen (nvn_gl.c wide_k) */
+    const GfxOptions *go = gfx_options();
+    double a = gfx_widescreen();
+    if (a < 0) a = (double)go->width / (double)go->height;
+    return a > (double)ASPECT_W / ASPECT_H * 1.01 ? a : (double)ASPECT_W / ASPECT_H;
+}
 void display_fit(int sw, int sh, int dw, int dh, int out[4]) {      /* the largest rectangle of sw:sh in dw x dh, centred: x, y, w, h */
     out[0] = 0; out[1] = 0; out[2] = dw; out[3] = dh;
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
@@ -310,8 +316,8 @@ static void sizing_keep_aspect(HWND h, WPARAM edge, RECT *r) {
     AdjustWindowRectEx(&frame, (DWORD)GetWindowLongPtrA(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrA(h, GWL_EXSTYLE));
     int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
     int cw = r->right - r->left - fw, ch = r->bottom - r->top - fh;
-    if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) cw = ch * ASPECT_W / ASPECT_H;      /* the edge dragged decides; corners follow the width */
-    else ch = cw * ASPECT_H / ASPECT_W;
+    if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) cw = (int)(ch * win_aspect() + 0.5);      /* the edge dragged decides; corners follow the width */
+    else ch = (int)(cw / win_aspect() + 0.5);
     if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM || edge == WMSZ_RIGHT || edge == WMSZ_LEFT) {
         if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) r->right = r->left + cw + fw;
         else r->bottom = r->top + ch + fh;
@@ -339,7 +345,7 @@ static void toggle_fullscreen(HWND h) {
         if (g_have_windowed) SetWindowPlacement(h, &g_windowed);
         else {                                        /* started borderless / fullscreen: the configured client size, centred */
             const GfxOptions *go = gfx_options();
-            RECT r = {0, 0, go->width, go->width * ASPECT_H / ASPECT_W};
+            RECT r = {0, 0, go->width, (int)(go->width / win_aspect() + 0.5)};
             MONITORINFO mi;
             memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
             GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);

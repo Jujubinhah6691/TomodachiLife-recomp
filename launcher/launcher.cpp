@@ -447,6 +447,9 @@ static void page_display(ImVec2 avail) {
     static const char *const fv[] = {"30", "60"}, *const fl[] = {"30 fps (as the console)", "60 fps"};
     label_col("Frame rate"); ini_combo("frame_rate", "30", fv, fl, 2);
     hint("At 60 fps the game keeps its normal speed; busy scenes may not hold 60 on every PC yet.");
+    static const char *const sv[] = {"off", "auto", "21:9", "32:9"}, *const sl[] = {"Off (16:9, as the console)", "Fit the monitor", "21:9 ultrawide", "32:9 super ultrawide"};
+    label_col("Widescreen"); ini_combo("widescreen", "off", sv, sl, 4);
+    hint("Wider than 16:9: the island shows more at the sides; menus and text stay 16:9 in the middle.");
     static const char *const vv[] = {"auto", "display", "clock", "off"}, *const vl[] = {"Automatic", "Follow the display (smoothest)", "Own 60 Hz clock", "Off (lowest latency, may tear)"};
     label_col("Vertical sync"); ini_combo("vsync", "auto", vv, vl, 4);
     static const char *const lv[] = {"normal", "low", "lowest"}, *const ll[] = {"Normal", "Low", "Lowest"};

@@ -164,7 +164,7 @@ static void vk_shutdown_at_exit(void);
     X(void, CopyNamedBufferSubData, (GLuint, GLuint, ptrdiff_t, ptrdiff_t, ptrdiff_t)) \
     X(void, MemoryBarrier, (GLbitfield)) \
     X(void, BindImageTexture, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum)) \
-    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, ProgramUniform1f, (GLuint, GLint, GLfloat))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))     X(void, QueryCounter, (GLuint, GLenum))
+    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, ProgramUniform1f, (GLuint, GLint, GLfloat))     X(void, ProgramUniform2f, (GLuint, GLint, GLfloat, GLfloat))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))     X(void, QueryCounter, (GLuint, GLenum))
 #define X(ret, name, args) static ret (APIENTRY *gl##name) args;
 GLF(X)
 #undef X
@@ -666,7 +666,32 @@ static float rs_factor(void) {
     }
     return g_rsf;
 }
-static int rs_on(void) { return rs_factor() != 1.0f; }
+/* Widescreen (graphics.ini widescreen = off | auto | 21:9 | <w:h>; TOMO_WIDESCREEN wins): the screen-class targets are made
+ * k times wider than the game's (k = the aspect / 16:9; the resolution scale's per-axis mapping does the rest), the vertex
+ * stages multiply the clip-space x of their positions by 1/k on such targets (mx_translate.c mx_wide_fix: hor+, the 3D
+ * scene shows more at the sides, menus stay 16:9 in the middle; full-screen passes keep covering the picture), and the
+ * present fits the wider picture to the window. */
+static float g_wide_k = -1.0f;
+static float wide_k(void) {
+    if (g_wide_k < 0) {
+        float a = gfx_widescreen();
+        const char *e = getenv("TOMO_WIDESCREEN");
+        if (e) a = !_stricmp(e, "auto") ? -1.0f : strchr(e, ':') && atof(strchr(e, ':') + 1) > 0 ? (float)(atof(e) / atof(strchr(e, ':') + 1)) : (float)atof(e);
+        if (a < 0) {
+            const GfxOptions *o = gfx_options();
+            MONITORINFO mi;
+            memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+            if (o->window_mode && GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi) && mi.rcMonitor.bottom > mi.rcMonitor.top)
+                a = (float)(mi.rcMonitor.right - mi.rcMonitor.left) / (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            else a = (float)o->width / (float)o->height;
+        }
+        float k = a > 0 ? a / (16.0f / 9.0f) : 1.0f;
+        g_wide_k = k > 1.01f ? (k > 4.0f ? 4.0f : k) : 1.0f;
+        if (g_wide_k != 1.0f) printf("nvn_gl: widescreen: %.3f:1, the screen-sized targets %.3f times as wide as the game's (OpenGL)%c", 16.0f / 9.0f * g_wide_k, g_wide_k, 10);
+    }
+    return g_wide_k;
+}
+static int rs_on(void) { return rs_factor() != 1.0f || wide_k() != 1.0f; }
 static int rs_class(const TexBuilder *b) {
     Fmt f;
     if (!rs_on() || b->target != 1 || b->samples > 1 || b->depth > 1 || (b->flags & 0x10) || !fmt_get(b->format, &f) || f.kind == 4) return 0;
@@ -727,7 +752,7 @@ static void tex_realize(Tex *t) {
     TexBuilder *b = &t->b;
     t->rw = t->rh = 0;
     if (rs_class(b)) {
-        t->rw = (int)((float)b->width * rs_factor() + 0.5f); t->rh = (int)((float)b->height * rs_factor() + 0.5f);
+        t->rw = (int)((float)b->width * rs_factor() * wide_k() + 0.5f); t->rh = (int)((float)b->height * rs_factor() + 0.5f);
         if (t->rw < 1) t->rw = 1; if (t->rh < 1) t->rh = 1;
     }
     if (tex_take_spare(t)) return;
@@ -1892,7 +1917,7 @@ static char *pw_translate(int stage, const uint8_t *code, int code_len, const ui
     in.stage = stage; in.code = code; in.code_len = code_len;
     if (cdata_size) { in.cdata = cdata; in.cdata_size = cdata_size; }
     in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
     if (!mx_translate(&in, &out)) return NULL;
     if (in_attr) *in_attr = out.in_attr;
     return out.glsl;
@@ -2104,7 +2129,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         if (j->cdata_size) { in.cdata = j->data + j->code_len; in.cdata_size = j->cdata_size; }
         in.binding_base = (unsigned)j->stage * 20; in.ssbo_base = 40 + (unsigned)j->stage * 16;
         in.int_attrs = j->key[0]; in.sint_attrs = j->key[1]; in.int_tex = j->key[2]; in.sint_tex = j->key[3];
-        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
+        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
         if (mx_translate(&in, &out)) {
             char path[320];
             size_t len = strlen(out.glsl);
@@ -2426,7 +2451,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     }
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
     in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
     LONG64 pf0 = pf_now();
     int xl;
     { HS_IN("shader translate (machine code to GLSL)", 0); xl = mx_translate(&in, &out); HS_OUT(); }
@@ -2791,7 +2816,7 @@ static struct {
     int attr_enabled[16];
     uint8_t ms[24]; unsigned ms_ext;              /* the bound multisample state, and which of its extensions are on in OpenGL */
     int sc0[4], render_off, debug_depth, sample_shading;
-    float gvp[16][4], prs;                     /* resolution scale: the game's viewports, and the scale of the targets bound (0 = 1) */
+    float gvp[16][4], prs, prsy;               /* resolution scale: the game's viewports, and the scale of the targets bound in x / y (0 = 1) */
     int gsc[16][4];                            /* ... and its scissors */
     uint32_t gvp_set;
 } S;
@@ -3166,19 +3191,19 @@ static void alias_pull(Tex *t) {
 static int g_dbg_noscissor;                       /* SSBU_NOSCISSOR (below) */
 /* Resolution scale: viewports and scissors are kept in the game's pixels and set on the bound targets' storage. */
 static void apply_vp(int i) {
-    float s = S.prs ? S.prs : 1.0f;
-    glViewportIndexedf((GLuint)i, S.gvp[i][0] * s, S.gvp[i][1] * s, S.gvp[i][2] * s, S.gvp[i][3] * s);
+    float s = S.prs ? S.prs : 1.0f, sy = S.prsy ? S.prsy : 1.0f;
+    glViewportIndexedf((GLuint)i, S.gvp[i][0] * s, S.gvp[i][1] * sy, S.gvp[i][2] * s, S.gvp[i][3] * sy);
 }
 static void apply_sc(int i) {
     const int *v = S.gsc[i];
     if (!S.prs || v[2] >= 16384) { glScissorIndexed((GLuint)i, v[0], v[1], v[2], v[3]); return; }
-    int x0 = (int)floorf((float)v[0] * S.prs + 0.5f), y0 = (int)floorf((float)v[1] * S.prs + 0.5f);
-    glScissorIndexed((GLuint)i, x0, y0, (int)floorf((float)(v[0] + v[2]) * S.prs + 0.5f) - x0, (int)floorf((float)(v[1] + v[3]) * S.prs + 0.5f) - y0);
+    int x0 = (int)floorf((float)v[0] * S.prs + 0.5f), y0 = (int)floorf((float)v[1] * S.prsy + 0.5f);
+    glScissorIndexed((GLuint)i, x0, y0, (int)floorf((float)(v[0] + v[2]) * S.prs + 0.5f) - x0, (int)floorf((float)(v[1] + v[3]) * S.prsy + 0.5f) - y0);
 }
 static void rs_pass(Tex *t) {                         /* the scale of the targets now bound (their first): viewports and scissors follow */
-    float s = t && t->rw ? (float)t->rw / (float)t->b.width : 0.0f;
-    if (s == S.prs) return;
-    S.prs = s;
+    float s = t && t->rw ? (float)t->rw / (float)t->b.width : 0.0f, sy = t && t->rh ? (float)t->rh / (float)t->b.height : 0.0f;
+    if (s == S.prs && sy == S.prsy) return;
+    S.prs = s; S.prsy = sy;
     for (int i = 0; i < 16; i++) { if (S.gvp_set >> i & 1) apply_vp(i); if (!g_dbg_noscissor) apply_sc(i); }
 }
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
@@ -3222,7 +3247,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     }
     g_rt0_layer = k.layer[0]; g_rt0_level = k.level[0]; g_rt0_vset = n ? col[0].view.set : 0;
     if (rtlog_match(S.color0)) printf("rtlog: frame %lld gl %u mem %p born %lld\n", (long long)g_st.frames + 1, S.color0->o.gl, (void *)S.color0->mem, S.color0->born);      /* TOMO_RTLOG */
-    if (g_rsf != 1.0f) rs_pass(S.color0 ? S.color0 : S.depth_tex);
+    if (rs_on()) rs_pass(S.color0 ? S.color0 : S.depth_tex);
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
     g_fbo_bad_last = 0;
     S.fbo = fbo_get(&k);
@@ -3500,7 +3525,14 @@ static int draw_prepare(void) {
             if (ss != S.sample_shading) { S.sample_shading = ss; if (ss == 1 && gl_has(glMinSampleShading, "glMinSampleShading")) { glEnable(0x8C36 /* SAMPLE_SHADING */); glMinSampleShading(1.0f); } else glDisable(0x8C36); }
         }
         if (!depth_only && S.prog[1]->st[1].glsl_alpha) { uint32_t ref; memcpy(&ref, &S.alpha_ref, 4); glProgramUniform2ui(pair ? pair : S.prog[1]->st[1].glsl, 0, (GLuint)S.alpha_func, ref); }
-        if (!depth_only && S.prog[1]->st[1].glsl_fcs) glProgramUniform1f(pair ? pair : S.prog[1]->st[1].glsl, 1, S.prs ? 1.0f / S.prs : 1.0f);      /* resolution scale: game pixels per real one */
+        if (!depth_only && S.prog[1]->st[1].glsl_fcs) {
+            if (wide_k() != 1.0f) glProgramUniform2f(pair ? pair : S.prog[1]->st[1].glsl, 1, S.prs ? 1.0f / S.prs : 1.0f, S.prsy ? 1.0f / S.prsy : 1.0f);
+            else glProgramUniform1f(pair ? pair : S.prog[1]->st[1].glsl, 1, S.prs ? 1.0f / S.prs : 1.0f);
+        }
+        if (wide_k() != 1.0f) {     /* widescreen: the vertex stage's clip-space x shrinks by 1/k on a widened target, else 1 */
+            static int nosq = -1; if (nosq < 0) nosq = getenv("TOMO_WIDE_NOSQUEEZE") != NULL;      /* TEST ONLY: the picture stretched instead */
+            glProgramUniform1f(pair ? pair : S.prog[0]->st[0].glsl, 2, S.prs && S.prsy && !nosq ? S.prsy / S.prs : 1.0f);
+        }      /* resolution scale: game pixels per real one */
         for (int s = 0; s < (depth_only ? 1 : 2); s++) {
             Stage *st = &S.prog[s]->st[s];
             for (unsigned n = 0; n < 16; n++)
@@ -4349,7 +4381,7 @@ static void draw_shot(void) {
     if (rtshot < 0) rtshot = getenv("SSBU_DRAWLOG_RT_SHOT") != NULL;
     if (S.fbo_w && rtshot && g_dlrt_n > 0 && S.color0 && S.color0->b.width == S.fbo_w && dlrt_match()) {      /* level 0 only */
         memset(&fake, 0, sizeof fake);
-        fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prs + 0.5f); }
+        fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prsy + 0.5f); }
         glBindFramebuffer(GL_READ_FRAMEBUFFER_, S.fbo);
         snprintf(path, sizeof path, "dlrt_%03d.bmp", g_dlrt_n); save_bmp(path, &fake);
         fake.b.depth = -1; snprintf(path, sizeof path, "dlrt_%03d_a.bmp", g_dlrt_n); save_bmp(path, &fake);
@@ -4379,7 +4411,7 @@ static void draw_shot(void) {
         }
     }
     memset(&fake, 0, sizeof fake);
-    fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prs + 0.5f); }
+    fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * (S.prsy ? S.prsy : S.prs) + 0.5f); }
     snprintf(path, sizeof path, "draw_%02d_fbo%u.bmp", g_frame_draw_index - 1, S.fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER_, S.fbo);
     save_bmp(path, &fake);
@@ -5626,7 +5658,7 @@ static void job_present(void *arg) {
         glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
         void display_fit(int sw, int sh, int dw, int dh, int out[4]);      /* PR #24, display.c: the picture keeps its 16:9 shape */
         int d4[4];
-        display_fit(16, 9, (int)r.right, (int)r.bottom, d4);
+        display_fit(sr[2], sr[3], (int)r.right, (int)r.bottom, d4);      /* 16:9, or wider with widescreen */
         if (d4[2] != r.right || d4[3] != r.bottom) { glColorMaski(0, 1, 1, 1, 1); glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); }      /* the game's next draw restores its own mask */
         glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[2], sr[1] + sr[3], d4[0], r.bottom - d4[1], d4[0] + d4[2], r.bottom - d4[1] - d4[3], GL_COLOR_BUFFER_BIT, GL_LINEAR);
         if (g_drawlog_frame >= 0 && frame == g_drawlog_frame + 1) save_bmp("frame_drawlog.bmp", t);      /* the frame the draw log describes */
