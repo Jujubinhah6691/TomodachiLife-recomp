@@ -46,6 +46,11 @@ typedef struct {
     uint16_t *stk_of;
     char ring[24][1200]; int ri;
     char exitcode[4096];
+    /* Forward-only flow (every branch, SYNC, BRK and CONT goes to a later word; no BRX): the blocks are emitted in order as
+     * "if (pc == <block>) { ... }" with each branch setting pc, instead of a switch inside an endless loop. NVIDIA's compiler
+     * keeps far fewer values alive through plain ifs: the deferred lighting passes of the island cost 4-8 ms each at 4K. */
+    int back_jump, linear, guards, guard_after;
+    unsigned cur_label;
     unsigned lmem_words, ssbo_word0;
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64]; int nsmp;      /* target 1: named samplers used (SMP) */
 } Mx;
@@ -1385,12 +1390,14 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned tgt = (unsigned)((int)pc + 1 + off / 8);
         if ((tgt & 3) == 0) tgt++;
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;       /* never taken (the analysis did not follow it either) */
+        if (e->linear) { emit(e, "if (%s) pc = %uu;", FLOW(e, MXB(i, 0, 5)), tgt); e->guard_after = 1; break; }
         emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), tgt);
         break;
     }
     case MXOP_SYNC: case MXOP_BRK: case MXOP_CONT:
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;
         if (!e->jt[pc]) { fail(e, mx_op_name[op], "%s without a matching token at word %u", mx_op_name[op], pc); break; }
+        if (e->linear) { emit(e, "if (%s) pc = %uu;", FLOW(e, MXB(i, 0, 5)), e->jt[pc]); e->guard_after = 1; break; }
         emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), e->jt[pc]);
         break;
     case MXOP_BRX: {
@@ -1425,6 +1432,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         break;
     }
     emit(e, " }\n");
+    if (e->guard_after) { e->guard_after = 0; emit(e, "if (pc == %uu) {\n", e->cur_label); e->guards++; }      /* forward-only flow: the rest of the block */
 }
 
 /* ---------------------------------------------------------------- control flow analysis */
@@ -1500,6 +1508,7 @@ static void analyze(Mx *e) {
                 if (ft == 0 || ft == 28) continue;                   /* flow test never true */
                 if (tgt >= e->words) { fail(e, "BRA", "branch target %u outside the code", tgt); break; }
                 e->leader[tgt] = 1; e->any_jump = 1;
+                if (tgt <= pc) e->back_jump = 1;
                 if (nw >= cap) break;
                 wpc[nw] = tgt; wst[nw++] = (uint16_t)sid;
                 if (always && ft == 15) break;
@@ -1515,6 +1524,7 @@ static void analyze(Mx *e) {
                 unsigned tgt = s.tgt[k];
                 s.n = k;
                 e->jt[pc] = tgt; e->leader[tgt] = 1; e->any_jump = 1;
+                if (tgt <= pc) e->back_jump = 1;
                 if (tgt >= e->words) { fail(e, mx_op_name[op], "target outside the code"); break; }
                 if (nw >= cap) break;
                 wpc[nw] = tgt; wst[nw++] = (uint16_t)stk_id(e, &s);
@@ -1530,7 +1540,7 @@ static void analyze(Mx *e) {
                     e->leader[tg[k]] = 1;
                     if (nw < cap) { wpc[nw] = tg[k]; wst[nw++] = (uint16_t)sid; }
                 }
-                e->any_jump = 1;
+                e->any_jump = 1; e->back_jump = 1;                   /* computed targets: the dispatcher */
                 if (always && ft == 15) break;
                 continue;
             }
@@ -1614,11 +1624,24 @@ int mx_translate(const MxIn *in, MxOut *out) {
     }
 
     if (!e->fail) analyze(e);
+    {   static int lin = -1;                       /* TOMO_LINEAR_FLOW=0: the dispatcher for every shader with branches */
+        if (lin < 0) lin = !(getenv("TOMO_LINEAR_FLOW") && getenv("TOMO_LINEAR_FLOW")[0] == '0');
+        e->linear = lin && e->any_jump && !e->back_jump;
+        e->cur_label = 1; e->guards = 0;
+    }
     for (unsigned pc = 1; pc < e->words && !e->fail; pc++) {
         if (!e->reach[pc]) continue;
-        if (e->leader[pc] && e->any_jump) { emit(e, "case %uu:\n", pc); e->blocks++; }
+        if (e->leader[pc] && e->any_jump) {
+            if (e->linear) {
+                for (; e->guards > 0; e->guards--) emit(e, "}");
+                if (e->cur_label != pc) emit(e, "\nif (pc == %uu) pc = %uu;\n", e->cur_label, pc);      /* the block before falls through */
+                emit(e, "if (pc == %uu) {\n", pc); e->guards = 1; e->cur_label = pc;
+            } else emit(e, "case %uu:\n", pc);
+            e->blocks++;
+        }
         insn(e, pc, MXW(pc));
     }
+    if (e->linear) for (; e->guards > 0; e->guards--) emit(e, "}\n");
     if (e->fail) {
         snprintf(out->why, sizeof out->why, "%s", e->why);
         snprintf(out->op, sizeof out->op, "%s", e->failop);
@@ -1746,14 +1769,14 @@ int mx_translate(const MxIn *in, MxOut *out) {
         any = 0;
         for (unsigned p = 0; p < 7; p++) if (e->preds[p]) { emit(&h, "%s p%u = false", any ? "," : " bool", p); any = 1; }
         if (any) emit(&h, ";\n");
-        if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
+        if (e->any_jump) emit(&h, e->linear ? " uint pc = 1u;\n" : " uint pc = 1u;\n for (;;) { switch (pc) {\n");
         const char *vertex_entry = vk && in->stage == MX_VERTEX ? "\nvoid main() { mx_vertex_main(); gl_Position = mx_position; }\n" : "";
         size_t need = h.len + e->len + strlen(e->exitcode) + strlen(vertex_entry) + 256;
         res = malloc(need);
         memcpy(res, h.s, h.len);
         memcpy(res + h.len, e->s, e->len);
         size_t n = h.len + e->len;
-        if (e->any_jump) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
+        if (e->any_jump && !e->linear) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
         else n += (size_t)sprintf(res + n, " %s\n}\n", e->exitcode);
         n += (size_t)sprintf(res + n, "%s", vertex_entry);
         res[n] = 0;
