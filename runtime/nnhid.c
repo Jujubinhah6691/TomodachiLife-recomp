@@ -538,9 +538,16 @@ static int id_supported(uint32_t id) {
     return 0;
 }
 /* Is a controller connected as this npad id? Player 1 always exists in scripted runs (the script is its pad). */
+/* Single-player mode (the controller applet in single mode, tomo.c controller_support): as on the console, one controller
+ * is left. Here only player 1 stays connected for the game, and the controllers (and keyboard) of the other players
+ * drive player 1 too, so whichever one is in hand works. */
+static volatile LONG g_single_mode;
+static __declspec(thread) int t_merge;                      /* fill_pad reading another player's sources for player 1 */
+void nnhid_single_mode(int on) { if (InterlockedExchange(&g_single_mode, on) != on) printf("nn::hid: single-player mode %s (controller applet)\n", on ? "on" : "off"); }
 static int player_connected(uint32_t id) {
     hid_setup();
     if (id > 7 || !id_supported(id)) return 0;
+    if (g_single_mode && id != 0 && !t_merge) return 0;
     {   /* a GameCube controller needs the game to support its own style or the Pro one it is shown as */
         uint32_t need = STYLE_FULLKEY | (sdl_on() && nnpad_is_gc((int)id) ? STYLE_GC : 0);
         if (!(g_supported_styles & need)) return 0;
@@ -647,6 +654,20 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
         rx = g->rx < -STICK_MAX ? -STICK_MAX : g->rx;
         ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
         wired = !g_x[slot].wireless;
+    }
+    if (id == 0 && g_single_mode && !t_merge) {              /* single-player mode: the other players' controllers on player 1 */
+        uint8_t other[0x30];
+        t_merge = 1;
+        for (uint32_t k = 1; k < 8; k++) {
+            if (!player_connected(k)) continue;
+            fill_pad((uint64_t)(uintptr_t)other, k, kind);
+            int kx = (int)rd32((uint64_t)(uintptr_t)other + 0x10), ky = (int)rd32((uint64_t)(uintptr_t)other + 0x14);
+            int qx = (int)rd32((uint64_t)(uintptr_t)other + 0x18), qy = (int)rd32((uint64_t)(uintptr_t)other + 0x1c);
+            buttons |= rd64((uint64_t)(uintptr_t)other + 8);
+            if (!lx && !ly) { lx = kx; ly = ky; }
+            if (!rx && !ry) { rx = qx; ry = qy; }
+        }
+        t_merge = 0;
     }
     if (id == 0) record_or_replay(&buttons, &lx, &ly, &rx, &ry);
     if (id == 0 && r1_on()) r1_pad(&buttons, &lx, &ly, &rx, &ry);

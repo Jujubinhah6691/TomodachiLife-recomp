@@ -32,7 +32,13 @@ static void touch_states(Ctx *c) {                       /* TouchScreenState<16>
     memset((void *)(uintptr_t)A0, 0, 0x290);
     RET(1);
 }
+/* ControllerSupportArg: player count min, max, take over, left justify, permit dual, single mode (+5), ... The game asks in
+ * single mode whenever more than one controller is connected; on the console the applet then leaves one (nnhid.c
+ * nnhid_single_mode). Left as it was, the game asked again a few frames later and paused all sound every time. */
 static void controller_support(Ctx *c) {                 /* ControllerSupportResultInfo { int playerCount; NpadIdType selectedId; } */
+    void nnhid_single_mode(int on);
+    nnhid_single_mode(rd8(A1 + 5) != 0);
+    if (getenv("SSBU_HIDLOG")) printf("hidlog: ShowControllerSupport min %u max %u single %u%c", rd8(A1), rd8(A1 + 1), rd8(A1 + 5), 10);
     wr32(A0, 1); wr32(A0 + 4, 0);
     RET(0);
 }

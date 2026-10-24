@@ -599,6 +599,17 @@ void host_import(Ctx *c, int sym) {
                 printf("importlog: frame %lld %s from %llx (x0 %llx)\n", display_frame_count(), dyn_syms[sym].name, (unsigned long long)c->x[30], (unsigned long long)c->x[0]);
         }
     }
+    {   /* TOMO_RA_CHAIN=<return address>[,...] (diagnosis): an import called from there prints the guest frame chain (who
+         * called the function that called it; found the sound pauses of the controller applet loop) */
+        static uint64_t ra_watch[8] = {1}; static int nra;
+        if (ra_watch[0] == 1) { const char *e = getenv("TOMO_RA_CHAIN"); ra_watch[0] = 0; for (char *p = (char *)e; p && *p && nra < 8; ) { ra_watch[nra++] = strtoull(p, &p, 16); while (*p == ',') p++; } }
+        for (int k = 0; k < nra; k++) if (c->x[30] == ra_watch[k]) {
+            uint64_t fp = c->x[29];
+            printf("rachain %llx tid%lu:", (unsigned long long)c->x[30], GetCurrentThreadId());
+            for (int d = 0; d < 10 && fp > 0x10000 && !(fp & 7); d++) { printf(" %llx", (unsigned long long)*(uint64_t *)(uintptr_t)(fp + 8)); fp = *(uint64_t *)(uintptr_t)fp; }
+            printf("%c", 10);
+        }
+    }
     if (sym != g_watch_sym) { host_import_real(c, sym); return; }
     extern long long nvn_front_frame_next(void);
     static long long cur_frame, n, tks, max_tk, n_all; static char max_txt[72]; static uint64_t max_ra, ras[64]; static int nras; static uint64_t max_x1;
