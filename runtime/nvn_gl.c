@@ -4651,7 +4651,10 @@ static void exec(const Cmd *m, int depth) {
         unsigned i = (unsigned)a[0] & 7, mask = (unsigned)a[2];
         if (!S.have_fbo || S.render_off) break;
         memcpy(v, blob, 16);
-        if (S.color[i]) S.color[i]->frz_restf = (long long)g_st.frames + 1;      /* cleared by the game this frame: no frozen-scene restore (frozen_scene) */
+        if (S.color[i]) {
+            S.color[i]->frz_restf = (long long)g_st.frames + 1;
+            if (mask & 7) S.color[i]->frz_depth = 0;     /* a new colour background invalidates the old 3D history on later frames too */
+        }
         if (drawlog_now() || rtlog_match(S.color[i])) printf("clear: frame %lld colour %u of fbo %u (%dx%d, gl %u): %g %g %g %g mask %x\n", (long long)g_st.frames + 1, i, S.fbo, S.fbo_w, S.fbo_h,
                                                           S.color[i] ? S.color[i]->o.gl : 0, v[0], v[1], v[2], v[3], mask);
         glColorMaski(i, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);
@@ -5086,6 +5089,42 @@ static void replay(uint64_t handle, int depth) {
         }
         off += m->size;
     }
+}
+
+static void frozen_clear_selftest(void) {
+    if (!getenv("SSBU_FROZEN_CLEAR_SELFTEST")) return;
+    Tex target = {0}, depth = {0};
+    target.b.target = 1; target.b.width = 1280; target.b.height = 720; target.b.depth = 1;
+    target.b.format = 0x25; target.b.levels = target.glevels = 1; target.gpu_written = 1;
+    glGenTextures(1, &target.o.gl); glBindTexture(GL_TEXTURE_2D, target.o.gl);
+    glTexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* RGBA8 */, 1280, 720);
+    const float red[4] = {1, 0, 0, 1};
+    glClearTexImage(target.o.gl, 0, GL_RGBA, GL_FLOAT, red);
+    S.color0 = S.color[0] = &target; S.depth_tex = &depth;
+    g_st.frames = 0; frozen_scene();
+    S.depth_tex = NULL; frozen_scene();           /* keep the red 3D picture */
+    const float green[4] = {0, 1, 0, 1};
+    uint8_t pixel[4] = {0};
+    glClearTexImage(target.o.gl, 0, GL_RGBA, GL_FLOAT, green);
+    g_st.frames = 1; frozen_scene();              /* unchanged scenes still restore their saved background */
+    glGetTextureSubImage(target.o.gl, 0, 640, 360, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sizeof pixel, pixel);
+    int restore_bad = pixel[0] != 255 || pixel[1] != 0 || pixel[2] != 0 || pixel[3] != 255;
+    glGenFramebuffers(1, &S.fbo); glBindFramebuffer(GL_FRAMEBUFFER_, S.fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, target.o.gl, 0);
+    S.have_fbo = 1; S.fbo_w = 1280; S.fbo_h = 720;
+    glDisable(GL_SCISSOR_TEST);
+    struct { Cmd cmd; float rgba[4]; } clear = {0};
+    clear.cmd.op = OP_CLEARCOLOR; clear.cmd.size = sizeof clear; clear.cmd.a[2] = 15;
+    clear.rgba[2] = clear.rgba[3] = 1;
+    g_st.frames = 2; exec(&clear.cmd, 0);          /* the game replaces it with a blue UI background */
+    g_st.frames = 3; frozen_scene();              /* the following UI frame must not resurrect the red scene */
+    glGetTextureSubImage(target.o.gl, 0, 640, 360, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sizeof pixel, pixel);
+    GLenum error = glGetError();
+    int bad = restore_bad || pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 255 || pixel[3] != 255 || error;
+    printf("frozen-clear self-test: unchanged background restoration: %s\n", restore_bad ? "FAIL" : "PASS");
+    printf("frozen-clear self-test: next frame is %u,%u,%u,%u (expected 0,0,255,255), GL error 0x%x: %s\n",
+           pixel[0], pixel[1], pixel[2], pixel[3], error, bad ? "FAIL" : "PASS");
+    fflush(stdout); ExitProcess(bad ? 1 : 0);
 }
 
 /* ---------------------------------------------------------------- render-thread jobs */
@@ -5723,6 +5762,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     shd_init();
     hitch_set_render();
     arena_selftest();                            /* SSBU_ARENA_SELFTEST: rollover must preserve this draw's inputs */
+    frozen_clear_selftest();                     /* SSBU_FROZEN_CLEAR_SELFTEST: a new UI must outlive an old snapshot */
     nvn_c4_gl_selftest_hook();                  /* SSBU_NVN_GLTEST: OpenGL self-test of nvn_c4.c, then exit */
     SetEvent(g_ready_event);
     render_loop();
