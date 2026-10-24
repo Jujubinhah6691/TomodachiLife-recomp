@@ -100,9 +100,11 @@ static void pool_builder_get_memory(Ctx *c) { RET(nobj(A0)->memory); }
 static void pool_builder_get_size(Ctx *c) { RET(nobj(A0)->size); }
 static void pool_builder_get_flags(Ctx *c) { RET(nobj(A0)->flags); }
 void nvn_front_memory_retire(uint64_t addr, uint64_t size);      /* PR #41 (nvn_gl.c): finish deferred reads and compute copy-back before the guest releases this storage */
+void nvn_gl_lists_pool_gone(uint64_t pool);   /* nvn_gl.c: command lists recorded in the pool's memory */
 static void pool_finalize(Ctx *c) {
     NvnObj *o = nobj(A0);
     nvn_front_memory_retire(o->memory, o->size);
+    nvn_gl_lists_pool_gone(A0);
     nvn_label_drop(A0); nobj_drop(A0);
 }
 static void obj_set_label(Ctx *c) { nvn_label_set(A0, A1 ? (const char *)(uintptr_t)A1 : ""); }

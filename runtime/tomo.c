@@ -39,12 +39,8 @@ static void controller_support(Ctx *c) {                 /* ControllerSupportRes
 
 /* ---- nn::time: ClockSnapshot and the adjustable clocks, from the host's clock in the Windows time zone (nntime.c). The island's
  * time of day comes from these: with UTC as the device's zone the island was hours off (evening light in the afternoon). */
-void nntime_location(char out[0x24]); void nntime_local_calendar(int64_t posix, uint64_t out); void nntime_to_posix_rule(Ctx *c);
-static int64_t posix_now(void) {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    return (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000000ull);
-}
+void nntime_location(char out[0x24]); void nntime_local_calendar(int64_t posix, uint64_t out); void nntime_to_posix_rule(Ctx *c); int64_t nntime_now(void);
+#define posix_now nntime_now
 static void time_user_clock_now(Ctx *c) { wr64(A0, (uint64_t)posix_now()); RET(0); }
 static void time_location_name(Ctx *c) { nntime_location((char *)(uintptr_t)A0); }
 /* ClockSnapshot (0xd0 bytes in SDK 20, opaque to the game): our own layout, read only by the accessors below */

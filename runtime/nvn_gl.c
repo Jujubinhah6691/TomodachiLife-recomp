@@ -947,7 +947,8 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
          * and the island had no sunlight in a new game. Such a view is a copy of the texture with the view's swizzle,
          * copied again before a draw that samples it whenever the texture was a render target since (view_copies_refresh). */
         int same_shape = e.target == base.target && e.lvl0 == 0 && e.nlvl == base.nlvl && e.lay0 == 0 && e.nlay == base.nlay && (!e.format || e.format == base.format) && e.dsmode == base.dsmode;
-        if (t->gpu_written && same_shape && memcmp(e.swz, base.swz, 4) && t->b.samples <= 1 && f.kind == 0 && (tg == GL_TEXTURE_2D || tg == GL_TEXTURE_2D_ARRAY_)
+        static int novc = -1; if (novc < 0) novc = getenv("TOMO_NOVIEWCOPY") != NULL;
+        if (!novc && t->gpu_written && same_shape && memcmp(e.swz, base.swz, 4) && t->b.samples <= 1 && f.kind == 0 && (tg == GL_TEXTURE_2D || tg == GL_TEXTURE_2D_ARRAY_)
             && gl_has(glCopyImageSubData, "glCopyImageSubData")) {
             int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1;
             while (glGetError()) {}
@@ -2353,7 +2354,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     st->glsl_state = 1;
     memcpy(st->glsl_key, key, sizeof st->glsl_key);
     st->glsl_cbufs = out.cbufs; st->glsl_ssbos = out.ssbos; st->glsl_dep = out.in_attr; st->glsl_tex = out.tex_units; st->glsl_alpha = out.uses_alpha; st->glsl_ssbo_w = out.ssbo_written;
-    if (out.ssbo_written) { static int nw; logf_limited(&nw, 5, "nvn_gl: program #%d %s stage writes storage buffers (mask 0x%x): results are not copied back to guest memory\n", p->serial, k_stage_name[s], out.ssbo_written); }
+    if (out.ssbo_written) { static int nw; logf_limited(&nw, 5, "nvn_gl: program #%d %s stage writes storage buffers (mask 0x%x): kept in GL buffers and copied back to guest memory\n", p->serial, k_stage_name[s], out.ssbo_written); }
     if (!g_shc_off) {
         ShEnt *e = calloc(1, sizeof *e);
         e->h = h1; e->stage = s; e->code_len = st->code_len; memcpy(e->key, key, 16); e->prog = st->glsl;
@@ -2402,7 +2403,9 @@ static const char *const k_op_name[OP_COUNT] = {
     "DispatchComputeIndirect", "SetRenderEnable", "ResetCounter", "ReportCounter", "ReportValue", "FenceSync", "WaitSync", "SignalEvent", "WaitEvent",
     "BindCoverageModulationTable", "DebugGroup", "DrawTexture", "BindDeferred"};
 
-typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used; } List;
+typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized, r_n, inv_k; uint64_t inv_off, inv_size; LONG64 created, used, inval; uint64_t r_pool[4], r_lo[4], r_hi[4]; } List;   /* r_*: the game's command memory the list occupies; inval: frame + 1 at which the game gave that memory out again */
+static LONG64 g_list_bytes;
+static int g_listlog_dbg;      /* TOMO_LISTLOG=1: calls of lists whose memory the game had given out again */
 static List *g_lists;
 static int g_list_count, g_list_cap, *g_list_free, g_list_free_n;
 static SRWLOCK g_list_lock = SRWLOCK_INIT;
@@ -2502,7 +2505,8 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
     return m;
 }
 
-static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches) {
+static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches, const CmdBuf *cb) {
+    if (!data) data = malloc(8);                       /* an empty recording is still a valid handle */
     AcquireSRWLockExclusive(&g_list_lock);
     int i;
     if (g_list_free_n) i = g_list_free[--g_list_free_n];
@@ -2517,6 +2521,9 @@ static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uin
     }
     g_lists[i].data = data; g_lists[i].len = len; g_lists[i].created = g_st.frames; g_lists[i].used = -1;
     g_lists[i].model_cmd = model_cmd; g_lists[i].model_ctrl = model_ctrl; g_lists[i].dispatches = dispatches; g_lists[i].finalized = 0;
+    g_lists[i].inval = 0; g_lists[i].r_n = cb->r_n;
+    for (int k = 0; k < cb->r_n; k++) { g_lists[i].r_pool[k] = cb->r_pool[k]; g_lists[i].r_lo[k] = cb->r_lo[k]; g_lists[i].r_hi[k] = cb->r_hi[k]; }
+    g_list_bytes += (LONG64)len;
     uint64_t h = ((uint64_t)(g_lists[i].gen & 0x7fffffff) << 32) | (uint32_t)(i + 1);
     ReleaseSRWLockExclusive(&g_list_lock);
     InterlockedIncrement64(&g_st.lists);
@@ -2527,18 +2534,55 @@ static uint8_t *list_lookup(uint64_t h, size_t *len) {
     uint32_t i = (uint32_t)h - 1;
     AcquireSRWLockShared(&g_list_lock);
     if (h && i < (uint32_t)g_list_count && g_lists[i].data && (g_lists[i].gen & 0x7fffffff) == (uint32_t)(h >> 32)) { data = g_lists[i].data; *len = g_lists[i].len; g_lists[i].used = g_st.frames; }
+    if (data && g_listlog_dbg && g_lists[i].inval) {
+        static LONG nlog; List *l = &g_lists[i];
+        if (InterlockedIncrement(&nlog) <= 60)
+            printf("listlog: call of list %u (made frame %lld, %zu bytes, %d ranges, range %d %llx..%llx) at frame %lld after new memory %llx+%llx at frame %lld\n", i, (long long)l->created, l->len, l->r_n, l->inv_k,
+                   (unsigned long long)l->r_lo[l->inv_k], (unsigned long long)l->r_hi[l->inv_k], (long long)g_st.frames, (unsigned long long)l->inv_off, (unsigned long long)l->inv_size, (long long)l->inval - 1);
+    }
     ReleaseSRWLockShared(&g_list_lock);
     return data;
 }
-/* Render thread, once per frame: drop lists not submitted for a while (NVN has no call that frees a command handle). */
+/* A command handle stays valid as long as the command memory it was recorded into: the game gives that memory to a command
+ * buffer again (AddCommandMemory) or finalizes its pool only when it no longer calls the handle. Tomodachi Life records the
+ * display lists of its models (gsys ShapeDL) once and calls them whenever the model is drawn: dropping lists after two
+ * seconds without a call (as before) lost the Mii's, the palm trees' and the shrubs' draws for good once they had been out of
+ * sight (blank Mii in the editor and the resident view of a new game; 235 calls of dropped lists a frame). */
+static void list_invalidate(uint64_t pool, uint64_t off, uint64_t size) {
+    AcquireSRWLockShared(&g_list_lock);                   /* shared: lookups go on meanwhile; only this marks inval */
+    for (int i = 0; i < g_list_count; i++) {
+        List *l = &g_lists[i];
+        if (!l->data || l->inval) continue;
+        for (int k = 0; k < l->r_n; k++)
+            if (l->r_pool[k] == pool && l->r_lo[k] < off + size && off < l->r_hi[k]) {
+                InterlockedCompareExchange64(&l->inval, g_st.frames + 1, 0);
+                if (g_listlog_dbg) { l->inv_off = off; l->inv_size = size; l->inv_k = k; }
+                break;
+            }
+    }
+    ReleaseSRWLockShared(&g_list_lock);
+}
+void nvn_gl_lists_pool_gone(uint64_t pool) { list_invalidate(pool, 0, ~0ull >> 1); }      /* nvn_stub.c: nvnMemoryPoolFinalize */
+/* Render thread, once per frame: drop the lists whose memory the game reused or released (a few frames later: replays queued
+ * before the reuse still run), those of a finalized handle, and lists without known memory after two seconds unused. Above
+ * 1 GB of recorded lists the ones unused for 20 seconds go too (shortcut: a guard against a game that never reuses its
+ * command memory; raise TOMO_LIST_CAP_MB if a model then disappears). */
 static void list_collect(void) {
+    static LONG64 cap = -1;
+    if (cap < 0) g_listlog_dbg = getenv("TOMO_LISTLOG") != NULL;
+    if (cap < 0) cap = (getenv("TOMO_LIST_CAP_MB") ? _atoi64(getenv("TOMO_LIST_CAP_MB")) : 1024) << 20;
     AcquireSRWLockExclusive(&g_list_lock);
+    int over = g_list_bytes > cap;
     for (int i = 0; i < g_list_count; i++) {
         List *l = &g_lists[i];
         if (!l->data) continue;
         LONG64 last = l->used >= 0 ? l->used : l->created;
-        if (l->finalized || g_st.frames - last > 120) { free(l->data); l->data = NULL; l->gen++; g_list_free[g_list_free_n++] = i; }      /* finalized by the game, or (a handle the game never finalized) unused for two seconds */
+        if (l->finalized || (l->inval && g_st.frames + 1 - l->inval > 4) || (!l->r_n && g_st.frames - last > 120) || (over && g_st.frames - last > 600)) {
+            g_list_bytes -= (LONG64)l->len;
+            free(l->data); l->data = NULL; l->gen++; g_list_free[g_list_free_n++] = i;
+        }
     }
+    if (over) { static int nlog; logf_limited(&nlog, 5, "nvn_gl: recorded command lists above %lld MB: lists unused for 20 s dropped (%lld MB left)\n", (long long)(cap >> 20), (long long)(g_list_bytes >> 20)); }
     ReleaseSRWLockExclusive(&g_list_lock);
 }
 
@@ -2870,6 +2914,11 @@ static struct { uint64_t addr, size; int prog, n; } g_crange[1024];       /* sto
 static int g_ncrange;
 static int crange_hit(uint64_t addr, uint64_t size);
 static void compute_flush(void);
+typedef struct { uint64_t addr, size; GLuint buf; int dirty, live, frag; } CBuf;   /* frag: written by a draw's fragment stage only */
+static CBuf g_cbuf[64];
+static int g_cbuf_live;
+static CBuf *cbuf_find(uint64_t addr, uint64_t size);
+static CBuf *cbuf_get(uint64_t addr, uint64_t size);
 static int g_dbg_noscissor, g_dbg_skipdraw = -1, g_frame_draw_index;      /* debug aids: SSBU_NOSCISSOR=1, SSBU_SKIPDRAW=<n-th draw of every frame> */
 /* Audit measurement (fake audit, row "unbound or dead texture slots sample a 1x1 dummy texture"): draws whose bound
  * programs reference a texture unit (MxOut.tex_units of the translated stage) that holds the dummy texture; split by cause:
@@ -2903,7 +2952,21 @@ static int draw_prepare(void) {
     uint32_t ints = 0, sints = 0;
     GLuint pn_vs = 0, pn_fs = 0;                /* the pair of GLSL stage programs of this draw (prec_note) */
     int pn_empty = 0;
-    compute_flush();
+    {   /* buffers written by dispatches go back to guest memory before a draw; buffers only fragment stages wrote (the
+         * game's occlusion flags, written by its bounding-box draws) stay in GL unless this draw reads them from memory */
+        int only_frag = g_cbuf_live > 0;
+        for (int k = 0; k < 64 && only_frag; k++) if (g_cbuf[k].live && !g_cbuf[k].frag) only_frag = 0;
+        if (only_frag) {
+            int hit = 0;
+            for (int k = 0; k < 64 && !hit; k++) {
+                if (!g_cbuf[k].live) continue;
+                uint64_t a = g_cbuf[k].addr, z = g_cbuf[k].size;
+                for (int i = 0; i < 32 && !hit; i++) hit = S.vbuf[i].addr && S.vbuf[i].addr < a + z && a < S.vbuf[i].addr + S.vbuf[i].size;
+                for (int st = 0; st < 2 && !hit; st++) for (int n = 0; n < 16 && !hit; n++) hit = S.ubo[st][n].addr && S.ubo[st][n].addr < a + z && a < S.ubo[st][n].addr + S.ubo[st][n].size;
+            }
+            if (hit) compute_flush();
+        } else compute_flush();
+    }
     if (!S.have_fbo || S.render_off) return 0;
     if (g_frame_draw_index++ == g_dbg_skipdraw) return 0;
     for (int i = 0; i < 16 && i < S.nattr; i++) {
@@ -2955,8 +3018,19 @@ static int draw_prepare(void) {
             Stage *st = &S.prog[s]->st[s];
             for (unsigned n = 0; n < 16; n++)
                 if ((st->glsl_ssbos >> n & 1) && S.ssbo[s][n].addr && S.ssbo[s][n].size) {
-                    size_t off = arena_put(S.ssbo[s][n].addr, S.ssbo[s][n].size);
-                    glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
+                    /* a stage that writes a storage buffer writes it in a GL buffer that goes back to guest memory with the
+                     * dispatches' results (compute_flush); the game reads such flags back (its occlusion culling: the fragment
+                     * stage of bounding-box draws marks what is visible; before, nothing was ever marked and the palm trees and
+                     * shrubs of the island were never drawn) */
+                    static int nofrag = -1; if (nofrag < 0) nofrag = getenv("TOMO_NOFRAGSSBO") != NULL;
+                    CBuf *cb = nofrag ? NULL : (st->glsl_ssbo_w >> n & 1) ? cbuf_get(S.ssbo[s][n].addr, S.ssbo[s][n].size) : cbuf_find(S.ssbo[s][n].addr, S.ssbo[s][n].size);
+                    if (cb) {
+                        if (st->glsl_ssbo_w >> n & 1) { if (!cb->dirty) cb->frag = 1; cb->dirty = 1; }
+                        glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, cb->buf, 0, (ptrdiff_t)S.ssbo[s][n].size);
+                    } else {
+                        size_t off = arena_put(S.ssbo[s][n].addr, S.ssbo[s][n].size);
+                        glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
+                    }
                 }
             if (st->glsl_cbufs & 0x80000000u) bl_bind();        /* TEX.B: the bindless handle table */
             /* hardware constant buffers: 1 = constants stored after the shader's code, 2 = texture handles, 3.. = the uniform buffers bound by the game */
@@ -3211,9 +3285,6 @@ static struct { int serial; LONG64 calls, run, groups; } g_chist[64];
 /* Storage buffers written by dispatches live in GL buffers of their own from the first dispatch that writes them until the next
  * command that reads guest memory (a draw, a copy, the end of the batch): compute_flush() then copies the written ones back to
  * guest memory, once, however many dispatches wrote into them (a fighter's meshes are skinned by ~10 dispatches into one buffer). */
-typedef struct { uint64_t addr, size; GLuint buf; int dirty, live; } CBuf;
-static CBuf g_cbuf[64];
-static int g_cbuf_live;
 static CBuf *cbuf_find(uint64_t addr, uint64_t size) {
     for (int k = 0; k < 64; k++) if (g_cbuf[k].live && g_cbuf[k].addr == addr && g_cbuf[k].size == size) return &g_cbuf[k];
     return NULL;
@@ -3226,6 +3297,7 @@ static int cbuf_conflict(uint64_t addr, uint64_t size) {      /* overlaps a buff
 static void compute_flush(void) {
     int any = 0;
     if (!g_cbuf_live) return;
+    for (int k = 0; k < 64; k++) if (g_cbuf[k].live && g_cbuf[k].frag && g_cbuf[k].dirty) { glMemoryBarrier(0x2000 | 0x200 /* SHADER_STORAGE | BUFFER_UPDATE */); break; }
     for (int k = 0; k < 64; k++) {
         CBuf *b = &g_cbuf[k];
         if (!b->live) continue;
@@ -3243,7 +3315,7 @@ static CBuf *cbuf_get(uint64_t addr, uint64_t size) {
     if (!b) { compute_flush(); b = &g_cbuf[0]; }
     if (!b->buf) glCreateBuffers(1, &b->buf);
     glNamedBufferData(b->buf, (ptrdiff_t)size, P(addr), 0x88EA /* DYNAMIC_COPY */);
-    b->addr = addr; b->size = size; b->live = 1; b->dirty = 0;
+    b->addr = addr; b->size = size; b->live = 1; b->dirty = 0; b->frag = 0;
     g_cbuf_live++;
     return b;
 }
@@ -3549,6 +3621,15 @@ static void blit_tex(Tex *src, const View *sv, const int *sr, Tex *dst, const Vi
     dst->gpu_written = 1;
     GLuint mask = temp_fbo(GL_READ_FRAMEBUFFER_, g_fbo_tmp[0], src, sv);
     temp_fbo(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1], dst, dv);
+    {   static int dbg = -1, nlog; if (dbg < 0) dbg = getenv("TOMO_GLERR_DRAW") != NULL;
+        if (dbg) {
+            GLenum rs = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER_), ds = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER_);
+            if ((rs != 0x8CD5 || ds != 0x8CD5) && nlog++ < 40)
+                printf("blit: incomplete (read 0x%x draw 0x%x): src fmt 0x%x %dx%dx%d target %d levels %d view target %d fmt 0x%x lvl %d+%d lay %d+%d region %d,%d,%d %dx%dx%d | dst fmt 0x%x %dx%dx%d target %d levels %d view target %d fmt 0x%x lvl %d+%d lay %d+%d region %d,%d,%d %dx%dx%d\n",
+                       rs, ds, src->b.format, src->b.width, src->b.height, src->b.depth, src->b.target, src->b.levels, sv ? sv->target : -1, sv ? sv->format : 0, sv ? sv->lvl0 : 0, sv ? sv->nlvl : 0, sv ? sv->lay0 : 0, sv ? sv->nlay : 0, sr[0], sr[1], sr[2], sr[3], sr[4], sr[5],
+                       dst->b.format, dst->b.width, dst->b.height, dst->b.depth, dst->b.target, dst->b.levels, dv ? dv->target : -1, dv ? dv->format : 0, dv ? dv->lvl0 : 0, dv ? dv->nlvl : 0, dv ? dv->lay0 : 0, dv ? dv->nlay : 0, dr[0], dr[1], dr[2], dr[3], dr[4], dr[5]);
+        }
+    }
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_FRAMEBUFFER_SRGB_);
     glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[3], sr[1] + sr[4], dr[0], dr[1], dr[0] + dr[3], dr[1] + dr[4], mask, linear && mask == GL_COLOR_BUFFER_BIT ? GL_LINEAR : GL_NEAREST);
@@ -4827,6 +4908,7 @@ void nvn_gl_start(void *hwnd) {
 }
 
 void nvn_gl_report(FILE *out) {
+    fprintf(out, "\nnvn_gl: recorded command lists kept at the end: %lld MB\n", (long long)(g_list_bytes >> 20));
     fprintf(out, "\nnvn_gl: %lld frames, %lld batches, %lld command lists (%lld unknown handles), %lld draws (+%lld skipped), %lld clears, %lld copies\n", (long long)g_st.frames,
             (long long)g_st.submits, (long long)g_st.lists, (long long)g_st.stale, (long long)g_st.draws, (long long)g_st.draws_skipped, (long long)g_st.clears, (long long)g_st.copies);
     fprintf(out, "nvn_gl: textures %lld (uploads %lld, %lld MB, views %lld, bindless handles %lld, unmapped formats %lld), framebuffers %lld (%lld incomplete)\n", (long long)g_st.tex_created,
@@ -5378,7 +5460,19 @@ static void vstream_divisor(Ctx *c) { wr32(A0 + 4, (uint32_t)A1); }
 /* ---- command buffers: recording */
 static void cmd_initialize(Ctx *c) { cb_new(A0); RET(1); }
 static void cmd_finalize(Ctx *c) { CmdBuf *cb = hobj(A0, K_CMD); if (cb) { cb_forget(cb); free(cb->data); free(cb); wr32(A0 + 8, 0); } }
-static void cmd_add_command_memory(Ctx *c) { CmdBuf *cb = cb_get(A0); cb->cmd_size = A3; cb->cmd_used = 0; }       /* (cmdbuf, pool, offset, size): a new block replaces the current one */
+static void cb_range_close(CmdBuf *cb) {         /* the part of the current block the recording took so far: lists recorded there before are gone */
+    if (cb->cmd_pool && cb->cmd_used > cb->r_start) {
+        list_invalidate(cb->cmd_pool, cb->cmd_off + cb->r_start, cb->cmd_used - cb->r_start);
+        if (cb->r_n < 4) { cb->r_pool[cb->r_n] = cb->cmd_pool; cb->r_lo[cb->r_n] = cb->cmd_off + cb->r_start; cb->r_hi[cb->r_n] = cb->cmd_off + cb->cmd_used; cb->r_n++; }
+    }
+    cb->r_start = cb->cmd_used;
+}
+static void cmd_add_command_memory(Ctx *c) {          /* (cmdbuf, pool, offset, size): a new block replaces the current one. Not the whole block ends
+                                                         * older lists: the game gives a window (0x200 bytes) and keeps only what the recording took of it (GetCommandMemoryUsed) */
+    CmdBuf *cb = cb_get(A0);
+    if (cb->recording) cb_range_close(cb);
+    cb->cmd_pool = A1; cb->cmd_off = A2; cb->cmd_size = A3; cb->cmd_used = 0; cb->r_start = 0;
+}
 static void cmd_add_control_memory(Ctx *c) { CmdBuf *cb = cb_get(A0); cb->ctrl_size = A2; cb->ctrl_used = 0; }     /* (cmdbuf, memory, size) */
 static void cmd_get_command_size(Ctx *c) { RET(cb_get(A0)->cmd_size); }
 static void cmd_get_control_size(Ctx *c) { RET(cb_get(A0)->ctrl_size); }
@@ -5391,11 +5485,12 @@ int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread
 int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(DWORD tid);
 #endif
 #define L1T(...) do { if (display_l1_trace()) { char l1b_[240]; snprintf(l1b_, sizeof l1b_, __VA_ARGS__); printf("l1-trace: %+8.2f %-26s lr %09llx %s%c", display_l1_ms(), guest_thread_name_of(GetCurrentThreadId()) ? guest_thread_name_of(GetCurrentThreadId()) : "?", (unsigned long long)c->x[30], l1b_, 10); } } while (0)
-static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; }
+static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; cb->r_n = 0; cb->r_start = cb->cmd_used; }
 static void cmd_end(Ctx *c) {
     CmdBuf *cb = cb_get(A0);
     cb->ctrl_used += 32; cb->rec_ctrl += 32;
-    uint64_t h = list_register(cb->data, cb->len, (uint32_t)cb->rec_cmd, (uint32_t)cb->rec_ctrl, (uint32_t)cb->dispatches);
+    cb_range_close(cb);
+    uint64_t h = list_register(cb->data, cb->len, (uint32_t)cb->rec_cmd, (uint32_t)cb->rec_ctrl, (uint32_t)cb->dispatches, cb);
     L1T("end recording cb %llx -> list %llx (%u bytes, %u dispatches)", (unsigned long long)A0, (unsigned long long)h, (unsigned)cb->len, (unsigned)cb->dispatches);
     cb->data = NULL; cb->len = cb->cap = 0; cb->recording = 0;
     RET(h);

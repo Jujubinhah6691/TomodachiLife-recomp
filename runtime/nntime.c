@@ -17,7 +17,13 @@
 #define A3 (c->x[3])
 #define RET(v) (c->x[0] = (uint64_t)(v))
 
-static int64_t now_posix(void) { return (int64_t)_time64(NULL); }
+int64_t nntime_now(void);
+#define now_posix nntime_now
+int64_t nntime_now(void) {      /* TOMO_CLOCK_SHIFT=<seconds>: test aid, moves the game's clock (daylight screenshots at any hour) */
+    static int64_t shift = -1;
+    if (shift == -1) shift = getenv("TOMO_CLOCK_SHIFT") ? _atoi64(getenv("TOMO_CLOCK_SHIFT")) : 0;
+    return (int64_t)_time64(NULL) + shift;
+}
 
 static void write_calendar(uint64_t out, const struct tm *t) {
     wr16(out, (uint16_t)(t->tm_year + 1900));
