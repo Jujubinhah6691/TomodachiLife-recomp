@@ -2867,7 +2867,7 @@ static int layered_rt(Tex *t, const View *v) {
  * neither compatible nor identical": the framebuffer was incomplete, the texture stayed empty and Mii faces black). The
  * target is a scratch texture of the view's format, a quarter the size, and its texels are copied into the compressed
  * texture (glCopyImageSubData: an uncompressed texel of the block's size is one block) when the render targets change. */
-typedef struct { Tex *t; int level, layer, w, h; GLuint gl; TexObj o; int pending; } BcShadow;
+typedef struct { Tex *t; int level, layer, w, h; GLuint gl; TexObj o; int pending; GLenum fmt, type; int bpb; } BcShadow;
 static BcShadow g_bcsh[64];
 static int g_bcsh_n;
 static void bc_flush(void) {
@@ -2878,6 +2878,19 @@ static void bc_flush(void) {
         if (!b->t || b->t->dead || !b->t->o.gl || !gl_has(glCopyImageSubData, "glCopyImageSubData")) continue;
         GLenum tg = gl_target(b->t->b.target, b->t->b.samples);
         while (glGetError()) {}
+        int tw = lvl(b->t->b.width, b->level), th = lvl(b->t->b.height, b->level);
+        Fmt tf;
+        if ((tw < 4 || th < 4) && tg == GL_TEXTURE_2D && b->bpb && fmt_get(b->t->b.format, &tf)) {
+            /* a level smaller than one block: glCopyImageSubData refuses it (a block is 4x4 texels, the level is not); the block
+             * goes through memory and is uploaded as compressed data of the level's real size */
+            uint8_t blk[16 * 4];
+            int n = b->w * b->h * b->bpb;
+            if (n <= (int)sizeof blk) {
+                glGetTextureSubImage(b->gl, 0, 0, 0, 0, b->w, b->h, 1, b->fmt, b->type, (GLsizei)sizeof blk, blk);
+                glBindTexture(GL_TEXTURE_2D, b->t->o.gl);
+                glCompressedTexSubImage2D(GL_TEXTURE_2D, b->level, 0, 0, tw, th, tf.internal, n, blk);
+            }
+        } else
         glCopyImageSubData(b->gl, GL_TEXTURE_2D, 0, 0, 0, 0, b->t->o.gl, tg, b->level, 0, 0, tg == GL_TEXTURE_2D ? 0 : b->layer, b->w, b->h, 1);
         GLenum e = glGetError();
         static int nlog;
@@ -2897,7 +2910,7 @@ static TexObj *bc_target(Tex *t, const View *v) {     /* NULL: not a render targ
     BcShadow *b = g_bcsh_n < 64 ? &g_bcsh[g_bcsh_n++] : &g_bcsh[(g_bcsh_n++) & 63];
     if (b->gl) { fbo_purge(b->gl); glDeleteTextures(1, &b->gl); }
     memset(b, 0, sizeof *b);
-    b->t = t; b->level = level; b->layer = layer; b->w = w; b->h = h;
+    b->t = t; b->level = level; b->layer = layer; b->w = w; b->h = h; b->fmt = vf.format; b->type = vf.type; b->bpb = tf.bpb;
     glGenTextures(1, &b->gl);
     glBindTexture(GL_TEXTURE_2D, b->gl);
     glTexStorage2D(GL_TEXTURE_2D, 1, vf.internal, w, h);
@@ -2950,6 +2963,31 @@ static void alias_refresh(Tex *t) {
         glCopyImageSubData(a->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
     t->alias_tick = a->rt_tick;
 }
+/* Before a texture becomes a render target: the newest picture drawn into another texture of its shape over the same memory
+ * comes into it (the game binds a second texture object over a depth buffer for the colour pass of a depth pre-pass; with
+ * its own empty GL storage the colour pass's depth test for equality let nothing through: the new Mii stayed invisible). */
+static void alias_pull(Tex *t) {
+    if (!t->mem || !t->storage || !t->o.gl) return;
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    Tex *best = NULL;
+    long long mine = t->rt_tick > t->alias_tick ? t->rt_tick : t->alias_tick;
+    AcquireSRWLockShared(&g_tex_range_lock);
+    for (size_t i = tex_range_lower(begin); i < g_tex_range_count && g_tex_ranges[i].begin == begin; i++) {
+        Tex *o = g_tex_ranges[i].tex;
+        if (o == t || !o->o.gl || o->o.gl == t->o.gl || o->rt_tick <= mine || (best && o->rt_tick <= best->rt_tick)) continue;
+        if (o->b.width != t->b.width || o->b.height != t->b.height || o->b.depth != t->b.depth || o->b.format != t->b.format
+            || o->b.target != t->b.target || o->b.levels != t->b.levels || o->b.samples != t->b.samples) continue;
+        best = o;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+    if (!best || !gl_has(glCopyImageSubData, "glCopyImageSubData")) return;
+    GLenum tg = gl_target(t->b.target, t->b.samples);
+    int w = t->b.width > 0 ? t->b.width : 1, h = t->b.height > 0 ? t->b.height : 1, d = tex_layers(&t->b);
+    for (int l = 0; l < t->glevels && l < best->glevels; l++)
+        glCopyImageSubData(best->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
+    t->alias_tick = best->rt_tick;
+    {   static int nlog; logf_limited(&nlog, 5, "nvn_gl: render target %dx%d format 0x%x takes the picture of the texture drawn last over its memory (another texture object)\n", t->b.width, t->b.height, t->b.format); }
+}
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
     Fmt f;
@@ -2961,6 +2999,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = col[i].tex;
         if (!t || t->dead) continue;
         tex_sync(t);
+        alias_pull(t);
         t->gpu_written = 1; t->rt_gen++; rt_alias_note(t);
         k.layer[i] = -1;
         if (layered_rt(t, &col[i].view)) {
@@ -2977,6 +3016,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = depth->tex;
         S.depth_tex = t;
         tex_sync(t);
+        alias_pull(t);
         t->gpu_written = 1; t->rt_gen++; rt_alias_note(t);
         k.dlayer = -1;
         if (layered_rt(t, &depth->view)) {
@@ -3308,6 +3348,13 @@ static int draw_prepare(void) {
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
         if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x layer %d level %d view set 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format, g_rt0_layer, g_rt0_level, g_rt0_vset);
         for (int ci = 1; ci < 8; ci++) if (S.color[ci]) printf("  colour target %d: gl %u mem %p %dx%dx%d format 0x%x target %d\n", ci, S.color[ci]->o.gl, (void *)S.color[ci]->mem, S.color[ci]->b.width, S.color[ci]->b.height, S.color[ci]->b.depth, S.color[ci]->b.format, S.color[ci]->b.target);
+        if (S.depth_tex) {
+            GLboolean dm = 0; GLfloat dr[2] = {0, 0}, po[2] = {0, 0}; GLint clampd = 0;
+            glGetBooleanv(0x0B72 /* DEPTH_WRITEMASK */, &dm); glGetFloatv(0x0B70 /* DEPTH_RANGE */, dr);
+            glGetFloatv(0x8038 /* POLYGON_OFFSET_FACTOR */, &po[0]); glGetFloatv(0x2A00 /* POLYGON_OFFSET_UNITS */, &po[1]); clampd = glIsEnabled(0x864F /* DEPTH_CLAMP */);
+            printf("  depth target: gl %u mem %p %dx%d format 0x%x | write %d range %g..%g offset %g/%g (fill %d) clamp %d\n", S.depth_tex->o.gl, (void *)S.depth_tex->mem, S.depth_tex->b.width, S.depth_tex->b.height, S.depth_tex->b.format,
+                   dm, dr[0], dr[1], po[0], po[1], glIsEnabled(0x8037 /* POLYGON_OFFSET_FILL */), clampd);
+        }
         for (int s = 0; s < 2; s++) {
             printf("  %s buffers:", k_stage_name[s]);
             for (int n = 0; n < 16; n++) if (S.ubo[s][n].addr) printf(" c%d=%llx+%llu", n, (unsigned long long)S.ubo[s][n].addr, (unsigned long long)S.ubo[s][n].size);
@@ -4220,7 +4267,14 @@ static void exec(const Cmd *m, int depth) {
         S.ds = d;
         if (d & 1) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         glDepthMask((d >> 1) & 1);
-        glDepthFunc(nvn_func((unsigned)(d >> 4) & 15));
+        {   /* A depth test for equality without depth writes (the colour pass after a depth pre-pass) runs as less-or-equal: the
+             * two passes are different programs with the same position arithmetic, and the driver compiles them to depths that
+             * differ in the last bits however invariant and precise the GLSL is: nothing passed and the Mii in Mii creation was
+             * invisible. TOMO_EQUAL_FIX=0: equality as the game asks. */
+            static int eqfix = -1; if (eqfix < 0) eqfix = getenv("TOMO_EQUAL_FIX") ? atoi(getenv("TOMO_EQUAL_FIX")) : 1;
+            GLenum df = nvn_func((unsigned)(d >> 4) & 15);
+            if (eqfix && df == 0x202 /* EQUAL */ && !((d >> 1) & 1)) df = 0x203 /* LEQUAL */;
+            glDepthFunc(df); }
         if (d & 4) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
         glStencilOpSeparate(GL_FRONT, stencil_op((unsigned)(d >> 16) & 15), stencil_op((unsigned)(d >> 20) & 15), stencil_op((unsigned)(d >> 24) & 15));
         glStencilOpSeparate(GL_BACK, stencil_op((unsigned)(d >> 28) & 15), stencil_op((unsigned)(d >> 32) & 15), stencil_op((unsigned)(d >> 36) & 15));

@@ -185,7 +185,11 @@ static void setcc_int(Mx *e, const char *res) { e->uses_cc = 1; emit(e, " cz = %
 /* ---------------------------------------------------------------- results */
 /* float result with optional saturation and condition code */
 static void fres(Mx *e, uint64_t i, const char *expr, int sat, int cc) {
-    emit(e, "float f = %s;", expr);
+    /* OpenGL vertex stage: every float result is precise. `precise gl_Position` did not reach back through the uint registers:
+     * the driver contracted multiplies and adds differently in two programs with the same position arithmetic (a depth
+     * pre-pass and the colour pass after it with a depth test for equality): no fragment passed and the Mii in Mii creation
+     * was invisible. */
+    emit(e, "%sfloat f = %s;", e->in->stage == MX_VERTEX && e->in->target != 1 ? "precise " : "", expr);
     if (sat) emit(e, " f = clamp(f, 0.0, 1.0);");
     emit(e, " %s = U(f);", DST);
     if (cc) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
