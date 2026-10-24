@@ -693,6 +693,9 @@ static float wide_k(void) {
     }
     return g_wide_k;
 }
+float nvn_wide_k(void) { return wide_k(); }
+static int g_wide_camera;                         /* the game's cameras are given the wide aspect (tomo.c): the squeeze is for 2D only */
+void nvn_wide_camera(void) { g_wide_camera = 1; }
 static int rs_on(void) { return rs_factor() != 1.0f || wide_k() != 1.0f; }
 static int rs_class(const TexBuilder *b) {
     Fmt f;
@@ -1742,6 +1745,11 @@ static ShEnt *g_shc[4096];
 static ShSrc *g_shs[4096];
 static int g_shc_off = -1;
 static LONG64 g_shc_hit, g_shc_src_hit, g_shc_compiled;
+static uint64_t sh_hash(uint64_t h, const void *data, size_t n);
+static uint32_t code_tag(Stage *st) {          /* a stage's machine code, hashed (debug aids: the same in every run) */
+    if (!st->code_tag && st->code && st->code_len > 0) st->code_tag = (uint32_t)sh_hash(0, st->code, (size_t)st->code_len) | 1u;
+    return st->code_tag;
+}
 static uint64_t sh_hash(uint64_t h, const void *data, size_t n) {
     const uint8_t *b = data;
     size_t i = 0;
@@ -2006,7 +2014,7 @@ static char *pw_translate(int stage, const uint8_t *code, int code_len, const ui
     in.stage = stage; in.code = code; in.code_len = code_len;
     if (cdata_size) { in.cdata = cdata; in.cdata_size = cdata_size; }
     in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)stage * 18;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f ? 1 + g_wide_camera : 0;
     if (!mx_translate(&in, &out)) return NULL;
     if (in_attr) *in_attr = out.in_attr;
     return out.glsl;
@@ -2218,7 +2226,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         if (j->cdata_size) { in.cdata = j->data + j->code_len; in.cdata_size = j->cdata_size; }
         in.binding_base = (unsigned)j->stage * 20; in.ssbo_base = 40 + (unsigned)j->stage * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)j->stage * 18;
         in.int_attrs = j->key[0]; in.sint_attrs = j->key[1]; in.int_tex = j->key[2]; in.sint_tex = j->key[3];
-        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
+        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f ? 1 + g_wide_camera : 0;
         if (mx_translate(&in, &out)) {
             char path[320];
             size_t len = strlen(out.glsl);
@@ -2540,7 +2548,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     }
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
     in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)s * 18;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f ? 1 + g_wide_camera : 0;
     LONG64 pf0 = pf_now();
     int xl;
     { HS_IN("shader translate (machine code to GLSL)", 0); xl = mx_translate(&in, &out); HS_OUT(); }
@@ -3567,6 +3575,12 @@ static int draw_prepare(void) {
     PP(0);
     if (!S.have_fbo || S.render_off) return 0;
     if (g_frame_draw_index++ == g_dbg_skipdraw) return 0;
+    {   /* debug aid TOMO_SKIPPROG=<tag>[,...]: the draws whose fragment stage has that code tag (draw log "tag", the same in
+         * every run; program numbers are not) are left out: which pass draws what */
+        static uint32_t skip[16]; static int nskip = -1;
+        if (nskip < 0) { const char *e = getenv("TOMO_SKIPPROG"); nskip = 0; for (char *p = (char *)e; p && *p && nskip < 16; ) { skip[nskip++] = (uint32_t)strtoul(p, &p, 16); while (*p == ',') p++; } }
+        for (int i = 0; i < nskip; i++) if (S.prog[1] && code_tag(&S.prog[1]->st[1]) == skip[i]) return 0;
+    }
     gs_mode();
     frozen_scene(S.depth_tex != NULL);
     for (int i = 0; i < 16 && i < S.nattr; i++) {
@@ -3624,7 +3638,19 @@ static int draw_prepare(void) {
         }
         if (wide_k() != 1.0f) {     /* widescreen: the vertex stage's clip-space x shrinks by 1/k on a widened target, else 1 */
             static int nosq = -1; if (nosq < 0) nosq = getenv("TOMO_WIDE_NOSQUEEZE") != NULL;      /* TEST ONLY: the picture stretched instead */
-            glProgramUniform1f(pair ? pair : S.prog[0]->st[0].glsl, 2, S.prs && S.prsy && !nosq ? S.prsy / S.prs : 1.0f);
+            float q = S.prs && S.prsy && !nosq ? S.prsy / S.prs : 1.0f;
+            if (q != 1.0f && g_wide_camera && !depth_only) {     /* a full-screen 2D quad keeps the width only to read a widened texture or to fill with
+                                                                  * no texture (fades); 2D art keeps its 16:9 shape (no stretching) */
+                int screen = 1;
+                for (uint32_t m = units_sampled(1), u = 0; m && u < 32; m >>= 1, u++) {
+                    Tex *t;
+                    if (!(m & 1) || !(t = unit_tex(1, u)) || t->dead) continue;
+                    screen = t->rw && t->rh && (float)t->rw * (float)t->b.height != (float)t->rh * (float)t->b.width;
+                    if (screen) break;
+                }
+                if (screen) q = -q;
+            }
+            glProgramUniform1f(pair ? pair : S.prog[0]->st[0].glsl, 2, q);
         }      /* resolution scale: game pixels per real one */
         for (int s = 0; s < (depth_only ? 1 : 2); s++) {
             Stage *st = &S.prog[s]->st[s];
@@ -3752,8 +3778,8 @@ static int draw_prepare(void) {
         GLboolean cm[4];
         glGetFloatv(GL_VIEWPORT, vp); glGetIntegerv(GL_SCISSOR_BOX, sc); glGetBooleanv(GL_COLOR_WRITEMASK, cm); glGetIntegerv(GL_DEPTH_FUNC, &dfunc);
         g_dlrt_n++;
-        printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
-               vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, glIsEnabled(GL_DEPTH_TEST), dfunc,
+        printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d tag %08x depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
+               vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, S.prog[1] ? code_tag(&S.prog[1]->st[1]) : 0, glIsEnabled(GL_DEPTH_TEST), dfunc,
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
         {   GLint bf[6] = {0, 0, 0, 0, 0, 0};
             static const GLenum q[6] = {0x80C9 /* SRC_RGB */, 0x80C8 /* DST_RGB */, 0x80CB /* SRC_ALPHA */, 0x80CA /* DST_ALPHA */, 0x8009 /* EQUATION_RGB */, 0x883D /* EQUATION_ALPHA */};
@@ -5264,18 +5290,30 @@ static void exec(const Cmd *m, int depth) {
     case OP_DRAW_TEXTURE: {                    /* nvn_c4.c: glDrawTextureNV with the depth, stencil and depth bounds tests off */
         GLuint tex = 0, smp = 0;
         static int nlog;
+        float r[8], ssx = 1.0f, ssy = 1.0f;
         if (!S.have_fbo || S.render_off) break;
         frozen_scene(0);                         /* DrawTexture disables depth even with a depth attachment bound. */
         {   /* the source takes the texels of the texture drawn last over its memory first, as a draw's textures do (view_copies_refresh) */
             uint32_t tid = (uint32_t)a[0] & 0xfffff;
             Tex *st = S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
             if (st && !st->dead && st->o.gl && st->alias_from) alias_refresh(st);
+            if (st && st->rw) { ssx = (float)st->rw / (float)st->b.width; ssy = (float)st->rh / (float)st->b.height; }
             if (drawlog_now() || rtlog_match(S.color0))
                 printf("drawtexture: frame %lld into fbo %u (%dx%d) from id 0x%x %dx%d format 0x%x gl %u mem %p\n", (long long)g_st.frames + 1, S.fbo, S.fbo_w, S.fbo_h, tid,
                        st ? st->b.width : 0, st ? st->b.height : 0, st ? st->b.format : 0, st ? st->o.gl : 0, st ? (void *)st->mem : NULL);
         }
         if (!resolve_names(S.tpool, S.spool, a[0], &tex, &smp)) { logf_limited(&nlog, 20, "nvn_gl: DrawTexture with handle 0x%llx: no such texture in the bound texture pool; nothing to draw\n", (unsigned long long)a[0]); break; }
-        if (!nvn_c4_draw_texture_gl(tex, smp, (const NvnC4DrawTexture *)blob, S.alpha_func, S.alpha_ref)) {
+        nvn_c4_draw_texture_rect((const NvnC4DrawTexture *)blob, r);      /* game pixels -> the GL storage of both textures (resolution scale, widescreen) */
+        if (S.prs && S.prsy) {
+            /* widescreen: a 16:9 image keeps its shape, centred (never stretched); a widened source (the scene) fills the target */
+            float q = ssx != ssy ? 1.0f : S.prsy / S.prs, half = (float)S.fbo_w * 0.5f;
+            for (int i = 0; i < 4; i++) {
+                if (!(i & 1)) r[i] = (r[i] - half) * q + half;
+                r[i] *= i & 1 ? S.prsy : S.prs;
+            }
+        }
+        r[4] *= ssx; r[6] *= ssx; r[5] *= ssy; r[7] *= ssy;
+        if (!nvn_c4_draw_texture_gl(tex, smp, (const NvnC4DrawTexture *)blob, r, S.alpha_func, S.alpha_ref)) {
             printf("nvn: stopping: nvnCommandBufferDrawTexture with a texture view that is not 2D or rectangle: what the GPU does is not established\n");
             fflush(stdout);
             report_and_exit(6);

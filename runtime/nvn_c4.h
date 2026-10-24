@@ -17,7 +17,7 @@ int nvn_c4_draw_texture_words(const float dst[4], const float src[4], NvnC4DrawT
 void nvn_c4_draw_texture_rect(const NvnC4DrawTexture *w, float out[8]);
 /* Render thread: draw with GL_NV_draw_texture into the bound framebuffer. alpha_func = NVN compare function (0 / 8 = no test).
  * Returns 0 if the texture is not a 2D or rectangle texture (nothing drawn). */
-int nvn_c4_draw_texture_gl(unsigned tex, unsigned smp, const NvnC4DrawTexture *w, int alpha_func, float alpha_ref);
+int nvn_c4_draw_texture_gl(unsigned tex, unsigned smp, const NvnC4DrawTexture *w, const float *rect, int alpha_func, float alpha_ref);   /* rect: nvn_c4_draw_texture_rect's 8 values as drawn (scaled targets), or NULL */
 /* Render thread, after the context is ready: with SSBU_NVN_GLTEST set, run the OpenGL self-test and exit (exit code = failures). */
 void nvn_c4_gl_selftest_hook(void);
 /* Part of the SDK self-test (no OpenGL): the encoder arithmetic against words produced by the emulator on sdk.elf. */

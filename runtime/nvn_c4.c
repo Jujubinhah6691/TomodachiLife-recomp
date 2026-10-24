@@ -86,7 +86,7 @@ static void gl_load(void) {
     p_GetTextureLevelParameteriv = (void *)wglGetProcAddress("glGetTextureLevelParameteriv");
 }
 
-int nvn_c4_draw_texture_gl(unsigned tex, unsigned smp, const NvnC4DrawTexture *w, int alpha_func, float alpha_ref) {
+int nvn_c4_draw_texture_gl(unsigned tex, unsigned smp, const NvnC4DrawTexture *w, const float *rect, int alpha_func, float alpha_ref) {
     float r[8];
     GLint target = 0, tw = 0, th = 0, base = 0;
     gl_load();
@@ -101,7 +101,7 @@ int nvn_c4_draw_texture_gl(unsigned tex, unsigned smp, const NvnC4DrawTexture *w
     p_GetTextureLevelParameteriv(tex, base, GL_TEXTURE_WIDTH, &tw);
     p_GetTextureLevelParameteriv(tex, base, GL_TEXTURE_HEIGHT, &th);
     if (tw <= 0 || th <= 0) return 0;
-    nvn_c4_draw_texture_rect(w, r);
+    if (rect) memcpy(r, rect, sizeof r); else nvn_c4_draw_texture_rect(w, r);
     GLboolean depth = glIsEnabled(GL_DEPTH_TEST), stencil = glIsEnabled(GL_STENCIL_TEST), bounds = glIsEnabled(0x8890 /* DEPTH_BOUNDS_TEST_EXT */);
     GLboolean alpha = glIsEnabled(GL_ALPHA_TEST);
     GLint afunc = GL_ALWAYS; GLfloat aref = 0;
@@ -185,7 +185,7 @@ static int gltest_case(const char *name, GLuint tex, GLuint smp, const float dst
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (!nvn_c4_draw_texture_words(dst, src, &w)) { printf("  FAIL %s: the encoder wrote nothing\n", name); return 1; }
-    if (!nvn_c4_draw_texture_gl(tex, smp, &w, 0, 0.f)) { printf("  FAIL %s: not drawn\n", name); return 1; }
+    if (!nvn_c4_draw_texture_gl(tex, smp, &w, NULL, 0, 0.f)) { printf("  FAIL %s: not drawn\n", name); return 1; }
     glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px);
     for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) {
         uint8_t want[4] = {0, 0, 0, 0};
@@ -240,7 +240,7 @@ void nvn_c4_gl_selftest_hook(void) {
         int wrong = 0;
         glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_SCISSOR_TEST); glScissor(0, 0, 8, 16);
-        nvn_c4_draw_texture_words(dst, src, &w); nvn_c4_draw_texture_gl(tex, smp, &w, 0, 0.f);
+        nvn_c4_draw_texture_words(dst, src, &w); nvn_c4_draw_texture_gl(tex, smp, &w, NULL, 0, 0.f);
         glScissor(0, 0, 16384, 16384);
         glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px);
         for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) { int in = x >= 4 && x < 8 && y >= 2 && y < 6; if ((px[(y * 16 + x) * 4 + 3] != 0) != in) wrong++; }
@@ -251,7 +251,7 @@ void nvn_c4_gl_selftest_hook(void) {
         NvnC4DrawTexture w;
         int written = 0;
         glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
-        nvn_c4_draw_texture_words(dst, src, &w); nvn_c4_draw_texture_gl(tex, smp, &w, 5, 2.0f);
+        nvn_c4_draw_texture_words(dst, src, &w); nvn_c4_draw_texture_gl(tex, smp, &w, NULL, 5, 2.0f);
         glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px);
         for (int i = 0; i < 16 * 16; i++) if (px[i * 4 + 3]) written++;
         n++; if (written || glIsEnabled(GL_ALPHA_TEST)) { bad++; printf("  FAIL alpha test GREATER 2.0: %d pixels written, alpha test left %s\n", written, glIsEnabled(GL_ALPHA_TEST) ? "on" : "off"); }

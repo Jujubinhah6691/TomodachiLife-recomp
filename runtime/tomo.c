@@ -1185,10 +1185,11 @@ static void trace_site_call(Ctx *c, void *user) {
     if (all < 0) all = getenv("TOMO_TRACE_ALL") != NULL;                  /* TOMO_TRACE_ALL=1: every call, the first 30000 in all */
     int say = n <= 20 || n % 500 == 0 || (all && InterlockedIncrement(&total) < 30000);
     uint64_t a0 = A0, a1 = A1, a2 = A2, a3 = A3, from = c->x[30];
+    float f0 = c->v[0].f[0], f1 = c->v[1].f[0], f2 = c->v[2].f[0], f3 = c->v[3].f[0];
     const char *name = guest_thread_name_of(GetCurrentThreadId());
     t->orig(c);
-    if (say) printf("trace %llx #%u [%s]: x0 %llx x1 %llx x2 %llx x3 %llx -> %llx (from %llx)\n", (unsigned long long)t->addr, n, name ? name : "main",
-                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)c->x[0], (unsigned long long)from);
+    if (say) printf("trace %llx #%u [%s]: x0 %llx x1 %llx x2 %llx x3 %llx s0-3 %g %g %g %g -> %llx (from %llx)\n", (unsigned long long)t->addr, n, name ? name : "main",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, f0, f1, f2, f3, (unsigned long long)c->x[0], (unsigned long long)from);
 }
 static void trace_install(void) {
     const char *e = getenv("TOMO_TRACE");
@@ -1198,6 +1199,35 @@ static void trace_install(void) {
         if (a) { g_trace_sites[k].addr = a; printf("trace: %llx %s\n", (unsigned long long)a, hook_install(a, trace_site_call, &g_trace_sites[k], &g_trace_sites[k].orig) ? "hooked" : "NOT hooked (not a function entry?)"); k++; }
         while (*p == ',' || *p == ' ') p++;
     }
+}
+/* Widescreen (graphics.ini widescreen, nvn_gl.c wide_k): the game's cameras set their projection with [0x71008ce838]
+ * (this, near s0, far s1, fovy s2, aspect s3; the island camera from 0x7100205c84 with its aspect at camera + 0x234). A
+ * 16:9 one is given the wider aspect, so the 3D view itself is wider: hor+, and the frustum culling and every pass that
+ * rebuilds positions from depth with the camera's matrices (water, lighting: compute) agree with it. Squeezing the clip x
+ * of the vertices instead left those passes on the 16:9 matrices (blocks in the water, ghost palms). 2D keeps its 16:9
+ * shape (mx_wide_fix, 2D only). TOMO_WIDE_CAMERA=0: the old vertex squeeze for 3D too. */
+static ImportFn g_persp;
+static void persp_wide(Ctx *c, void *user) {
+    (void)user;
+    float nvn_wide_k(void), k = nvn_wide_k();
+    if (k != 1.0f && fabsf(c->v[3].f[0] - 16.0f / 9.0f) < 0.01f) c->v[3].f[0] *= k;
+    g_persp(c);
+}
+/* The layouts (menus, dialogs) are drawn with a perspective camera of their own, made by [0x71006ec3c0] (this, width s0,
+ * height s1, fovy s2: 1920 x 1080, 20 degrees) at the distance where that rectangle fills the view. Wider by k, the layout
+ * keeps its size and shape in the middle and what lies beyond 16:9 shows at the sides: nothing is stretched. */
+static ImportFn g_layout_cam;
+static void layout_cam_wide(Ctx *c, void *user) {
+    (void)user;
+    float nvn_wide_k(void), k = nvn_wide_k();
+    if (k != 1.0f && c->v[1].f[0] > 0.0f && fabsf(c->v[0].f[0] / c->v[1].f[0] - 16.0f / 9.0f) < 0.01f) c->v[0].f[0] *= k;
+    g_layout_cam(c);
+}
+static void persp_install(void) {
+    void nvn_wide_camera(void);
+    if (getenv("TOMO_WIDE_CAMERA") && getenv("TOMO_WIDE_CAMERA")[0] == '0') return;
+    if (hook_install(0x71008ce838ull, persp_wide, NULL, &g_persp) && hook_install(0x71006ec3c0ull, layout_cam_wide, NULL, &g_layout_cam)) nvn_wide_camera();
+    else printf("widescreen: the camera projection hook is not installed (the 3D view is squeezed instead)\n");
 }
 static void heaplog_install(void) {
     trace_install();
@@ -1215,6 +1245,7 @@ static const ImportDef tomo_overrides[] = {
     {"_ZN2nn2os26GetThreadAvailableCoreMaskEv", ret7},
 };
 void register_tomo_imports(void) {
+    persp_install();
     audio_volume_selftest();                     /* SSBU_AUDIO_VOLUME_SELFTEST=<expected startup percent>, -1 for no device */
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);

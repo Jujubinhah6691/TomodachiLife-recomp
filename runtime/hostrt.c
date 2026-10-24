@@ -599,6 +599,15 @@ void host_import(Ctx *c, int sym) {
                 printf("importlog: frame %lld %s from %llx (x0 %llx)\n", display_frame_count(), dyn_syms[sym].name, (unsigned long long)c->x[30], (unsigned long long)c->x[0]);
         }
     }
+    {   /* TOMO_IMPORT_CALLERS=<part of an import's name> (diagnosis): each distinct caller of it once, with x0 / s0 */
+        static int want = -2; static uint64_t seen[256]; static volatile LONG nseen;
+        if (want == -2) { const char *e = getenv("TOMO_IMPORT_CALLERS"); want = -1; if (e && *e) for (int i = 0; i < (int)dyn_sym_count; i++) if (strstr(dyn_syms[i].name, e)) { want = i; break; } }
+        if (sym == want) {
+            int k = 0, n = (int)nseen;
+            while (k < n && seen[k] != c->x[30]) k++;
+            if (k == n && n < 256) { seen[InterlockedIncrement(&nseen) - 1] = c->x[30]; printf("importcaller: %s from %llx x0 %llx s0 %f\n", dyn_syms[sym].name, (unsigned long long)c->x[30] - 4, (unsigned long long)c->x[0], c->v[0].f[0]); }
+        }
+    }
     {   /* TOMO_RA_CHAIN=<return address>[,...] (diagnosis): an import called from there prints the guest frame chain (who
          * called the function that called it; found the sound pauses of the controller applet loop) */
         static uint64_t ra_watch[8] = {1}; static int nra;

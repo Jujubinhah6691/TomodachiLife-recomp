@@ -73,7 +73,9 @@ typedef struct {
     int screen_scale;
     /* Widescreen (OpenGL; nvn_gl.c wide_k): vertex stage: the clip-space x of the position is multiplied by the uniform
      * mx_wide (location 2, 1.0 unless set) except a vertex of a 2D draw (w = 1) exactly on the left or right edge (x = -1, 1
-     * or +-3: full-screen passes); fragment stage with screen_scale: mx_fcs is a vec2 (x and y factors). */
+     * or +-3: full-screen passes); fragment stage with screen_scale: mx_fcs is a vec2 (x and y factors).
+     * 2: 2D vertices only (w = 1 within 1e-4): the game's own cameras are made wider (tomo.c persp_wide), so 3D needs no
+     * squeeze; a negative mx_wide lets a full-screen quad keep the whole width (nvn_gl.c: a screen pass or a plain fill). */
     int wide;
 } MxIn;
 
