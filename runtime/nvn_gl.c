@@ -3277,6 +3277,7 @@ static int drawlog_now(void) {
 }
 static GLuint g_dbg_query;
 static struct { GLuint q; int active; uint64_t acc; } g_counter[17];
+static struct { uint64_t addr; long long frame; } g_tsrep[256];      /* TIMESTAMP_TOP reports: where, in which frame (OP_RENDER_ENABLE) */
 static void drawlog_begin(void) { if (!drawlog_now() || g_counter[1].active) return; if (!g_dbg_query) glGenQueries(1, &g_dbg_query); glBeginQuery(0x8914, g_dbg_query); }
 static void drawlog_end(void) {
     GLuint n = 0;
@@ -3391,6 +3392,7 @@ static void frozen_scene(int has_depth) {
     if (t->frz_snap && t->frz_snapf == t->frz_depth && t->frz_restf != frame) {   /* no 3D this frame (so far): the last 3D picture back */
         glCopyImageSubData(t->frz_snap, GL_TEXTURE_2D, 0, 0, 0, 0, t->o.gl, GL_TEXTURE_2D, 0, 0, 0, 0, tw(t), th(t), 1);
         t->frz_restf = frame;
+        if (drawlog_now()) printf("frozen scene: gl %u (%dx%d) gets the 3D picture of frame %lld back%c", t->o.gl, t->b.width, t->b.height, t->frz_depth, 10);
         static int said; if (!said++) printf("nvn_gl: frozen scene: the target %dx%d (gl %u) gets its last 3D picture back each frame (TOMO_FREEZE_RESTORE=0: off)\n", t->b.width, t->b.height, t->o.gl);
     }
 }
@@ -4633,11 +4635,10 @@ static void exec(const Cmd *m, int depth) {
         S.ds = d;
         if (d & 1) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         glDepthMask((d >> 1) & 1);
-        {   /* A depth test for equality without depth writes (the colour pass after a depth pre-pass) runs as less-or-equal: the
-             * two passes are different programs with the same position arithmetic, and the driver compiles them to depths that
-             * differ in the last bits however invariant and precise the GLSL is: nothing passed and the Mii in Mii creation was
-             * invisible. TOMO_EQUAL_FIX=0: equality as the game asks. */
-            static int eqfix = -1; if (eqfix < 0) eqfix = getenv("TOMO_EQUAL_FIX") ? atoi(getenv("TOMO_EQUAL_FIX")) : 1;
+        {   /* TEST ONLY, TOMO_EQUAL_FIX=1: a depth test for equality without depth writes runs as less-or-equal. It once made the
+             * Mii of Mii creation visible, but the cause was a second (lazy) clear of its depth between the depth pre-pass and the
+             * colour pass (OP_RENDER_ENABLE); less-or-equal also let a 169-vertex mask mesh through as a black card. */
+            static int eqfix = -1; if (eqfix < 0) eqfix = getenv("TOMO_EQUAL_FIX") ? atoi(getenv("TOMO_EQUAL_FIX")) : 0;
             GLenum df = nvn_func((unsigned)(d >> 4) & 15);
             if (eqfix && df == 0x202 /* EQUAL */ && !((d >> 1) & 1)) df = 0x203 /* LEQUAL */;
             glDepthFunc(df); }
@@ -4718,6 +4719,7 @@ static void exec(const Cmd *m, int depth) {
         GLbitfield bits = (a[0] & 1 ? GL_DEPTH_BUFFER_BIT : 0) | ((uint32_t)a[2] ? GL_STENCIL_BUFFER_BIT : 0);
         if (!S.have_fbo || !bits || S.render_off) break;
         memcpy(&depth, &a[3], 4);
+        if (drawlog_now()) printf("clear: frame %lld depth/stencil of fbo %u: bits %x depth %g stencil %d%c", (long long)g_st.frames + 1, S.fbo, (unsigned)bits, depth, (int)a[1], 10);
         glDepthMask(GL_TRUE);
         glStencilMaskSeparate(GL_FRONT_AND_BACK, (GLuint)a[2]);
         glClearDepth(depth);
@@ -4937,6 +4939,7 @@ static void exec(const Cmd *m, int depth) {
         break;
     case OP_DISCARD: {                         /* the contents of an attachment are no longer needed */
         GLenum att[2] = {GL_DEPTH_ATTACHMENT_, GL_STENCIL_ATTACHMENT_};
+        if (drawlog_now()) printf("discard: %s of fbo %u%c", a[0] == ~0ull ? "depth/stencil" : "colour", S.fbo, 10);
         if (!S.have_fbo || !gl_has(glInvalidateFramebuffer, "glInvalidateFramebuffer")) break;
         if (a[0] == ~0ull) glInvalidateFramebuffer(GL_FRAMEBUFFER_, 2, att);
         else {
@@ -5024,7 +5027,22 @@ static void exec(const Cmd *m, int depth) {
     }
     case OP_RENDER_ENABLE:                     /* a1 = 0: a0 is the switch; otherwise mode + 1 and a2 the address of two counters (16 bytes each) to compare */
         if (!a[1]) S.render_off = !(a[0] & 1);
-        else { cbuf_flush_if(a[2], 32); int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16); S.render_off = a[1] == 1 ? !eq : eq; }
+        else {
+            cbuf_flush_if(a[2], 32);
+            int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16);
+            /* Tomodachi Life clears a render target lazily: SetRenderEnableConditional(not equal) on the target's 32-byte slot, the
+             * clear, then a TIMESTAMP_TOP report into the slot. The slot starts {1, 0 | 0, 0} and nothing else writes it, so the
+             * console's skip of a second clear in a frame is not visible in the memory here; a slot reported in this frame
+             * counts as equal: a target bound again in the frame keeps its contents. Mii creation binds its depth again for
+             * the colour pass after the depth pre-pass and tests it for equality: cleared there, no Mii was drawn (2026-10-24).
+             * TOMO_CLEAR_ONCE=0: every conditional clear runs. */
+            static int once = -1; if (once < 0) once = !getenv("TOMO_CLEAR_ONCE") || atoi(getenv("TOMO_CLEAR_ONCE"));
+            if (!eq && once && a[2] && g_tsrep[(a[2] >> 5) & 255].addr == a[2] && g_tsrep[(a[2] >> 5) & 255].frame == (long long)g_st.frames + 1) eq = 1;
+            S.render_off = a[1] == 1 ? !eq : eq;
+        }
+        {   static int on = -1, n; if (on < 0) on = getenv("TOMO_CONDLOG") != NULL;      /* TEST ONLY */
+            if (on && a[1] && a[2] && n++ < 400) printf("condexec: frame %lld mode %d at %llx: %llx %llx | %llx %llx -> %s%c", (long long)g_st.frames + 1, (int)a[1] - 1, (unsigned long long)a[2],
+                (unsigned long long)rd64(a[2]), (unsigned long long)rd64(a[2] + 8), (unsigned long long)rd64(a[2] + 16), (unsigned long long)rd64(a[2] + 24), S.render_off ? "OFF" : "on", 10); }
         if (drawlog_now()) printf("render enable: %s mode %d counters %llu %llu -> %s\n", a[1] ? "conditional" : "switch", (int)a[1] - 1,
                                   a[1] && a[2] ? (unsigned long long)rd64(a[2]) : 0ull, a[1] && a[2] ? (unsigned long long)rd64(a[2] + 16) : 0ull, S.render_off ? "OFF" : "on");
         break;
@@ -5034,7 +5052,7 @@ static void exec(const Cmd *m, int depth) {
         int type = (int)a[0];
         /* type 16 (TIMESTAMP_TOP): a timestamp in the counter field too. Tomodachi Life reports it twice and draws its island
          * objects (palm trees, shrubs) under SetRenderEnableConditional(not equal) of the pair: two zeros culled them all. */
-        if (type == 16) d[0] = d[1];
+        if (type == 16) { d[0] = d[1]; if (a[1]) { g_tsrep[(a[1] >> 5) & 255].addr = a[1]; g_tsrep[(a[1] >> 5) & 255].frame = (long long)g_st.frames + 1; } }
         if (type > 0 && type < 16 && counter_target(type)) { counter_stop(type); d[0] = g_counter[type].acc; counter_start(type); }
         if (a[1]) { cbuf_flush_if(a[1], 16); memcpy(P(a[1]), d, 16); g_arena_gen++; }
         if (drawlog_now()) printf("counter report: type %d value %llu at %llx (draw %d)\n", type, (unsigned long long)d[0], (unsigned long long)a[1], g_frame_draw_index);
@@ -7391,7 +7409,7 @@ static void cmd_tess_levels(Ctx *c) {                   /* (cmdbuf, const float 
     if (src) memcpy(BLOB(m), P(src), outer ? 16 : 8);
 }
 static void cmd_barrier(Ctx *c) { rec(c, OP_BARRIER, 0); }
-static void cmd_discard_color(Ctx *c) { rec(c, OP_DISCARD, 0); }
+static void cmd_discard_color(Ctx *c) { rec(c, OP_DISCARD, 0)->a[0] = A1 & 7; }       /* (cmdbuf, colour target index) */
 static void cmd_discard_ds(Ctx *c) { rec(c, OP_DISCARD, 0)->a[0] = ~0ull; }
 static void cmd_clear_color_typed(Ctx *c) {             /* ClearColori / ClearColorui (cmdbuf, index, const int *, mask) */
     uint64_t src = A2;
@@ -7436,10 +7454,18 @@ static void cmd_multi_draw_elements_indirect(Ctx *c) {  /* (cmdbuf, mode, type, 
     memcpy(BLOB(m), &param, 8);
 }
 static void cmd_dispatch_indirect(Ctx *c) { cb_get(A0)->dispatches++; rec(c, OP_DISPATCH_INDIRECT, 0); }       /* (cmdbuf, address of three group counts) */
-static void cmd_render_enable(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[1] = 0; m->a[2] = 0; }                      /* (cmdbuf, enable) */
-static void cmd_render_enable_cond(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[2] = m->a[1]; m->a[1] = m->a[0] + 1; }   /* (cmdbuf, mode, counter address) */
-static void cmd_reset_counter(Ctx *c) { rec(c, OP_COUNTER_RESET, 0); }
-static void cmd_report_counter(Ctx *c) { rec(c, OP_COUNTER_REPORT, 0); }
+static void condlog(Ctx *c, const char *what) {         /* TEST ONLY, TOMO_CONDLOG=1: the game code behind conditional rendering and counter reports */
+    static int on = -1; static uint64_t seen[64]; static int n;
+    if (on < 0) on = getenv("TOMO_CONDLOG") != NULL;
+    if (!on) return;
+    for (int i = 0; i < n; i++) if (seen[i] == c->x[30]) return;
+    if (n < 64) seen[n++] = c->x[30];
+    printf("condlog: %s lr %llx args %llx %llx %llx%c", what, (unsigned long long)c->x[30], (unsigned long long)A1, (unsigned long long)c->x[2], (unsigned long long)c->x[3], 10);
+}
+static void cmd_render_enable(Ctx *c) { condlog(c, "SetRenderEnable"); Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[1] = 0; m->a[2] = 0; }                      /* (cmdbuf, enable) */
+static void cmd_render_enable_cond(Ctx *c) { condlog(c, "SetRenderEnableConditional"); Cmd *m = rec(c, OP_RENDER_ENABLE, 0); m->a[2] = m->a[1]; m->a[1] = m->a[0] + 1; }   /* (cmdbuf, mode, counter address) */
+static void cmd_reset_counter(Ctx *c) { condlog(c, "ResetCounter"); rec(c, OP_COUNTER_RESET, 0); }
+static void cmd_report_counter(Ctx *c) { condlog(c, "ReportCounter"); rec(c, OP_COUNTER_REPORT, 0); }
 static void cmd_report_value(Ctx *c) { rec(c, OP_REPORT_VALUE, 0); }
 static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags) */
 static void cmd_wait_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_WAITSYNC, 0)->a[0] = (uint64_t)(uintptr_t)o; }
