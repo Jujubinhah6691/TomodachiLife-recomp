@@ -688,6 +688,19 @@ static LONG64 g_spare_same_mem, g_spare_cleared;
  * kept from frame to frame): a spare made at the same memory is taken first, its texels are the right ones. A spare from
  * other memory holds another target's picture: it is cleared to zero (a new GL texture would start out that way). */
 static void alias_inherit(Tex *t);
+/* Zero texels for GL storage the game will only reach through the GPU: new GL storage is not cleared by the driver (it may
+ * hold a texture deleted just before; a 128x128 noise target there gave the dialog cloud its torn "heatwave" edge on some
+ * runs, 2026-10-24), and a spare from other memory holds another target's picture. */
+static void tex_zero(Tex *t) {
+    Fmt f;
+    if (!fmt_get(t->b.format, &f) || f.kind == 4 || !gl_has(glClearTexImage, "glClearTexImage")) return;
+    GLenum fm = f.format, ty = f.type;
+    if (f.kind == 1) { fm = 0x1902; ty = 0x1406; }                 /* DEPTH_COMPONENT, FLOAT */
+    else if (f.kind == 2) { fm = 0x1901; ty = 0x1401; }            /* STENCIL_INDEX, UNSIGNED_BYTE */
+    else if (f.kind == 3) { fm = 0x84F9; ty = f.internal == 0x8CAD ? 0x8DAD : 0x84FA; }   /* DEPTH_STENCIL: 32F_8 or 24_8 */
+    for (int l = 0; l < t->glevels; l++) glClearTexImage(t->o.gl, l, fm, ty, NULL);
+    while (glGetError()) {}
+}
 static int tex_take_spare(Tex *t) {
     if (!t->gpu_written || g_rb == &rb_vk) return 0;
     int pick = -1;
@@ -703,16 +716,7 @@ static int tex_take_spare(Tex *t) {
     g_spare_hits++;
     if (same) g_spare_same_mem++;
     else {
-        Fmt f;
-        if (fmt_get(t->b.format, &f) && gl_has(glClearTexImage, "glClearTexImage")) {
-            GLenum fm = f.format, ty = f.type;
-            if (f.kind == 1) { fm = 0x1902; ty = 0x1406; }                 /* DEPTH_COMPONENT, FLOAT */
-            else if (f.kind == 2) { fm = 0x1901; ty = 0x1401; }            /* STENCIL_INDEX, UNSIGNED_BYTE */
-            else if (f.kind == 3) { fm = 0x84F9; ty = f.internal == 0x8CAD ? 0x8DAD : 0x84FA; }   /* DEPTH_STENCIL: 32F_8 or 24_8 */
-            if (f.kind != 4) for (int l = 0; l < t->glevels; l++) glClearTexImage(t->o.gl, l, fm, ty, NULL);
-            while (glGetError()) {}
-            g_spare_cleared++;
-        }
+        tex_zero(t); g_spare_cleared++;
         alias_inherit(t);
     }
     return 1;
@@ -772,7 +776,7 @@ static void tex_realize(Tex *t) {
     }
     if (e || g_debug) logf_limited(&nlog, 80, "nvn_gl: texture target %d format 0x%x %dx%dx%d levels %d samples %d flags 0x%x -> gl %u%s (error 0x%x)\n", b->target, b->format,
                                    b->width, b->height, b->depth, b->levels, b->samples, b->flags, t->o.gl, e ? " FAILED" : "", e);
-    if (!e) alias_inherit(t);
+    if (!e) { if (t->gpu_written) tex_zero(t); alias_inherit(t); }
 }
 
 /* One level (one layer / face, or all slices of a 3D level) of tightly packed texels into the GL texture. */
@@ -3617,8 +3621,19 @@ static int draw_prepare(void) {
                 Tex *t = S.tpool && tid && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
                 static uint8_t seen[0x4000];
                 if (!t) continue;
-                printf("    texture %d: id 0x%x target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u uploaded %d rendered %d view set 0x%x format 0x%x\n", n, tid, t->b.target, t->b.format, t->b.width,
-                       t->b.height, t->b.depth, t->b.levels, t->b.flags, t->o.gl, t->uploaded, t->gpu_written, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format);
+                printf("    texture %d: id 0x%x target %d format 0x%x %dx%dx%d levels %d flags 0x%x gl %u mem %p uploaded %d rendered %d view set 0x%x format 0x%x\n", n, tid, t->b.target, t->b.format, t->b.width,
+                       t->b.height, t->b.depth, t->b.levels, t->b.flags, t->o.gl, (void *)t->mem, t->uploaded, t->gpu_written, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format);
+                if (!t->uploaded && !t->rt_tick && t->mem) {     /* never drawn into itself: what else covers its memory */
+                    uint64_t b0 = (uint64_t)(uintptr_t)t->mem, e0 = b0 + t->storage;
+                    AcquireSRWLockShared(&g_tex_range_lock);
+                    for (size_t i = 0; i < g_tex_range_count && g_tex_ranges[i].begin < e0; i++) {
+                        Tex *o = g_tex_ranges[i].tex;
+                        if (o == t || g_tex_ranges[i].end <= b0) continue;
+                        printf("      overlaps: mem %p+%llx %dx%dx%d format 0x%x gl %u rt_tick %lld dead %d\n", (void *)o->mem, (unsigned long long)o->storage, o->b.width, o->b.height,
+                               o->b.depth, o->b.format, o->o.gl, o->rt_tick, o->dead);
+                    }
+                    ReleaseSRWLockShared(&g_tex_range_lock);
+                }
                 {   uint32_t dims2[4]; int isint2 = 0;
                     uint64_t fresh = resolve_handle(S.tpool, S.spool, S.nvn_tex[s][n], dims2, &isint2);
                     if (fresh != S.gl_tex[s][4 + n]) printf("      STALE handle: bound %llx, now %llx\n", (unsigned long long)S.gl_tex[s][4 + n], (unsigned long long)fresh);
