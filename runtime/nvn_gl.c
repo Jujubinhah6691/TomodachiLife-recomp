@@ -2572,6 +2572,12 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
                                        (unsigned long long)fp0, (unsigned long long)c->x[29], (unsigned long long)sp0, (unsigned long long)c->x[31]);
             }
             cb->in_callback = 0;
+            {   static int dbg = -1, nlog;          /* TOMO_CBLOG=1: each out-of-command-memory callback and whether the game added memory */
+                if (dbg < 0) dbg = getenv("TOMO_CBLOG") != NULL;
+                if (dbg && nlog++ < 300)
+                    printf("cblog: frame %lld cmdbuf %llx asked for %llu bytes (recording %u bytes so far): now %llu of %llu used, pool %llx offset %llx\n", (long long)g_st.frames, (unsigned long long)(uintptr_t)cb,
+                           (unsigned long long)((use + 0xff) & ~0xffull), (unsigned)cb->rec_cmd, (unsigned long long)cb->cmd_used, (unsigned long long)cb->cmd_size, (unsigned long long)cb->cmd_pool, (unsigned long long)cb->cmd_off);
+            }
             memcpy(c->x, sx, sizeof sx); memcpy(c->v, sv, sizeof sv);
             if (cb->len + need > cb->cap) { cb->cap = (cb->cap + need) * 2 + 4096; cb->data = realloc(cb->data, cb->cap); }
         }
@@ -3797,6 +3803,21 @@ static void apply_multisample(void) {
 }
 
 static void copy_region(const uint8_t *p, int *r) { memcpy(r, p, 24); }
+/* A copy addresses layers (and 3D slices) by the z of its region; a layered texture is attached one layer at a time (attached
+ * whole, the blit read and wrote layer 0 whatever the region said). NVN targets: 2 3D, 3 1D array, 4 2D array, 6 2D multisample
+ * array, 8 cube, 9 cube array. */
+static int tex_layered(const Tex *t, const View *v) { int tg = v && (v->set & 0xa0) == 0xa0 ? v->target : t->b.target; return tg == 2 || tg == 3 || tg == 4 || tg == 6 || tg == 8 || tg == 9; }
+static GLuint temp_fbo_layer(GLenum target, GLuint slot_fbo, Tex *t, const View *v, int layer) {
+    Fmt f;
+    int kind = fmt_get(t->b.format, &f) ? f.kind : 0;
+    GLenum att = kind == 3 ? GL_DEPTH_STENCIL_ATTACHMENT_ : kind == 1 ? GL_DEPTH_ATTACHMENT_ : kind == 2 ? GL_STENCIL_ATTACHMENT_ : GL_COLOR_ATTACHMENT0_;
+    glBindFramebuffer(target, slot_fbo);
+    glFramebufferTexture(target, GL_COLOR_ATTACHMENT0_, 0, 0);
+    glFramebufferTexture(target, GL_DEPTH_STENCIL_ATTACHMENT_, 0, 0);
+    if (layer >= 0 && tex_layered(t, v)) glFramebufferTextureLayer(target, att, tex_view_obj(t, v)->gl, 0, layer);
+    else glFramebufferTexture(target, att, tex_view_obj(t, v)->gl, 0);
+    return (GLuint)(kind == 3 ? GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT : kind == 1 ? GL_DEPTH_BUFFER_BIT : kind == 2 ? GL_STENCIL_BUFFER_BIT : GL_COLOR_BUFFER_BIT);
+}
 static GLuint temp_fbo(GLenum target, GLuint slot_fbo, Tex *t, const View *v) {
     Fmt f;
     int kind = fmt_get(t->b.format, &f) ? f.kind : 0;
@@ -3810,6 +3831,37 @@ static GLuint g_fbo_tmp[2];
 static void blit_tex(Tex *src, const View *sv, const int *sr, Tex *dst, const View *dv, const int *dr, int linear) {
     tex_sync(src); tex_sync(dst);
     dst->gpu_written = 1;
+    {   /* Block-compressed textures cannot be framebuffer attachments: a copy between them (Tomodachi Life copies the Mii face
+         * textures it compresses on the GPU, level by level) failed as an incomplete framebuffer and left the face cards and
+         * the new Mii blank. Same size, no mirroring: the blocks are copied as they are. */
+        Fmt fs, fd;
+        int cs = fmt_get(src->b.format, &fs) && fs.kind == 4, cd = fmt_get(dst->b.format, &fd) && fd.kind == 4;
+        if ((cs || cd) && sr[3] == dr[3] && sr[4] == dr[4] && dr[3] > 0 && dr[4] > 0 && gl_has(glCopyImageSubData, "glCopyImageSubData") && src->o.gl && dst->o.gl) {
+            int sl = sv && (sv->set & 0x81) == 0x81 ? sv->lvl0 : 0, dl = dv && (dv->set & 0x81) == 0x81 ? dv->lvl0 : 0;
+            int sz = sr[2] + (sv && (sv->set & 0x82) == 0x82 ? sv->lay0 : 0), dz = dr[2] + (dv && (dv->set & 0x82) == 0x82 ? dv->lay0 : 0);
+            static int nlog;
+            while (glGetError()) {}
+            glCopyImageSubData(src->o.gl, gl_target(src->b.target, src->b.samples), sl, sr[0], sr[1], sz, dst->o.gl, gl_target(dst->b.target, dst->b.samples), dl, dr[0], dr[1], dz, sr[3], sr[4], sr[5] > 1 ? sr[5] : 1);
+            GLenum e = glGetError();
+            if (e) logf_limited(&nlog, 10, "nvn_gl: compressed texture copy (format 0x%x -> 0x%x, level %d -> %d, %dx%d at %d,%d) failed with GL error 0x%x\n", src->b.format, dst->b.format, sl, dl, sr[3], sr[4], sr[0], sr[1], e);
+            g_st.copies++;
+            return;
+        }
+    }
+    if (tex_layered(src, sv) || tex_layered(dst, dv)) {     /* layer by layer: z of the regions, depth = the number of layers */
+        int n = sr[5] > 1 ? sr[5] : 1;
+        for (int k = 0; k < n; k++) {
+            GLuint m = temp_fbo_layer(GL_READ_FRAMEBUFFER_, g_fbo_tmp[0], src, sv, sr[2] + k);
+            temp_fbo_layer(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1], dst, dv, dr[2] + k);
+            glDisable(GL_SCISSOR_TEST); glDisable(GL_FRAMEBUFFER_SRGB_);
+            glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[3], sr[1] + sr[4], dr[0], dr[1], dr[0] + dr[3], dr[1] + dr[4], m, linear && m == GL_COLOR_BUFFER_BIT ? GL_LINEAR : GL_NEAREST);
+            glEnable(GL_FRAMEBUFFER_SRGB_); glEnable(GL_SCISSOR_TEST);
+        }
+        fbo_detach(g_fbo_tmp[0]); fbo_detach(g_fbo_tmp[1]);
+        glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
+        g_st.copies++;
+        return;
+    }
     GLuint mask = temp_fbo(GL_READ_FRAMEBUFFER_, g_fbo_tmp[0], src, sv);
     temp_fbo(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1], dst, dv);
     {   static int dbg = -1, nlog; if (dbg < 0) dbg = getenv("TOMO_GLERR_DRAW") != NULL;
