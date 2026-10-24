@@ -6835,10 +6835,10 @@ static void job_rb_land_range(void *arg) { Range *r = arg; if (g_rbp_n) rb_land_
 void nvn_front_memory_retire(uint64_t addr, uint64_t size) {
     if (!addr || !size || !g_render_tid) return;
     if (g_rb == &rb_vk) { Range range = {addr, size}; gl_run(nvn_vk_memory_retire, &range); }
-    else { static int on = -1; if (on < 0) { const char *e = getenv("TOMO_RETIRE_BARRIER"); on = e ? atoi(e) : 1; } if (on) gl_barrier();
+    else { static int on = -1; if (on < 0) { const char *e = getenv("TOMO_RETIRE_BARRIER"); on = e ? atoi(e) : 0; } if (on) gl_barrier();
         int hit = 0;                               /* a hint read from this thread: after the barrier only the render thread changes the list */
         for (int i = 0; i < g_rbp_n && i < 64 && !hit; i++) hit = addr < g_rbp[i].addr + g_rbp[i].size && g_rbp[i].addr < addr + size;
-        if (hit) { Range range = {addr, size}; gl_run(job_rb_land_range, &range); } }   /* OpenGL: TOMO_RETIRE_BARRIER=0 skips it (tried: the sea foam drew wrong); the game frees storage only after its fences (nvnSyncWait), which pass through the render thread (Tomodachi Life: 1.6 buffer finalizes a frame, 14 ms of waiting) */
+        if (hit) { Range range = {addr, size}; gl_run(job_rb_land_range, &range); } }   /* OpenGL: no barrier by default since 2026-10-23 (TOMO_RETIRE_BARRIER=1 restores it): the game frees storage only after its fences (nvnSyncWait), which pass through the render thread, and read-backs over the freed range land first (above); the barrier made the game wait 18 ms a frame for the render thread (house close-up 20 -> 25 fps). The sea foam that once drew wrong without it looked the same in a side-by-side check. */
 }
 /* Seam step S2: the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
 static void rb_gl_idle(void) { gl_housekeeping(); if (g_rbp_n) rb_land(0); }     /* read-backs land as soon as the GPU is done (the game reads some results without a fence: late data made the island's shadows jump) */
