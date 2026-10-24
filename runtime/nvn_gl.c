@@ -231,7 +231,7 @@ enum {
     GL_TESS_CONTROL_PROGRAM_NV_ = 0x891E, GL_TESS_EVALUATION_PROGRAM_NV_ = 0x891F, GL_COMPUTE_PROGRAM_NV_ = 0x90FB,
     GL_PROGRAM_FORMAT_ASCII_ARB_ = 0x8875, GL_PROGRAM_ERROR_POSITION_ARB_ = 0x864B, GL_PROGRAM_ERROR_STRING_ARB_ = 0x8874,
     GL_MAX_PROGRAM_PARAMETER_BUFFER_BINDINGS_NV_ = 0x8DA0,
-    GL_ARRAY_BUFFER_ = 0x8892, GL_ELEMENT_ARRAY_BUFFER_ = 0x8893, GL_STREAM_DRAW_ = 0x88E0, GL_SHADER_STORAGE_BUFFER_ = 0x90D2,
+    GL_ARRAY_BUFFER_ = 0x8892, GL_ELEMENT_ARRAY_BUFFER_ = 0x8893, GL_STREAM_DRAW_ = 0x88E0, GL_SHADER_STORAGE_BUFFER_ = 0x90D2, GL_UNIFORM_BUFFER_ = 0x8A11,
     GL_FRAMEBUFFER_ = 0x8D40, GL_READ_FRAMEBUFFER_ = 0x8CA8, GL_DRAW_FRAMEBUFFER_ = 0x8CA9, GL_COLOR_ATTACHMENT0_ = 0x8CE0,
     GL_DEPTH_ATTACHMENT_ = 0x8D00, GL_STENCIL_ATTACHMENT_ = 0x8D20, GL_DEPTH_STENCIL_ATTACHMENT_ = 0x821A,
     GL_FRAMEBUFFER_COMPLETE_ = 0x8CD5, GL_FRAMEBUFFER_SRGB_ = 0x8DB9,
@@ -1456,13 +1456,13 @@ static uint32_t g_arena_gen = 1;      /* (declared above ww_note) */
 /* Redundant state calls skipped: on the island (2760 draws a frame) most of the 80 000 GL calls a frame repeated the draw
  * before. These remember what the render context has bound: every storage buffer range goes through gs_ssbo, and the code
  * that binds pipeline 0 or deletes buffers calls gs_invalidate. TOMO_GSCACHE=0: every call made, as before. */
-static struct { GLuint buf; ptrdiff_t off, size; } g_gs_ssbo[96];
+static struct { GLuint buf; ptrdiff_t off, size; } g_gs_ssbo[96], g_gs_ubo[40];
 static struct { GLuint buf; ptrdiff_t off; GLsizei stride; GLuint div; } g_gs_vb[16];
 static uint32_t g_gs_attr[16];
 static GLuint g_gs_vs, g_gs_fs;
 static int g_gs_pipe, g_gs_arb_on = 1, g_gs_alpha_on = 1, g_gs_on = -1;
 static void gs_invalidate(void) {
-    memset(g_gs_ssbo, 0, sizeof g_gs_ssbo); memset(g_gs_vb, 0, sizeof g_gs_vb); memset(g_gs_attr, 0, sizeof g_gs_attr);
+    memset(g_gs_ssbo, 0, sizeof g_gs_ssbo); memset(g_gs_ubo, 0, sizeof g_gs_ubo); memset(g_gs_vb, 0, sizeof g_gs_vb); memset(g_gs_attr, 0, sizeof g_gs_attr);
     g_gs_pipe = 0; g_gs_vs = g_gs_fs = 0; g_gs_arb_on = g_gs_alpha_on = 1;
 }
 static void gs_mode(void) { if (g_gs_on < 0) g_gs_on = getenv("TOMO_GSCACHE") ? atoi(getenv("TOMO_GSCACHE")) : 15; }      /* bits: 1 storage ranges, 2 programs, 4 attributes, 8 vertex buffers */
@@ -1472,6 +1472,14 @@ static void gs_ssbo(GLuint i, GLuint buf, ptrdiff_t off, ptrdiff_t size) {
     glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, i, buf, off, size);
     if (i < 96) { g_gs_ssbo[i].buf = buf; g_gs_ssbo[i].off = off; g_gs_ssbo[i].size = size; }
 }
+static void gs_ubo(GLuint i, GLuint buf, ptrdiff_t off, ptrdiff_t size) {
+    if (size > 65536) size = 65536;                  /* GL_MAX_UNIFORM_BLOCK_SIZE; the hardware's constant buffers are no larger */
+    if (g_gs_on && i < 40 && g_gs_ubo[i].buf == buf && g_gs_ubo[i].off == off && g_gs_ubo[i].size == size) return;
+    glBindBufferRange(GL_UNIFORM_BUFFER_, i, buf, off, size);
+    if (i < 40) { g_gs_ubo[i].buf = buf; g_gs_ubo[i].off = off; g_gs_ubo[i].size = size; }
+}
+/* TOMO_UBO=0: the graphics stages read their constant buffers from storage buffers, as before (mx_translate.h MxIn.ubo) */
+static int ubo_on(void) { static int on = -1; if (on < 0) on = !(getenv("TOMO_UBO") && getenv("TOMO_UBO")[0] == '0'); return on; }
 typedef struct ArenaOld { GLuint buf; struct ArenaOld *next; } ArenaOld;
 static ArenaOld *g_arena_old;
 static void arena_retire(void) {
@@ -1725,7 +1733,7 @@ static GLuint g_pipeline;
  * Shared GL programs are never deleted (a few thousand at most: the game has about 6,900 distinct stages). Per-draw state
  * of a program (the alpha-test uniform) is set at every draw that uses it, so sharing does not change what is drawn.
  * Entries are found by 64-bit hashes of the contents (plus length, stage and key compared exactly). */
-typedef struct ShEnt { uint64_t h; int stage, code_len; uint32_t key[4]; GLuint prog; uint32_t cbufs, ssbos, in_attr, tex_units, ssbo_written; int uses_alpha, uses_fcs; struct ShEnt *next; } ShEnt;
+typedef struct ShEnt { uint64_t h; int stage, code_len; uint32_t key[4]; GLuint prog; uint32_t cbufs, ssbos, in_attr, tex_units, ssbo_written; int uses_alpha, uses_fcs, ubo; struct ShEnt *next; } ShEnt;
 typedef struct ShSrc { uint64_t h; size_t len; GLuint prog; struct ShSrc *next; char *text; } ShSrc;
 static ShSrc *g_prog_src[65536];                 /* P3 round 3: GL stage program -> its text record (pair programs) */
 static GLuint g_pair_cur;                        /* the linked pair program in use (glUseProgram), 0 = none */
@@ -1997,7 +2005,7 @@ static char *pw_translate(int stage, const uint8_t *code, int code_len, const ui
     memset(&in, 0, sizeof in);
     in.stage = stage; in.code = code; in.code_len = code_len;
     if (cdata_size) { in.cdata = cdata; in.cdata_size = cdata_size; }
-    in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16;
+    in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)stage * 18;
     in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
     if (!mx_translate(&in, &out)) return NULL;
     if (in_attr) *in_attr = out.in_attr;
@@ -2208,7 +2216,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         memset(&in, 0, sizeof in);
         in.stage = j->stage; in.code = j->data; in.code_len = j->code_len;
         if (j->cdata_size) { in.cdata = j->data + j->code_len; in.cdata_size = j->cdata_size; }
-        in.binding_base = (unsigned)j->stage * 20; in.ssbo_base = 40 + (unsigned)j->stage * 16;
+        in.binding_base = (unsigned)j->stage * 20; in.ssbo_base = 40 + (unsigned)j->stage * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)j->stage * 18;
         in.int_attrs = j->key[0]; in.sint_attrs = j->key[1]; in.int_tex = j->key[2]; in.sint_tex = j->key[3];
         in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
         if (mx_translate(&in, &out)) {
@@ -2515,7 +2523,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
             if (e->h == h1 && e->stage == s && e->code_len == st->code_len && !memcmp(e->key, key, 16)) {
                 st->glsl = e->prog; st->glsl_state = 1;
                 memcpy(st->glsl_key, key, sizeof st->glsl_key);
-                st->glsl_cbufs = e->cbufs; st->glsl_ssbos = e->ssbos; st->glsl_dep = e->in_attr; st->glsl_tex = e->tex_units; st->glsl_alpha = e->uses_alpha; st->glsl_fcs = e->uses_fcs; st->glsl_ssbo_w = e->ssbo_written;
+                st->glsl_cbufs = e->cbufs; st->glsl_ssbos = e->ssbos; st->glsl_dep = e->in_attr; st->glsl_tex = e->tex_units; st->glsl_alpha = e->uses_alpha; st->glsl_fcs = e->uses_fcs; st->glsl_ubo = e->ubo; st->glsl_ssbo_w = e->ssbo_written;
                 g_shc_hit++;
                 return 1;
             }
@@ -2531,7 +2539,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
         g_pend[pend_i] = g_pend[--g_pend_n];
     }
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
-    in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16;
+    in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)s * 18;
     in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f;
     LONG64 pf0 = pf_now();
     int xl;
@@ -2626,12 +2634,12 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     free(src);
     st->glsl_state = 1;
     memcpy(st->glsl_key, key, sizeof st->glsl_key);
-    st->glsl_cbufs = out.cbufs; st->glsl_ssbos = out.ssbos; st->glsl_dep = out.in_attr; st->glsl_tex = out.tex_units; st->glsl_alpha = out.uses_alpha; st->glsl_fcs = out.uses_fcs; st->glsl_ssbo_w = out.ssbo_written;
+    st->glsl_cbufs = out.cbufs; st->glsl_ssbos = out.ssbos; st->glsl_dep = out.in_attr; st->glsl_tex = out.tex_units; st->glsl_alpha = out.uses_alpha; st->glsl_fcs = out.uses_fcs; st->glsl_ubo = out.ubo; st->glsl_ssbo_w = out.ssbo_written;
     if (out.ssbo_written) { static int nw; logf_limited(&nw, 5, "nvn_gl: program #%d %s stage writes storage buffers (mask 0x%x): kept in GL buffers and copied back to guest memory\n", p->serial, k_stage_name[s], out.ssbo_written); }
     if (!g_shc_off) {
         ShEnt *e = calloc(1, sizeof *e);
         e->h = h1; e->stage = s; e->code_len = st->code_len; memcpy(e->key, key, 16); e->prog = st->glsl;
-        e->cbufs = out.cbufs; e->ssbos = out.ssbos; e->in_attr = out.in_attr; e->tex_units = out.tex_units; e->ssbo_written = out.ssbo_written; e->uses_alpha = out.uses_alpha; e->uses_fcs = out.uses_fcs;
+        e->cbufs = out.cbufs; e->ssbos = out.ssbos; e->in_attr = out.in_attr; e->tex_units = out.tex_units; e->ssbo_written = out.ssbo_written; e->uses_alpha = out.uses_alpha; e->uses_fcs = out.uses_fcs; e->ubo = out.ubo;
         e->next = g_shc[h1 & 4095]; g_shc[h1 & 4095] = e;
     }
     g_st.glsl_ok++;
@@ -3350,6 +3358,7 @@ static void bind_handle_table(int s, GLenum target, GLuint index, int skip) {
         S.tex_gen[s] = g_arena_gen; S.tex_dirty[s] = 0;
     }
     if (target == GL_SHADER_STORAGE_BUFFER_) gs_ssbo(index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
+    else if (target == GL_UNIFORM_BUFFER_) gs_ubo(index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
     else glBindBufferRange(target, index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
 }
 /* Debug aid SSBU_DRAWLOG=<frame>: state of every draw of that frame, and how many samples each draw produced. */
@@ -3641,7 +3650,7 @@ static int draw_prepare(void) {
             for (unsigned n = 1; n < 18; n++) {
                 Range r = {0, 0};
                 if (!(st->glsl_cbufs >> n & 1)) continue;
-                if (n == 2) { bind_handle_table(s, GL_SHADER_STORAGE_BUFFER_, (GLuint)s * 20 + n, 0); continue; }
+                if (n == 2) { if (st->glsl_ubo) bind_handle_table(s, GL_UNIFORM_BUFFER_, (GLuint)s * 18 + n, 0); else bind_handle_table(s, GL_SHADER_STORAGE_BUFFER_, (GLuint)s * 20 + n, 0); continue; }
                 if (n == 1) { r.addr = (uint64_t)(uintptr_t)st->cdata_copy; r.size = st->cdata_copy ? st->ctl[3] : 0; } else r = S.ubo[s][n - 3];
                 if (n == 1 && gputime_ms() && !st->c1_logged) {       /* TOMO_GPUTIME: the shader's own constants (jump tables) as bound */
                     const uint32_t *w = (const uint32_t *)(uintptr_t)r.addr;
@@ -3653,7 +3662,8 @@ static int draw_prepare(void) {
                 }
                 if (r.addr && r.size) {
                     size_t off = arena_put(r.addr, r.size);
-                    gs_ssbo((GLuint)s * 20 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
+                    if (st->glsl_ubo) gs_ubo((GLuint)s * 18 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
+                    else gs_ssbo((GLuint)s * 20 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
                     g_gs_buf_bind++;
                 }
             }

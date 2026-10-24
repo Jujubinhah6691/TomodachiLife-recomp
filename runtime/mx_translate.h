@@ -40,6 +40,11 @@ typedef struct {
     uint32_t int_attrs, sint_attrs;  /* vertex: generic inputs with an integer format (and which of them are signed) */
     uint32_t int_tex, sint_tex;      /* texture units holding integer formats (and which are signed) */
     unsigned binding_base;           /* storage binding of constant buffer 0 */
+    /* OpenGL vertex / fragment stage: the constant buffers are uniform blocks "uvec4 cN[]" at binding ubo_base + n when the stage
+     * uses at most 14 of them (MxOut.ubo says it did); NVIDIA reads those through its constant cache, storage buffers through
+     * L1: the deferred lighting passes of the island cost 1.5-3 ms each at 4K. */
+    int ubo;
+    unsigned ubo_base;
     unsigned ssbo_base;              /* storage binding of the game's storage buffer 0 of this stage */
     int fragdebug;                   /* fragment: write magenta */
     /* compute stage (NVN control section: +0x748 work group size x, y, z; +0x754 shared memory bytes; +0x758 local memory bytes) */
@@ -84,6 +89,7 @@ typedef struct {
     uint16_t image_gl_format[8];     /* internal format each used image must be bound with (typed accesses name their own) */
     uint32_t int_dep;                /* which bits of int_attrs / int_tex influenced the code (vertex: attrs, fragment: textures) */
     int insns, blocks, uses_alpha, uses_fcs;      /* uses_fcs: the fragment stage reads mx_fcs (screen_scale) */
+    int ubo;                         /* MxIn.ubo was honoured: the constant buffers are uniform blocks at ubo_base + n */
     /* target 1: the samplers the text declares in set 1 (the back end binds a view of that type, or a dummy of that type) */
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64];
     int nsmp;

@@ -46,6 +46,7 @@ typedef struct {
     uint16_t *stk_of;
     char ring[24][1200]; int ri;
     char exitcode[4096];
+    uint16_t cb_max[18]; uint32_t cb_dyn;     /* highest constant word read at a fixed index, per buffer; buffers read at computed indices */
     /* Forward-only flow (every branch, SYNC, BRK and CONT goes to a later word; no BRX): the blocks are emitted in order as
      * "if (pc == <block>) { ... }" with each branch setting pc, instead of a switch inside an endless loop. NVIDIA's compiler
      * keeps far fewer values alive through plain ifs: the deferred lighting passes of the island cost 4-8 ms each at 4K. */
@@ -111,7 +112,8 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
         return f == 2 ? "0x07fffffcu" : "0u";
     }
     e->cbufs |= 1u << b;
-    return S(e, "c%u[%uu]", b, w);
+    if (b < 18 && w > e->cb_max[b]) e->cb_max[b] = (uint16_t)w;
+    return S(e, "cb%u(%uu)", b, w);
 }
 /* A video operand (VMNMX ...): chunk = 0 selects byte `byte_height` of the register, otherwise type 0 / 1 = the low / high
  * 16 bits, 2 = the whole register; signed operands are sign-extended. NULL for the invalid type. */
@@ -287,7 +289,8 @@ static const char *SMP(Mx *e, int unit, const char *base, int shadow) {
         }
         return S(e, "mx_t%d_%s", unit, type);
     }
-    return S(e, "%ssampler%s%s(uvec2(c2[%uu], c2[%uu]))", pre, base, shadow ? "Shadow" : "", 8 + 2 * unit, 9 + 2 * unit);
+    if (9 + 2 * unit > e->cb_max[2]) e->cb_max[2] = (uint16_t)(9 + 2 * unit);
+    return S(e, "%ssampler%s%s(uvec2(cb2(%uu), cb2(%uu)))", pre, base, shadow ? "Shadow" : "", 8 + 2 * unit, 9 + 2 * unit);
 }
 static int tex_is_int(Mx *e, int unit, int shadow) { return !shadow && unit >= 0 && (e->in->int_tex >> unit & 1); }
 static const char *ARR(Mx *e, unsigned r) { return S(e, "float(%s & 0xffffu)", X(e, r)); }
@@ -441,7 +444,8 @@ static const char *tf_scaled(Mx *e, int unit, const char *smp, const char *coord
     unsigned w = 96 + 4 * (unsigned)unit;
     e->uses_tf = 1; e->cbufs |= 4;
     if (off && *off) { coords = S(e, "(%s + %s)", coords, *off); *off = NULL; }
-    return S(e, "mx_tf(%s, textureSize(%s, 0), c2[%uu], c2[%uu])", coords, smp, w, w + 1);
+    if (w + 1 > e->cb_max[2]) e->cb_max[2] = (uint16_t)(w + 1);
+    return S(e, "mx_tf(%s, textureSize(%s, 0), cb2(%uu), cb2(%uu))", coords, smp, w, w + 1);
 }
 
 /* TLD (bound): integer coords, [lod] [offset] [sample] from Rb */
@@ -609,8 +613,9 @@ static void op_txq(Mx *e, uint64_t i) {
     if (unit < 0) return;
     if (mode != 1) { fail(e, "TXQ", "TXQ mode %u", mode); return; }
     unsigned w = 96 + 4 * (unsigned)unit;
-    emit(e, "uint lq = %s; uint lv = c2[%uu]; uvec4 tq = uvec4(c2[%uu] == 0u ? 0u : max(c2[%uu] >> lq, 1u), c2[%uu] == 0u ? 0u : max(c2[%uu] >> lq, 1u),"
-            " (lv >> 16) != 0u ? max(c2[%uu] >> lq, 1u) : c2[%uu], lv & 0xffffu);", A8, w + 3, w, w, w + 1, w + 1, w + 2, w + 2);
+    if (w + 3 > e->cb_max[2]) e->cb_max[2] = (uint16_t)(w + 3);
+    emit(e, "uint lq = %s; uint lv = cb2(%uu); uvec4 tq = uvec4(cb2(%uu) == 0u ? 0u : max(cb2(%uu) >> lq, 1u), cb2(%uu) == 0u ? 0u : max(cb2(%uu) >> lq, 1u),"
+            " (lv >> 16) != 0u ? max(cb2(%uu) >> lq, 1u) : cb2(%uu), lv & 0xffffu);", A8, w + 3, w, w, w + 1, w + 1, w + 2, w + 2);
     for (unsigned k = 0; k < 4; k++) {
         if (!(mask >> k & 1)) continue;
         if (r != 255) emit(e, " %s = tq[%u];", D(e, r), k);
@@ -1111,14 +1116,15 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         int off = (int)(int16_t)MXB(i, 20, 16);
         if (mode != 0) { fail(e, "LDC.IS", "LDC mode %u", mode); break; }
         e->cbufs |= 1u << cb;
-        emit(e, "uint ad = %s + 0x%08xu, w = c%u[ad >> 2];", A8, (uint32_t)off, cb);
+        if (cb < 18) e->cb_dyn |= 1u << cb;
+        emit(e, "uint ad = %s + 0x%08xu, w = cb%u(ad >> 2);", A8, (uint32_t)off, cb);
         switch (sz) {
         case 0: emit(e, " %s = bitfieldExtract(w, int((ad & 3u) * 8u), 8);", DST); break;
         case 1: emit(e, " %s = uint(bitfieldExtract(int(w), int((ad & 3u) * 8u), 8));", DST); break;
         case 2: emit(e, " %s = bitfieldExtract(w, int((ad & 2u) * 8u), 16);", DST); break;
         case 3: emit(e, " %s = uint(bitfieldExtract(int(w), int((ad & 2u) * 8u), 16));", DST); break;
         case 4: emit(e, " %s = w;", DST); break;
-        case 5: emit(e, " %s = w; %s = c%u[(ad >> 2) + 1u];", DST, D(e, rd == 255 ? 255 : rd + 1), cb); break;
+        case 5: emit(e, " %s = w; %s = cb%u((ad >> 2) + 1u);", DST, D(e, rd == 255 ? 255 : rd + 1), cb); break;
         default: fail(e, "LDC", "LDC size %u", sz); break;
         }
         break;
@@ -1675,7 +1681,17 @@ int mx_translate(const MxIn *in, MxOut *out) {
             emit(&h, "float mx_psize;\nvec4 mx_position;\n");
         }
         for (int k = 0; vk && k < e->nsmp; k++) emit(&h, "layout(set = 1, binding = %u) uniform %s mx_t%u_%s;\n", (unsigned)e->smp[k].binding, e->smp[k].type, (unsigned)e->smp[k].unit, e->smp[k].type);
-        for (unsigned n = 0; n < 18; n++) if (e->cbufs >> n & 1) emit(&h, "layout(std430, %sbinding = %u) readonly buffer CB%u { uint c%u[]; };\n", set0, in->binding_base + n, n, n);
+        {   unsigned ncb = 0;
+            for (unsigned n = 0; n < 18; n++) ncb += e->cbufs >> n & 1;
+            out->ubo = !vk && in->ubo && (in->stage == MX_VERTEX || in->stage == MX_FRAGMENT) && ncb <= 14 && !e->gubos;
+            for (unsigned n = 0; n < 18; n++) {
+                if (!(e->cbufs >> n & 1)) continue;
+                if (out->ubo) {                    /* fixed indices only: the block as large as they reach; computed ones: all 64 KB */
+                    unsigned vecs = e->cb_dyn >> n & 1 ? 4096u : e->cb_max[n] / 4u + 1u;
+                    emit(&h, "layout(std140, binding = %u) uniform CB%u { uvec4 c%u[%u]; };\nuint cb%u(uint i) { return c%u[i >> 2u][i & 3u]; }\n", in->ubo_base + n, n, n, vecs, n, n);
+                } else emit(&h, "layout(std430, %sbinding = %u) readonly buffer CB%u { uint c%u[]; };\nuint cb%u(uint i) { return c%u[i]; }\n", set0, in->binding_base + n, n, n, n, n);
+            }
+        }
         if (in->stage == MX_VERTEX) {
             int nclip = 0;
             for (int k = 0; k < 8; k++) if (e->clip_out >> k & 1) nclip = k + 1;
@@ -1748,7 +1764,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (e->uses_gmem) {
             emit(&h, "uint mx_ldg(uint ad) { uint o = (ad & 0x07ffffffu) >> 2; switch (ad >> 27) {\n");
             for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1) emit(&h, " case %uu: return s%u[o];\n", k + 1, k);
-            for (unsigned k = 0; k < 15; k++) if (e->gubos >> k & 1) emit(&h, " case %uu: return c%u[o];\n", 17 + k, 3 + k);
+            for (unsigned k = 0; k < 15; k++) if (e->gubos >> k & 1) emit(&h, " case %uu: return cb%u(o);\n", 17 + k, 3 + k);
             emit(&h, " } return 0u; }\n");
         }
         if (e->uses_gstore) {
