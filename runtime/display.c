@@ -659,7 +659,12 @@ void display_init(void) {
 
 /* Called after every presented frame (nvn_gl.c has already put it in the window): holds the caller to 60 Hz. */
 static volatile LONG g_interval = 1;         /* nvnWindowSetPresentInterval: display refreshes per presented frame (0 = do not wait) */
-void display_set_interval(int n) { InterlockedExchange(&g_interval, n < 0 ? 0 : n > 5 ? 5 : n); }
+void display_set_interval(int n) {
+    static int force = -2;                   /* EXPERIMENT TOMO_INTERVAL=<n>: the game's interval (2 = 30 fps) replaced (1 = 60 fps) */
+    if (force == -2) force = getenv("TOMO_INTERVAL") ? atoi(getenv("TOMO_INTERVAL")) : -1;
+    if (force >= 0) n = force;
+    InterlockedExchange(&g_interval, n < 0 ? 0 : n > 5 ? 5 : n);
+}
 void nvn_pf_pace(LONG64 ticks);            /* nvn_gl.c: timing scopes */
 /* SSBU_CLOCKSTAT=1: per 600 presented frames, the real time, the vsync signals sent, the refreshes the game counted
  * (its frame counter at 0x710593a440: 600 = one step per presented frame) and the refreshes this thread slept through. */

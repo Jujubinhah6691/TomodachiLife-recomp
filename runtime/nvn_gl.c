@@ -20,7 +20,7 @@
  *     top row, as in NVN; only the final blit to the window is flipped.
  *
  * Debug aids (environment): SSBU_SHOT=<n> / SSBU_SHOT_EVERY=<k> save presented frames as frame_<n>.bmp (in SSBU_SHOT_DIR if set, from frame SSBU_SHOT_FROM on, up to SSBU_SHOT_TO);
- * SSBU_RTDUMP=<n> saves every colour target at frame n; SSBU_DRAWSHOT=<n> the target after each draw
+ * SSBU_RTDUMP=<n> saves every colour target at frame n (SSBU_RTDUMP_ALPHA=1: also its alpha as _a.bmp); SSBU_DRAWSHOT=<n> the target after each draw
  * (with SSBU_DRAWSHOT_CLEAR, cleared before each); SSBU_DRAWLOG=<n> prints state, uniforms and textures of
  * every draw of frame n and writes the textures as tex_*.rgba; SSBU_SHADERDUMP=<dir> writes shader text,
  * machine code and generated GLSL; SSBU_NOSCISSOR, SSBU_SKIPDRAW=<i>, SSBU_FRAGDEBUG (magenta fragments),
@@ -3054,12 +3054,18 @@ static void bind_handle_table(int s, GLenum target, GLuint index, int skip) {
 static LONG64 g_prev_frame_draws, g_drawlog_frame = -1, g_disp_frames, g_frame_dispatch;
 static int g_drawlog_mindisp_n;     /* with SSBU_DRAWLOG_MIN=<n>: the first frame from <frame> on that follows a frame of at least n draws */
 static LONG64 g_dl_force[2] = {-1, -1};      /* TOMO_FLICKER_PERIOD: the frames predicted to flicker, and the one before */
+static int g_dlrt_n;                        /* draws logged by SSBU_DRAWLOG_RT */
 static int drawlog_now(void) {
     static int drawlog = -2, mindraws, mindisp;
     if (g_dl_force[0] >= 0 && (g_st.frames == g_dl_force[0] || g_st.frames == g_dl_force[1])) return 1;
     if (drawlog == -2) {
         drawlog = getenv("SSBU_DRAWLOG") ? atoi(getenv("SSBU_DRAWLOG")) : -1; mindraws = getenv("SSBU_DRAWLOG_MIN") ? atoi(getenv("SSBU_DRAWLOG_MIN")) : 0;
         mindisp = getenv("SSBU_DRAWLOG_MINDISP") ? atoi(getenv("SSBU_DRAWLOG_MINDISP")) : 0;
+    }
+    {   /* SSBU_DRAWLOG_RT=<w>x<h>: the draws into a colour target of that size, in any frame (at most SSBU_DRAWLOG_RT_MAX, 300) */
+        static int rw = -2, rh, rmax;
+        if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
+        if (rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && g_dlrt_n < rmax) return 1;
     }
     if (drawlog < 0) return 0;
     if (mindisp) {                             /* SSBU_DRAWLOG_MINDISP=<n>: SSBU_DRAWLOG then counts the frames that had at least n compute dispatches */
@@ -3343,9 +3349,11 @@ static int draw_prepare(void) {
         GLint sc[4], dfunc = 0;
         GLboolean cm[4];
         glGetFloatv(GL_VIEWPORT, vp); glGetIntegerv(GL_SCISSOR_BOX, sc); glGetBooleanv(GL_COLOR_WRITEMASK, cm); glGetIntegerv(GL_DEPTH_FUNC, &dfunc);
+        g_dlrt_n++;
         printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
                vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, glIsEnabled(GL_DEPTH_TEST), dfunc,
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
+        printf("  frame %lld\n", (long long)g_st.frames);
         if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x layer %d level %d view set 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format, g_rt0_layer, g_rt0_level, g_rt0_vset);
         for (int ci = 1; ci < 8; ci++) if (S.color[ci]) printf("  colour target %d: gl %u mem %p %dx%dx%d format 0x%x target %d\n", ci, S.color[ci]->o.gl, (void *)S.color[ci]->mem, S.color[ci]->b.width, S.color[ci]->b.height, S.color[ci]->b.depth, S.color[ci]->b.format, S.color[ci]->b.target);
         if (S.depth_tex) {
@@ -4778,7 +4786,10 @@ static void save_bmp(const char *path, Tex *t) {
     uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
     static const uint8_t pad[4];
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_BGR_, GL_UNSIGNED_BYTE, px);
+    if (t->b.depth == -1) {                         /* the alpha channel as grey (SSBU_RTDUMP_ALPHA) */
+        glReadPixels(0, 0, w, h, 0x1906 /* GL_ALPHA */, GL_UNSIGNED_BYTE, px);
+        for (int i = w * h - 1; i >= 0; i--) px[i * 3] = px[i * 3 + 1] = px[i * 3 + 2] = px[i];
+    } else glReadPixels(0, 0, w, h, GL_BGR_, GL_UNSIGNED_BYTE, px);
     FILE *f = fopen(path, "wb");
     if (!f) { free(px); return; }
     memcpy(head + 2, &size, 4);
@@ -5122,7 +5133,7 @@ static void job_present(void *arg) {
             }
         }
         if (getenv("SSBU_RTDUMP") && frame == atoi(getenv("SSBU_RTDUMP"))) {       /* debug: every colour target in use, as rt_<n>.bmp */
-            for (int k = 0; k < 256; k++) {
+            for (int k = 0; k < NFBO; k++) {
                 Tex fake;
                 char path[64];
                 GLint w = 0, h = 0;
@@ -5131,11 +5142,12 @@ static void job_present(void *arg) {
                 glBindTexture(GL_TEXTURE_2D, g_fbos[k].k.color[0]);
                 glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
                 glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-                if (w <= 0 || h <= 0) continue;
+                if (w <= 0 || h <= 0 || (w < 64 && h < 64)) continue;
                 memset(&fake, 0, sizeof fake);
                 fake.b.width = w; fake.b.height = h;
                 snprintf(path, sizeof path, "rt_%03d_gl%u.bmp", k, g_fbos[k].k.color[0]);
                 save_bmp(path, &fake);
+                if (getenv("SSBU_RTDUMP_ALPHA")) { fake.b.depth = -1; snprintf(path, sizeof path, "rt_%03d_gl%u_a.bmp", k, g_fbos[k].k.color[0]); save_bmp(path, &fake); }
             }
             glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_read);
         }
