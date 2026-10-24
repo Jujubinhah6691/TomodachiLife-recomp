@@ -1129,6 +1129,7 @@ static int rtlog_match(const Tex *t) {         /* TEST ONLY, TOMO_RTLOG=<w>x<h>[
 }
 static void tex_free_gl(Tex *t) {
     alias_handoff(t);
+    if (t->frz_snap) { glDeleteTextures(1, &t->frz_snap); t->frz_snap = 0; }
     {   unsigned i = g_freed_n % 16; int nv = 0;
         for (VNode *n = t->views; n; n = n->next) nv++;
         g_freed[i].gl = t->o.gl; g_freed[i].target = t->b.target; g_freed[i].format = t->b.format; g_freed[i].w = t->b.width; g_freed[i].h = t->b.height; g_freed[i].d = t->b.depth;
@@ -3279,6 +3280,42 @@ static void count_dummy_samples(void) {
 }
 #define PP(k) do { if (g_pp_on > 0) { LONG64 n_ = pf_now(); g_pp[k] += n_ - pp_t; pp_t = n_; } } while (0)
 static Range g_draw_ibuf;                     /* the index buffer of the draw being prepared (none for DrawArrays) */
+/* Frozen scenes. From the island-name screen on, the game stops drawing the island and draws its dialogs and menus over the
+ * last island picture left in the screen target, every frame, never clearing it. Drawn again and again over that picture,
+ * the translucent parts piled up here: the soft black cloud around a dialog hardened into streaks as it wobbled in, and the
+ * dimming behind "Add a Mii" turned the island black within a few frames. The console does not show that. So: a
+ * screen-sized target that gets 3D draws (with a depth target) is copied at its first draw without one in that frame (the
+ * picture before the 2D on top); in a later frame with no 3D draws, the copy goes back into it before its first draw.
+ * TOMO_FREEZE_RESTORE=0 turns this off. */
+static void frozen_scene(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("TOMO_FREEZE_RESTORE") || atoi(getenv("TOMO_FREEZE_RESTORE"));
+    Tex *t = S.color0;
+    if (!on || !t || t->dead || !t->o.gl || t->b.target != 1 || t->b.samples > 1 || t->b.width < 1280 || t->b.height < 720 || g_rt0_level > 0) return;
+    for (int i = 1; i < 8; i++) if (S.color[i]) return;
+    long long frame = (long long)g_st.frames + 1;
+    if (S.depth_tex) { t->frz_depth = frame; return; }
+    if (!t->frz_depth) return;
+    Fmt f;
+    if (!gl_has(glCopyImageSubData, "glCopyImageSubData") || !fmt_get(t->b.format, &f) || f.kind != 0) return;
+    if (t->frz_depth == frame) {                       /* the 3D of this frame is done: keep it */
+        if (t->frz_snapf == frame) return;
+        if (!t->frz_snap) {
+            const TexFormat *tf = tex_format(t->b.format);
+            glGenTextures(1, &t->frz_snap);
+            glBindTexture(GL_TEXTURE_2D, t->frz_snap);
+            glTexStorage2D(GL_TEXTURE_2D, 1, tf && tf->sw_decode && tf->gl_sw_internal ? tf->gl_sw_internal : f.internal, tw(t), th(t));
+        }
+        glCopyImageSubData(t->o.gl, GL_TEXTURE_2D, 0, 0, 0, 0, t->frz_snap, GL_TEXTURE_2D, 0, 0, 0, 0, tw(t), th(t), 1);
+        t->frz_snapf = frame;
+        return;
+    }
+    if (t->frz_snap && t->frz_snapf == t->frz_depth && t->frz_restf != frame) {   /* no 3D this frame (so far): the last 3D picture back */
+        glCopyImageSubData(t->frz_snap, GL_TEXTURE_2D, 0, 0, 0, 0, t->o.gl, GL_TEXTURE_2D, 0, 0, 0, 0, tw(t), th(t), 1);
+        t->frz_restf = frame;
+        static int said; if (!said++) printf("nvn_gl: frozen scene: the target %dx%d (gl %u) gets its last 3D picture back each frame (TOMO_FREEZE_RESTORE=0: off)\n", t->b.width, t->b.height, t->o.gl);
+    }
+}
 static int draw_prepare(void) {
     static int nlog;
     uint32_t ints = 0, sints = 0;
@@ -3333,6 +3370,7 @@ static int draw_prepare(void) {
     PP(0);
     if (!S.have_fbo || S.render_off) return 0;
     if (g_frame_draw_index++ == g_dbg_skipdraw) return 0;
+    frozen_scene();
     for (int i = 0; i < 16 && i < S.nattr; i++) {
         int size, norm, integer = 0;
         GLenum type;
@@ -4565,6 +4603,7 @@ static void exec(const Cmd *m, int depth) {
         unsigned i = (unsigned)a[0] & 7, mask = (unsigned)a[2];
         if (!S.have_fbo || S.render_off) break;
         memcpy(v, blob, 16);
+        if (S.color[i]) S.color[i]->frz_restf = (long long)g_st.frames + 1;      /* cleared by the game this frame: no frozen-scene restore (frozen_scene) */
         if (drawlog_now() || rtlog_match(S.color[i])) printf("clear: frame %lld colour %u of fbo %u (%dx%d, gl %u): %g %g %g %g mask %x\n", (long long)g_st.frames + 1, i, S.fbo, S.fbo_w, S.fbo_h,
                                                           S.color[i] ? S.color[i]->o.gl : 0, v[0], v[1], v[2], v[3], mask);
         glColorMaski(i, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);

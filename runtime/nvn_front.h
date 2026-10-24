@@ -56,6 +56,7 @@ typedef struct Tex {
     struct Tex *alias_from;                /* nvn_gl.c rt_alias_note: a texture of the same shape over the same memory that was a render target */
     long long rt_tick, alias_tick;         /* when it was last a render target / last took its alias's texels (one counter for all textures) */
     int rw, rh;                            /* nvn_gl.c resolution scale: the size of the GL storage (level 0) when it is not the game's; 0 = the game's */
+    long long frz_depth, frz_snapf, frz_restf; unsigned frz_snap;     /* nvn_gl.c frozen_scene: last frame with 3D draws, of the snapshot, of a restore; the snapshot's GL name */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; } TexPoolEnt;
