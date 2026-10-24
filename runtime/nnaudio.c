@@ -240,6 +240,22 @@ static void audio_InitializeAudioOutParameter(Ctx *c) {   /* (AudioOutParameter 
     wr16(A0 + 6, 0);
 }
 
+/* Shared by waveOut and Tomodachi's SDL renderer: test copies stay silent unless explicitly overridden. */
+int nnaudio_default_volume(void) {
+    char exe[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");
+    int gfx_volume(void);
+#ifdef _WIN32
+    int person = !_stricmp(base, "tomodachi_native.exe") || !_stricmp(base, "tomodachi_play.exe") || !_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe");
+#else
+    if (strrchr(base, '/')) base = strrchr(base, '/') + 1;
+    int person = !strcmp(base, "tomodachi_native") || !strcmp(base, "tomodachi_play") || !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user");
+#endif
+    int percent = vol ? atoi(vol) : person ? (gfx_volume() >= 0 ? gfx_volume() : 100) : 0;
+    return percent < 0 ? 0 : percent > 100 ? 100 : percent;
+}
+
 static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::SystemEvent *, const AudioOutParameter &) -> Result */
     unsigned want_rate = rd32(A2), want_channels = rd16(A2 + 4);
     EnterCriticalSection(&g_lock);
@@ -267,22 +283,7 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
         if (r != MMSYSERR_NOERROR) { g_wave = NULL; printf("nn::audio: waveOutOpen failed (%u): no sound, buffers are released by the clock\n", (unsigned)r); }
         else {
             waveOutPause(g_wave);                     /* nothing plays before StartAudioOut */
-            /* Test copies are silent: only the copies a person plays (ssbu_native.exe, ssbu_user.exe) are audible,
-             * like the window rule in display.c. The device stays open, so timing is the same as with sound.
-             * SSBU_VOLUME=<0..100> overrides either way. */
-            char exe[MAX_PATH] = "";
-            GetModuleFileNameA(NULL, exe, sizeof exe);
-            const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");
-            int gfx_volume(void);                     /* U1: graphics.ini volume = auto | 0..100, for the copies a person plays only (gfx_options.c) */
-#ifdef _WIN32
-            int person = !_stricmp(base, "tomodachi_native.exe") || !_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "ssbu_native_rb.exe");   /* (_rb: the rollback pair) */
-#else
-            if (strrchr(base, '/')) base = strrchr(base, '/') + 1;
-            int person = !strcmp(base, "tomodachi_native") || !strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user");      /* Linux build: no ".exe" */
-#endif
-            int percent = vol ? atoi(vol) : person ? (gfx_volume() >= 0 ? gfx_volume() : 100) : 0;
-            if (percent < 0) percent = 0;
-            if (percent > 100) percent = 100;
+            int percent = nnaudio_default_volume();
             DWORD level = (DWORD)(0xffff * percent / 100);
             waveOutSetVolume(g_wave, level | level << 16);
             g_host_percent = percent;
@@ -729,13 +730,18 @@ void register_audio_imports(void) {
 
 /* U1, the settings menu (menu.cpp): the host output volume (the game's whole mix; music and effects apart are the game's
  * own Options > Sound). -1 = no output device yet. */
-int nnaudio_volume(void) { return g_wave ? g_host_percent : -1; }
+int tomo_audio_volume(void);
+int tomo_audio_set_volume(int percent);
+int nnaudio_volume(void) { int sdl = tomo_audio_volume(); return sdl >= 0 ? sdl : g_wave ? g_host_percent : -1; }
 void nnaudio_set_volume(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
-    if (!g_wave) return;
-    DWORD level = (DWORD)(0xffff * percent / 100);
-    waveOutSetVolume(g_wave, level | level << 16);
-    g_host_percent = percent;
-    printf("nn::audio: host volume %d%% (settings menu)\n", percent);
+    int applied = tomo_audio_set_volume(percent);
+    if (g_wave) {
+        DWORD level = (DWORD)(0xffff * percent / 100);
+        waveOutSetVolume(g_wave, level | level << 16);
+        g_host_percent = percent;
+        applied = 1;
+    }
+    if (applied) printf("nn::audio: host volume %d%% (settings menu)\n", percent);
 }

@@ -347,20 +347,57 @@ static SilentVoice g_sv[1024];
 static SDL_AudioStream *g_audio_out;
 static int g_audio_on = -1;
 static float g_mix[240][2];
+int nnaudio_default_volume(void);
+int nnaudio_volume(void);
+void nnaudio_set_volume(int percent);
+int tomo_audio_volume(void) { return g_audio_out ? (int)(SDL_GetAudioStreamGain(g_audio_out) * 100.0f + 0.5f) : -1; }
+int tomo_audio_set_volume(int percent) { return g_audio_out && SDL_SetAudioStreamGain(g_audio_out, (float)percent / 100.0f); }
 static float rdf(uint64_t a) { uint32_t u = rd32(a); float f; memcpy(&f, &u, 4); return f; }
 static int audio_out_open(void) {
     if (g_audio_on >= 0) return g_audio_on;
     const char *e = getenv("TOMO_AUDIO");
     g_audio_on = 0;
-    if (e && e[0] == '0') return 0;
+    if ((e && e[0] == '0') || getenv("SSBU_AUDIO_MUTE")) return 0;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { printf("audio: SDL audio cannot start: %s (silent)\n", SDL_GetError()); return 0; }
     SDL_AudioSpec spec = {SDL_AUDIO_S16LE, 2, 48000};
     g_audio_out = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!g_audio_out) { printf("audio: no playback device: %s (silent)\n", SDL_GetError()); return 0; }
-    SDL_ResumeAudioStreamDevice(g_audio_out);
-    printf("audio: output 48 kHz stereo through SDL (TOMO_AUDIO=0 silences it)\n");
+    int percent = nnaudio_default_volume();
+    if (!tomo_audio_set_volume(percent) || !SDL_ResumeAudioStreamDevice(g_audio_out)) {
+        printf("audio: playback setup failed: %s (silent)\n", SDL_GetError());
+        SDL_DestroyAudioStream(g_audio_out); g_audio_out = NULL; return 0;
+    }
+    printf("audio: output 48 kHz stereo through SDL, host volume %d%% (TOMO_AUDIO=0 silences it)\n", percent);
     g_audio_on = 1;
     return 1;
+}
+static void audio_volume_selftest(void) {
+    const char *test = getenv("SSBU_AUDIO_VOLUME_SELFTEST");
+    if (!test) return;
+    int expected = atoi(test), bad = 0;
+    if (!SDL_SetHintWithPriority(SDL_HINT_AUDIO_DRIVER, "dummy", SDL_HINT_OVERRIDE)) {
+        printf("audio-volume self-test: cannot select dummy driver: FAIL\n"); fflush(stdout); ExitProcess(1);
+    }
+    int opened = audio_out_open();
+    if (expected < 0) {
+        nnaudio_set_volume(100);
+        bad = opened || g_audio_out || nnaudio_volume() != -1;
+    } else {
+        float want = (float)expected / 100.0f;
+        bad = !opened || nnaudio_volume() != expected || !g_audio_out;
+        if (g_audio_out) {
+            bad |= SDL_GetAudioStreamGain(g_audio_out) != want;
+            const int input[] = {-10, 23, 150, 0}, output[] = {0, 23, 100, 0};
+            for (int i = 0; i < 4; i++) {
+                nnaudio_set_volume(input[i]);
+                bad |= nnaudio_volume() != output[i] || SDL_GetAudioStreamGain(g_audio_out) != (float)output[i] / 100.0f;
+            }
+        }
+    }
+    printf("audio-volume self-test: startup %d%%, SDL gain/getter/live setter/clamps: %s\n", expected, bad ? "FAIL" : "PASS");
+    if (g_audio_out) { SDL_DestroyAudioStream(g_audio_out); g_audio_out = NULL; }
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    fflush(stdout); ExitProcess(bad ? 1 : 0);
 }
 static void audio_out_frame(void) {
     if (!g_audio_out) return;
@@ -1172,6 +1209,7 @@ static const ImportDef tomo_overrides[] = {
     {"_ZN2nn2os26GetThreadAvailableCoreMaskEv", ret7},
 };
 void register_tomo_imports(void) {
+    audio_volume_selftest();                     /* SSBU_AUDIO_VOLUME_SELFTEST=<expected startup percent>, -1 for no device */
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);
     register_imports(tomo_overrides, (int)(sizeof tomo_overrides / sizeof tomo_overrides[0]));
