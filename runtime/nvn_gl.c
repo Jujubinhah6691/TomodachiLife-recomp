@@ -164,7 +164,7 @@ static void vk_shutdown_at_exit(void);
     X(void, CopyNamedBufferSubData, (GLuint, GLuint, ptrdiff_t, ptrdiff_t, ptrdiff_t)) \
     X(void, MemoryBarrier, (GLbitfield)) \
     X(void, BindImageTexture, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum)) \
-    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))
+    X(void, DebugMessageCallback, (void *, const void *))     X(GLuint, CreateShaderProgramv, (GLenum, GLsizei, const char *const *))     X(void, GenProgramPipelines, (GLsizei, GLuint *))     X(void, BindProgramPipeline, (GLuint))     X(void, UseProgramStages, (GLuint, GLbitfield, GLuint))     X(void, GetProgramiv, (GLuint, GLenum, GLint *))     X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, char *))     X(void, DeleteProgram, (GLuint))     X(void, ProgramUniform2ui, (GLuint, GLint, GLuint, GLuint))     X(void, ProgramUniform1f, (GLuint, GLint, GLfloat))     X(void, PolygonOffsetClamp, (GLfloat, GLfloat, GLfloat))     X(void, ClearBufferiv, (GLenum, GLint, const GLint *))     X(void, ClearBufferuiv, (GLenum, GLint, const GLuint *))     X(void, SampleMaski, (GLuint, GLbitfield))     X(void, GetTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, GLsizei, void *))     X(void, GetCompressedTextureSubImage, (GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLsizei, void *))     X(void, GenQueries, (GLsizei, GLuint *))     X(void, BeginQuery, (GLenum, GLuint))     X(void, EndQuery, (GLenum))     X(void, GetQueryObjectuiv, (GLuint, GLenum, GLuint *))
 #define X(ret, name, args) static ret (APIENTRY *gl##name) args;
 GLF(X)
 #undef X
@@ -652,6 +652,32 @@ static volatile LONG64 g_handles_live, g_tex_live;       /* resident bindless ha
  * Tomodachi Life makes its render targets anew every frame (a dozen a frame in the island), and deleting and recreating
  * their GL objects each frame crashed the driver in glDeleteTextures after some 2400 frames. Only GPU-written textures
  * (CPU_NO_ACCESS pools) are kept: nothing is ever uploaded into them, so stale texels are what the pool memory holds too. */
+/* Resolution scale (graphics.ini resolution_scale; TOMO_SCALE wins), the OpenGL side of nvn_vk_draw.c's track O: a
+ * texture of the screen class (2D, one sample, not block-compressed, the game's size exactly 1920x1080 >> k) gets GL
+ * storage of round(size * scale) (Tex.rw / rh); what the game says in ITS pixels about such a texture (viewports,
+ * scissors, clear and copy rectangles, uploads, read-backs, the present) is converted where it is used, and fragment
+ * stages map gl_FragCoord and texelFetch back to the game's grid (MxIn.screen_scale). At 1.0 none of it runs. */
+static float g_rsf = -1.0f;
+static float rs_factor(void) {
+    if (g_rsf < 0) {
+        const char *e = getenv("TOMO_SCALE");
+        float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
+        g_rsf = v < 0.5f ? 0.5f : v > 3.0f ? 3.0f : v;
+    }
+    return g_rsf;
+}
+static int rs_on(void) { return rs_factor() != 1.0f; }
+static int rs_class(const TexBuilder *b) {
+    Fmt f;
+    if (!rs_on() || b->target != 1 || b->samples > 1 || b->depth > 1 || (b->flags & 0x10) || !fmt_get(b->format, &f) || f.kind == 4) return 0;
+    for (int k = 0; k < 7; k++) if (b->width == 1920 >> k && b->height == 1080 >> k) return 1;
+    return 0;
+}
+static int tw(const Tex *t) { return t->rw ? t->rw : t->b.width > 0 ? t->b.width : 1; }       /* the GL storage's level-0 size */
+static int th(const Tex *t) { return t->rh ? t->rh : t->b.height > 0 ? t->b.height : 1; }
+static int rsx(const Tex *t, int v) { return t->rw ? (int)floorf((float)v * (float)t->rw / (float)t->b.width + 0.5f) : v; }      /* the game's x on t -> storage texels */
+static int rsy(const Tex *t, int v) { return t->rh ? (int)floorf((float)v * (float)t->rh / (float)t->b.height + 0.5f) : v; }
+
 #define SPARE_KEY (offsetof(TexBuilder, layout))        /* flags .. has_layout, swz: what tex_realize makes the storage from */
 #define SPARE_MAX 96
 static struct { TexBuilder b; TexObj o; VNode *views; int glevels; } g_spare[SPARE_MAX];
@@ -693,6 +719,11 @@ static void tex_realize(Tex *t) {
     static int nlog, nbad;
     Fmt f;
     TexBuilder *b = &t->b;
+    t->rw = t->rh = 0;
+    if (rs_class(b)) {
+        t->rw = (int)((float)b->width * rs_factor() + 0.5f); t->rh = (int)((float)b->height * rs_factor() + 0.5f);
+        if (t->rw < 1) t->rw = 1; if (t->rh < 1) t->rh = 1;
+    }
     if (tex_take_spare(t)) return;
     if (!fmt_get(b->format, &f)) {
         g_st.unknown_fmt++;
@@ -705,6 +736,11 @@ static void tex_realize(Tex *t) {
     if (b->target == 2 && d > maxdim) maxdim = d;
     while ((maxdim >> maxl) > 0) maxl++;
     if (levels > maxl) levels = maxl;
+    if (t->rw) {                                       /* resolution scale: the storage's size (and the levels it can have) */
+        w = t->rw; h = t->rh; maxdim = w > h ? w : h; maxl = 1;
+        while ((maxdim >> maxl) > 0) maxl++;
+        if (levels > maxl) levels = maxl;
+    }
     t->glevels = levels;
     while (glGetError()) {}
     glGenTextures(1, &t->o.gl);
@@ -737,8 +773,11 @@ static void tex_realize(Tex *t) {
 }
 
 /* One level (one layer / face, or all slices of a 3D level) of tightly packed texels into the GL texture. */
+static void rs_put(Tex *t, const Fmt *f, int level, int x, int y, int w, int h, const void *data);
+static void rs_get(Tex *t, int level, int x, int y, int w, int h, GLenum fo, GLenum ty, GLsizei bytes, void *out);
 static void tex_put(Tex *t, const Fmt *f, int level, int layer, int x, int y, int z, int w, int h, int d, const void *data) {
     GLenum tg = gl_target(t->b.target, t->b.samples);
+    if (t->rw && tg == GL_TEXTURE_2D && f->kind != 4) { rs_put(t, f, level, x, y, w, h, data); return; }      /* resolution scale */
     GLsizei size = (GLsizei)(((size_t)(w + f->bw - 1) / f->bw) * ((size_t)(h + f->bh - 1) / f->bh) * f->bpb * (size_t)d);
     glBindTexture(tg, t->o.gl);
     switch (tg) {
@@ -961,7 +1000,7 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
         static int novc = -1; if (novc < 0) novc = getenv("TOMO_NOVIEWCOPY") != NULL;
         if (!novc && t->gpu_written && same_shape && memcmp(e.swz, base.swz, 4) && t->b.samples <= 1 && f.kind == 0 && (tg == GL_TEXTURE_2D || tg == GL_TEXTURE_2D_ARRAY_)
             && gl_has(glCopyImageSubData, "glCopyImageSubData")) {
-            int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1;
+            int w = tw(t), hgt = th(t);
             while (glGetError()) {}
             glGenTextures(1, &n->o.gl);
             glBindTexture(tg, n->o.gl);
@@ -1532,7 +1571,7 @@ static GLuint g_pipeline;
  * Shared GL programs are never deleted (a few thousand at most: the game has about 6,900 distinct stages). Per-draw state
  * of a program (the alpha-test uniform) is set at every draw that uses it, so sharing does not change what is drawn.
  * Entries are found by 64-bit hashes of the contents (plus length, stage and key compared exactly). */
-typedef struct ShEnt { uint64_t h; int stage, code_len; uint32_t key[4]; GLuint prog; uint32_t cbufs, ssbos, in_attr, tex_units, ssbo_written; int uses_alpha; struct ShEnt *next; } ShEnt;
+typedef struct ShEnt { uint64_t h; int stage, code_len; uint32_t key[4]; GLuint prog; uint32_t cbufs, ssbos, in_attr, tex_units, ssbo_written; int uses_alpha, uses_fcs; struct ShEnt *next; } ShEnt;
 typedef struct ShSrc { uint64_t h; size_t len; GLuint prog; struct ShSrc *next; char *text; } ShSrc;
 static ShSrc *g_prog_src[65536];                 /* P3 round 3: GL stage program -> its text record (pair programs) */
 static GLuint g_pair_cur;                        /* the linked pair program in use (glUseProgram), 0 = none */
@@ -1805,7 +1844,7 @@ static char *pw_translate(int stage, const uint8_t *code, int code_len, const ui
     in.stage = stage; in.code = code; in.code_len = code_len;
     if (cdata_size) { in.cdata = cdata; in.cdata_size = cdata_size; }
     in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL;
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
     if (!mx_translate(&in, &out)) return NULL;
     if (in_attr) *in_attr = out.in_attr;
     return out.glsl;
@@ -2017,7 +2056,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         if (j->cdata_size) { in.cdata = j->data + j->code_len; in.cdata_size = j->cdata_size; }
         in.binding_base = (unsigned)j->stage * 20; in.ssbo_base = 40 + (unsigned)j->stage * 16;
         in.int_attrs = j->key[0]; in.sint_attrs = j->key[1]; in.int_tex = j->key[2]; in.sint_tex = j->key[3];
-        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL;
+        in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
         if (mx_translate(&in, &out)) {
             char path[320];
             size_t len = strlen(out.glsl);
@@ -2322,7 +2361,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
             if (e->h == h1 && e->stage == s && e->code_len == st->code_len && !memcmp(e->key, key, 16)) {
                 st->glsl = e->prog; st->glsl_state = 1;
                 memcpy(st->glsl_key, key, sizeof st->glsl_key);
-                st->glsl_cbufs = e->cbufs; st->glsl_ssbos = e->ssbos; st->glsl_dep = e->in_attr; st->glsl_tex = e->tex_units; st->glsl_alpha = e->uses_alpha; st->glsl_ssbo_w = e->ssbo_written;
+                st->glsl_cbufs = e->cbufs; st->glsl_ssbos = e->ssbos; st->glsl_dep = e->in_attr; st->glsl_tex = e->tex_units; st->glsl_alpha = e->uses_alpha; st->glsl_fcs = e->uses_fcs; st->glsl_ssbo_w = e->ssbo_written;
                 g_shc_hit++;
                 return 1;
             }
@@ -2339,7 +2378,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     }
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
     in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16;
-    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL;
+    in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on();
     LONG64 pf0 = pf_now();
     int xl;
     { HS_IN("shader translate (machine code to GLSL)", 0); xl = mx_translate(&in, &out); HS_OUT(); }
@@ -2433,12 +2472,12 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     free(src);
     st->glsl_state = 1;
     memcpy(st->glsl_key, key, sizeof st->glsl_key);
-    st->glsl_cbufs = out.cbufs; st->glsl_ssbos = out.ssbos; st->glsl_dep = out.in_attr; st->glsl_tex = out.tex_units; st->glsl_alpha = out.uses_alpha; st->glsl_ssbo_w = out.ssbo_written;
+    st->glsl_cbufs = out.cbufs; st->glsl_ssbos = out.ssbos; st->glsl_dep = out.in_attr; st->glsl_tex = out.tex_units; st->glsl_alpha = out.uses_alpha; st->glsl_fcs = out.uses_fcs; st->glsl_ssbo_w = out.ssbo_written;
     if (out.ssbo_written) { static int nw; logf_limited(&nw, 5, "nvn_gl: program #%d %s stage writes storage buffers (mask 0x%x): kept in GL buffers and copied back to guest memory\n", p->serial, k_stage_name[s], out.ssbo_written); }
     if (!g_shc_off) {
         ShEnt *e = calloc(1, sizeof *e);
         e->h = h1; e->stage = s; e->code_len = st->code_len; memcpy(e->key, key, 16); e->prog = st->glsl;
-        e->cbufs = out.cbufs; e->ssbos = out.ssbos; e->in_attr = out.in_attr; e->tex_units = out.tex_units; e->ssbo_written = out.ssbo_written; e->uses_alpha = out.uses_alpha;
+        e->cbufs = out.cbufs; e->ssbos = out.ssbos; e->in_attr = out.in_attr; e->tex_units = out.tex_units; e->ssbo_written = out.ssbo_written; e->uses_alpha = out.uses_alpha; e->uses_fcs = out.uses_fcs;
         e->next = g_shc[h1 & 4095]; g_shc[h1 & 4095] = e;
     }
     g_st.glsl_ok++;
@@ -2704,6 +2743,9 @@ static struct {
     int attr_enabled[16];
     uint8_t ms[24]; unsigned ms_ext;              /* the bound multisample state, and which of its extensions are on in OpenGL */
     int sc0[4], render_off, debug_depth, sample_shading;
+    float gvp[16][4], prs;                     /* resolution scale: the game's viewports, and the scale of the targets bound (0 = 1) */
+    int gsc[16][4];                            /* ... and its scissors */
+    uint32_t gvp_set;
 } S;
 static void fbo_drop_bound(GLuint fbo) { if (S.have_fbo && S.fbo == fbo) { S.have_fbo = 0; glBindFramebuffer(GL_FRAMEBUFFER_, 0); } }
 
@@ -2759,7 +2801,7 @@ static Tex *tex_scratch(Tex *t) {
     int layers = t->b.target == 2 ? 0 : tex_layers(&t->b);
     LONG64 pf0 = pf_now();
     for (int l = 0; l < t->glevels && l < sc->glevels; l++) {
-        int w = lvl(t->b.width, l), h = lvl(t->b.height, l), d = t->b.target == 2 ? lvl(t->b.depth, l) : layers;
+        int w = lvl(tw(t), l), h = lvl(th(t), l), d = t->b.target == 2 ? lvl(t->b.depth, l) : layers;
         glCopyImageSubData(t->o.gl, tg, l, 0, 0, 0, sc->o.gl, tg, l, 0, 0, 0, w, h, d);
     }
     pf_add(PF_FEEDBACK, pf0);
@@ -2780,7 +2822,7 @@ static void feedback_restore(void) {
 static int feedback_copy_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOMO_FEEDBACK_COPY"); v = e ? atoi(e) : 0; } return v; }
 static void view_copy_fill(Tex *t, VNode *n) {
     GLenum tg = gl_target(n->e.target, t->b.samples);
-    int w = t->b.width > 0 ? t->b.width : 1, hgt = t->b.height > 0 ? t->b.height : 1;
+    int w = tw(t), hgt = th(t);
     for (int l = 0; l < n->e.nlvl; l++)
         glCopyImageSubData(t->o.gl, tg, l, 0, 0, 0, n->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(hgt, l), tg == GL_TEXTURE_2D ? 1 : n->e.nlay);
     n->copy_gen = t->rt_gen;
@@ -2958,7 +3000,7 @@ static void alias_refresh(Tex *t) {
     for (int i = 0; i < 8; i++) if (S.color[i] == a) return;           /* still being drawn: later */
     if (!gl_has(glCopyImageSubData, "glCopyImageSubData")) return;
     GLenum tg = gl_target(t->b.target, t->b.samples);
-    int w = t->b.width > 0 ? t->b.width : 1, h = t->b.height > 0 ? t->b.height : 1, d = tex_layers(&t->b);
+    int w = tw(t), h = th(t), d = tex_layers(&t->b);
     for (int l = 0; l < t->glevels && l < a->glevels; l++)
         glCopyImageSubData(a->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
     t->alias_tick = a->rt_tick;
@@ -2982,11 +3024,29 @@ static void alias_pull(Tex *t) {
     ReleaseSRWLockShared(&g_tex_range_lock);
     if (!best || !gl_has(glCopyImageSubData, "glCopyImageSubData")) return;
     GLenum tg = gl_target(t->b.target, t->b.samples);
-    int w = t->b.width > 0 ? t->b.width : 1, h = t->b.height > 0 ? t->b.height : 1, d = tex_layers(&t->b);
+    int w = tw(t), h = th(t), d = tex_layers(&t->b);
     for (int l = 0; l < t->glevels && l < best->glevels; l++)
         glCopyImageSubData(best->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
     t->alias_tick = best->rt_tick;
     {   static int nlog; logf_limited(&nlog, 5, "nvn_gl: render target %dx%d format 0x%x takes the picture of the texture drawn last over its memory (another texture object)\n", t->b.width, t->b.height, t->b.format); }
+}
+static int g_dbg_noscissor;                       /* SSBU_NOSCISSOR (below) */
+/* Resolution scale: viewports and scissors are kept in the game's pixels and set on the bound targets' storage. */
+static void apply_vp(int i) {
+    float s = S.prs ? S.prs : 1.0f;
+    glViewportIndexedf((GLuint)i, S.gvp[i][0] * s, S.gvp[i][1] * s, S.gvp[i][2] * s, S.gvp[i][3] * s);
+}
+static void apply_sc(int i) {
+    const int *v = S.gsc[i];
+    if (!S.prs || v[2] >= 16384) { glScissorIndexed((GLuint)i, v[0], v[1], v[2], v[3]); return; }
+    int x0 = (int)floorf((float)v[0] * S.prs + 0.5f), y0 = (int)floorf((float)v[1] * S.prs + 0.5f);
+    glScissorIndexed((GLuint)i, x0, y0, (int)floorf((float)(v[0] + v[2]) * S.prs + 0.5f) - x0, (int)floorf((float)(v[1] + v[3]) * S.prs + 0.5f) - y0);
+}
+static void rs_pass(Tex *t) {                         /* the scale of the targets now bound (their first): viewports and scissors follow */
+    float s = t && t->rw ? (float)t->rw / (float)t->b.width : 0.0f;
+    if (s == S.prs) return;
+    S.prs = s;
+    for (int i = 0; i < 16; i++) { if (S.gvp_set >> i & 1) apply_vp(i); if (!g_dbg_noscissor) apply_sc(i); }
 }
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
@@ -3028,6 +3088,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         if (!S.fbo_w) { S.fbo_w = t->b.width; S.fbo_h = t->b.height; }
     }
     g_rt0_layer = k.layer[0]; g_rt0_level = k.level[0]; g_rt0_vset = n ? col[0].view.set : 0;
+    if (g_rsf != 1.0f) rs_pass(S.color0 ? S.color0 : S.depth_tex);
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
     g_fbo_bad_last = 0;
     S.fbo = fbo_get(&k);
@@ -3055,6 +3116,13 @@ static LONG64 g_prev_frame_draws, g_drawlog_frame = -1, g_disp_frames, g_frame_d
 static int g_drawlog_mindisp_n;     /* with SSBU_DRAWLOG_MIN=<n>: the first frame from <frame> on that follows a frame of at least n draws */
 static LONG64 g_dl_force[2] = {-1, -1};      /* TOMO_FLICKER_PERIOD: the frames predicted to flicker, and the one before */
 static int g_dlrt_n;                        /* draws logged by SSBU_DRAWLOG_RT */
+/* SSBU_DRAWLOG_RT=<w>x<h>: the draws into a colour target of that size, in any frame (at most SSBU_DRAWLOG_RT_MAX, 300);
+ * SSBU_DRAWLOG_RT_SHOT=1: also the target after each of them (dlrt_<n>.bmp and its alpha, dlrt_<n>_a.bmp) */
+static int dlrt_match(void) {
+    static int rw = -2, rh, rmax;
+    if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
+    return rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && g_dlrt_n < rmax;
+}
 static int drawlog_now(void) {
     static int drawlog = -2, mindraws, mindisp;
     if (g_dl_force[0] >= 0 && (g_st.frames == g_dl_force[0] || g_st.frames == g_dl_force[1])) return 1;
@@ -3062,11 +3130,7 @@ static int drawlog_now(void) {
         drawlog = getenv("SSBU_DRAWLOG") ? atoi(getenv("SSBU_DRAWLOG")) : -1; mindraws = getenv("SSBU_DRAWLOG_MIN") ? atoi(getenv("SSBU_DRAWLOG_MIN")) : 0;
         mindisp = getenv("SSBU_DRAWLOG_MINDISP") ? atoi(getenv("SSBU_DRAWLOG_MINDISP")) : 0;
     }
-    {   /* SSBU_DRAWLOG_RT=<w>x<h>: the draws into a colour target of that size, in any frame (at most SSBU_DRAWLOG_RT_MAX, 300) */
-        static int rw = -2, rh, rmax;
-        if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
-        if (rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && g_dlrt_n < rmax) return 1;
-    }
+    if (dlrt_match()) return 1;
     if (drawlog < 0) return 0;
     if (mindisp) {                             /* SSBU_DRAWLOG_MINDISP=<n>: SSBU_DRAWLOG then counts the frames that had at least n compute dispatches */
         if (g_drawlog_frame < 0 && g_disp_frames >= drawlog) g_drawlog_frame = g_st.frames;
@@ -3231,6 +3295,7 @@ static int draw_prepare(void) {
             if (ss != S.sample_shading) { S.sample_shading = ss; if (ss == 1 && gl_has(glMinSampleShading, "glMinSampleShading")) { glEnable(0x8C36 /* SAMPLE_SHADING */); glMinSampleShading(1.0f); } else glDisable(0x8C36); }
         }
         if (!depth_only && S.prog[1]->st[1].glsl_alpha) { uint32_t ref; memcpy(&ref, &S.alpha_ref, 4); glProgramUniform2ui(pair ? pair : S.prog[1]->st[1].glsl, 0, (GLuint)S.alpha_func, ref); }
+        if (!depth_only && S.prog[1]->st[1].glsl_fcs) glProgramUniform1f(pair ? pair : S.prog[1]->st[1].glsl, 1, S.prs ? 1.0f / S.prs : 1.0f);      /* resolution scale: game pixels per real one */
         for (int s = 0; s < (depth_only ? 1 : 2); s++) {
             Stage *st = &S.prog[s]->st[s];
             for (unsigned n = 0; n < 16; n++)
@@ -3353,7 +3418,11 @@ static int draw_prepare(void) {
         printf("draw: fbo %u (%dx%d) viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d vs #%d fs #%d depth %d(func %x) stencil %d blend %d cull %d alpha %d mask %d%d%d%d\n", S.fbo, S.fbo_w, S.fbo_h,
                vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], S.prog[0] ? S.prog[0]->serial : -1, S.prog[1] ? S.prog[1]->serial : -1, glIsEnabled(GL_DEPTH_TEST), dfunc,
                glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_BLEND), glIsEnabled(GL_CULL_FACE), S.alpha_func, cm[0], cm[1], cm[2], cm[3]);
-        printf("  frame %lld\n", (long long)g_st.frames);
+        {   GLint bf[6] = {0, 0, 0, 0, 0, 0};
+            static const GLenum q[6] = {0x80C9 /* SRC_RGB */, 0x80C8 /* DST_RGB */, 0x80CB /* SRC_ALPHA */, 0x80CA /* DST_ALPHA */, 0x8009 /* EQUATION_RGB */, 0x883D /* EQUATION_ALPHA */};
+            for (int i = 0; i < 6; i++) glGetIntegerv(q[i], &bf[i]);
+            printf("  frame %lld | blend 0: rgb 0x%x 0x%x alpha 0x%x 0x%x eq 0x%x 0x%x | framebuffer srgb %d\n", (long long)g_st.frames, bf[0], bf[1], bf[2], bf[3], bf[4], bf[5], glIsEnabled(0x8DB9));
+        }
         if (S.color0) printf("  colour target 0: gl %u mem %p %dx%d format 0x%x layer %d level %d view set 0x%x\n", S.color0->o.gl, (void *)S.color0->mem, S.color0->b.width, S.color0->b.height, S.color0->b.format, g_rt0_layer, g_rt0_level, g_rt0_vset);
         for (int ci = 1; ci < 8; ci++) if (S.color[ci]) printf("  colour target %d: gl %u mem %p %dx%dx%d format 0x%x target %d\n", ci, S.color[ci]->o.gl, (void *)S.color[ci]->mem, S.color[ci]->b.width, S.color[ci]->b.height, S.color[ci]->b.depth, S.color[ci]->b.format, S.color[ci]->b.target);
         if (S.depth_tex) {
@@ -3364,6 +3433,13 @@ static int draw_prepare(void) {
                    dm, dr[0], dr[1], po[0], po[1], glIsEnabled(0x8037 /* POLYGON_OFFSET_FILL */), clampd);
         }
         for (int s = 0; s < 2; s++) {
+            if (S.prog[s] && S.prog[s]->st[s].cdata_copy) {     /* the stage's own constants (c1: jump tables) */
+                const Stage *cs = &S.prog[s]->st[s];
+                const uint32_t *w = (const uint32_t *)cs->cdata_copy;
+                printf("  %s constants (c1, %u bytes at +0x%x):", k_stage_name[s], cs->ctl[3], cs->ctl[4]);
+                for (unsigned i = 0; i < cs->ctl[3] / 4 && i < 24; i++) printf(" %08x", w[i]);
+                printf("\n");
+            }
             printf("  %s buffers:", k_stage_name[s]);
             for (int n = 0; n < 16; n++) if (S.ubo[s][n].addr) printf(" c%d=%llx+%llu", n, (unsigned long long)S.ubo[s][n].addr, (unsigned long long)S.ubo[s][n].size);
             for (int n = 0; n < 16; n++)
@@ -3374,7 +3450,7 @@ static int draw_prepare(void) {
                     printf(" ]");
                 }
             printf("  textures:");
-            for (int n = 0; n < 16; n++) if (S.nvn_tex[s][n]) printf(" %d:%llx%s", n, (unsigned long long)S.nvn_tex[s][n], S.gl_tex[s][4 + n] == g_dummy_handle ? "(dummy)" : "");
+            for (int n = 0; n < 32; n++) if (S.nvn_tex[s][n]) printf(" %d:%llx%s", n, (unsigned long long)S.nvn_tex[s][n], S.gl_tex[s][4 + n] == g_dummy_handle ? "(dummy)" : "");
             printf("\n");
             for (int n = 0; n < 16; n++)
                 if (S.ubo[s][n].addr && S.prog[s] && (S.prog[s]->st[s].glsl_cbufs >> (n + 3) & 1)) {
@@ -3412,7 +3488,7 @@ static int draw_prepare(void) {
                         }
                     }
                 }
-            for (int n = 0; n < 16; n++) {
+            for (int n = 0; n < 32; n++) {
                 uint32_t tid = (uint32_t)S.nvn_tex[s][n] & 0xfffff;
                 Tex *t = S.tpool && tid && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
                 static uint8_t seen[0x4000];
@@ -3731,6 +3807,7 @@ static void compute_bind_glsl(Prog *p) {
         tex_sync(t);
         int level = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, w = (st->glsl_images_w >> k & 1) != 0;
         GLenum fmt = st->glsl_img_fmt[k] ? st->glsl_img_fmt[k] : fmt_get(t->b.format, &f) ? f.internal : 0x8058;
+        if (t->rw) { static int said; if (!said++) printf("nvn_gl: resolution scale: a compute stage uses a scaled texture (%dx%d format 0x%x) as an image: its coordinates are the game's (not converted)\n", t->b.width, t->b.height, t->b.format); }
         glBindImageTexture((GLuint)k, tex_view_obj(t, &v)->gl, level, GL_TRUE, 0, w ? ((st->glsl_images_r >> k & 1) ? 0x88BA : 0x88B9) : 0x88B8, fmt);
         if (w) { t->gpu_written = 1; t->uploaded = 1; }
     }
@@ -3917,9 +3994,57 @@ static GLuint temp_fbo(GLenum target, GLuint slot_fbo, Tex *t, const View *v) {
     return (GLuint)(kind == 3 ? GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT : kind == 1 ? GL_DEPTH_BUFFER_BIT : kind == 2 ? GL_STENCIL_BUFFER_BIT : GL_COLOR_BUFFER_BIT);
 }
 static GLuint g_fbo_tmp[2];
+/* Resolution scale: texels of the game's grid to and from a scaled texture, through a temporary texture of the game's
+ * rectangle (one level, one layer) blitted to / from the scaled storage. */
+static GLuint rs_temp(Tex *t, int w, int h, GLbitfield *mask, GLenum *att) {
+    Fmt f;
+    GLuint tmp = 0;
+    if (!fmt_get(t->b.format, &f)) return 0;
+    *mask = f.kind == 0 ? GL_COLOR_BUFFER_BIT : f.kind == 1 ? GL_DEPTH_BUFFER_BIT : f.kind == 2 ? GL_STENCIL_BUFFER_BIT : GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+    *att = f.kind == 0 ? GL_COLOR_ATTACHMENT0_ : f.kind == 1 ? GL_DEPTH_ATTACHMENT_ : f.kind == 2 ? GL_STENCIL_ATTACHMENT_ : GL_DEPTH_STENCIL_ATTACHMENT_;
+    glGenTextures(1, &tmp);
+    glBindTexture(GL_TEXTURE_2D, tmp);
+    glTexStorage2D(GL_TEXTURE_2D, 1, f.internal, w, h);
+    return tmp;
+}
+static void rs_blit(GLuint from, int fl, GLuint to, int tl, GLenum att, const int *a, const int *b, GLbitfield mask) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_tmp[0]); glFramebufferTexture(GL_READ_FRAMEBUFFER_, att, from, fl);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1]); glFramebufferTexture(GL_DRAW_FRAMEBUFFER_, att, to, tl);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_FRAMEBUFFER_SRGB_);
+    glBlitFramebuffer(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], mask, mask == GL_COLOR_BUFFER_BIT ? GL_LINEAR : GL_NEAREST);
+    glEnable(GL_FRAMEBUFFER_SRGB_); glEnable(GL_SCISSOR_TEST);
+    fbo_detach(g_fbo_tmp[0]); fbo_detach(g_fbo_tmp[1]);
+    glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
+}
+static void rs_put(Tex *t, const Fmt *f, int level, int x, int y, int w, int h, const void *data) {
+    GLbitfield mask; GLenum att;
+    GLuint tmp = rs_temp(t, w, h, &mask, &att);
+    if (!tmp) return;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, f->format, f->type, data);
+    int a[4] = {0, 0, w, h}, b[4] = {rsx(t, x), rsy(t, y), rsx(t, x + w), rsy(t, y + h)};
+    rs_blit(tmp, 0, t->o.gl, level, att, a, b, mask);
+    glDeleteTextures(1, &tmp);
+}
+static void rs_get(Tex *t, int level, int x, int y, int w, int h, GLenum fo, GLenum ty, GLsizei bytes, void *out) {
+    GLbitfield mask; GLenum att;
+    GLuint tmp = rs_temp(t, w, h, &mask, &att);
+    if (!tmp) return;
+    int a[4] = {rsx(t, x), rsy(t, y), rsx(t, x + w), rsy(t, y + h)}, b[4] = {0, 0, w, h};
+    rs_blit(t->o.gl, level, tmp, 0, att, a, b, mask);
+    glGetTextureSubImage(tmp, 0, 0, 0, 0, w, h, 1, fo, ty, bytes, out);
+    glDeleteTextures(1, &tmp);
+}
 static void blit_tex(Tex *src, const View *sv, const int *sr, Tex *dst, const View *dv, const int *dr, int linear) {
     tex_sync(src); tex_sync(dst);
     dst->gpu_written = 1;
+    int s2[6], d2[6];
+    if (src->rw || dst->rw) {                         /* resolution scale: the game's rectangles on the storage of each */
+        memcpy(s2, sr, sizeof s2); memcpy(d2, dr, sizeof d2);
+        s2[0] = rsx(src, sr[0]); s2[1] = rsy(src, sr[1]); s2[3] = rsx(src, sr[0] + sr[3]) - s2[0]; s2[4] = rsy(src, sr[1] + sr[4]) - s2[1];
+        d2[0] = rsx(dst, dr[0]); d2[1] = rsy(dst, dr[1]); d2[3] = rsx(dst, dr[0] + dr[3]) - d2[0]; d2[4] = rsy(dst, dr[1] + dr[4]) - d2[1];
+        if ((src->rw != 0) != (dst->rw != 0)) linear = 1;     /* a scaled and an unscaled texture: filtered */
+        sr = s2; dr = d2;
+    }
     {   /* Block-compressed textures cannot be framebuffer attachments: a copy between them (Tomodachi Life copies the Mii face
          * textures it compresses on the GPU, level by level) failed as an incomplete framebuffer and left the face cards and
          * the new Mii blank. Same size, no mirroring: the blocks are copied as they are. */
@@ -3992,6 +4117,14 @@ static void draw_shot(void) {
     Tex fake;
     char path[64];
     if (want == -2) want = getenv("SSBU_DRAWSHOT") ? atoi(getenv("SSBU_DRAWSHOT")) : -1;
+    if (S.fbo_w && getenv("SSBU_DRAWLOG_RT_SHOT") && g_dlrt_n > 0 && S.color0 && S.color0->b.width == S.fbo_w && dlrt_match()) {      /* level 0 only */
+        memset(&fake, 0, sizeof fake);
+        fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prs + 0.5f); }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER_, S.fbo);
+        snprintf(path, sizeof path, "dlrt_%03d.bmp", g_dlrt_n); save_bmp(path, &fake);
+        fake.b.depth = -1; snprintf(path, sizeof path, "dlrt_%03d_a.bmp", g_dlrt_n); save_bmp(path, &fake);
+        return;
+    }
     if ((g_st.frames != want && !(g_draw_tag && getenv("SSBU_DRAWSHOT_BOX"))) || !S.fbo_w) return;      /* round 17: with SSBU_DRAWTAG the box aid follows the tagged fight frame */
     {   /* SSBU_DRAWSHOT_BOX=x,y,w,h (in 1920x1080 picture coordinates): no files; one line per draw that CHANGED the mean
          * colour of that box of its colour target (finds the draws that paint a given place of the screen) */
@@ -4016,7 +4149,7 @@ static void draw_shot(void) {
         }
     }
     memset(&fake, 0, sizeof fake);
-    fake.b.width = S.fbo_w; fake.b.height = S.fbo_h;
+    fake.b.width = S.fbo_w; fake.b.height = S.fbo_h; if (S.prs) { fake.rw = (int)(S.fbo_w * S.prs + 0.5f); fake.rh = (int)(S.fbo_h * S.prs + 0.5f); }
     snprintf(path, sizeof path, "draw_%02d_fbo%u.bmp", g_frame_draw_index - 1, S.fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER_, S.fbo);
     save_bmp(path, &fake);
@@ -4290,15 +4423,17 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_VIEWPORTS:
-        for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) { float v[4]; memcpy(v, blob + i * 16, 16); glViewportIndexedf((GLuint)a[0] + (GLuint)i, v[0], v[1], v[2], v[3]); }
+        for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) { int k = (int)a[0] + i; memcpy(S.gvp[k], blob + i * 16, 16); S.gvp_set |= 1u << k; apply_vp(k); }
         break;
     case OP_SCISSORS:
         if (g_dbg_noscissor) break;
         for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) {
             int v[4];
             memcpy(v, blob + i * 16, 16);
-            glScissorIndexed((GLuint)a[0] + (GLuint)i, v[0], v[1], v[2] < 0 ? 0 : v[2], v[3] < 0 ? 0 : v[3]);
-            if ((int)a[0] + i == 0) { S.sc0[0] = v[0]; S.sc0[1] = v[1]; S.sc0[2] = v[2] < 0 ? 0 : v[2]; S.sc0[3] = v[3] < 0 ? 0 : v[3]; }
+            int k = (int)a[0] + i;
+            S.gsc[k][0] = v[0]; S.gsc[k][1] = v[1]; S.gsc[k][2] = v[2] < 0 ? 0 : v[2]; S.gsc[k][3] = v[3] < 0 ? 0 : v[3];
+            apply_sc(k);
+            if (k == 0) memcpy(S.sc0, S.gsc[0], sizeof S.sc0);
         }
         break;
     case OP_DEPTHRANGES:
@@ -4314,8 +4449,8 @@ static void exec(const Cmd *m, int depth) {
     }
     case OP_BLENDCOLOR: { float v[4]; memcpy(v, blob, 16); glBlendColor(v[0], v[1], v[2], v[3]); break; }
     case OP_ALPHAREF: memcpy(&S.alpha_ref, &a[0], 4); break;                       /* applied per draw (draw_prepare) */
-    case OP_POINTSIZE: { float v; memcpy(&v, &a[0], 4); glPointSize(v); break; }
-    case OP_LINEWIDTH: { float v; memcpy(&v, &a[0], 4); glLineWidth(v); break; }
+    case OP_POINTSIZE: { float v; memcpy(&v, &a[0], 4); glPointSize(g_rsf > 0 ? v * g_rsf : v); break; }      /* resolution scale: in real pixels */
+    case OP_LINEWIDTH: { float v; memcpy(&v, &a[0], 4); glLineWidth(g_rsf > 0 ? v * g_rsf : v); break; }
     case OP_POLYOFFSET: { float v[3]; memcpy(v, &a[0], 12); glPolygonOffsetClamp(v[0], v[1], v[2]);
         {   static long long dl = -2;
             if (dl == -2) dl = getenv("SSBU_DRAWLOG") ? atoll(getenv("SSBU_DRAWLOG")) : -1;
@@ -4492,6 +4627,7 @@ static void exec(const Cmd *m, int depth) {
         if (a[5] && f.kind != 4) { glPixelStorei(0x0D02 /* PACK_ROW_LENGTH */, (GLint)((int64_t)a[5] / f.bpb)); bytes = (size_t)a[5] * (size_t)r[4] * (size_t)d; }
         if (a[6] && a[5] && f.kind != 4) { glPixelStorei(0x806C /* PACK_IMAGE_HEIGHT */, (GLint)((int64_t)a[6] / (int64_t)a[5])); bytes = (size_t)a[6] * (size_t)d; }
         if (f.kind == 4) glGetCompressedTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, (GLsizei)bytes, P(a[3]));
+        else if (t->rw && d == 1) rs_get(t, level, r[0], r[1], r[3], r[4], f.format, f.type, (GLsizei)bytes, P(a[3]));      /* resolution scale */
         else glGetTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, f.format, f.type, (GLsizei)bytes, P(a[3]));
         glPixelStorei(0x0D02, 0); glPixelStorei(0x806C, 0);
         g_arena_gen++;
@@ -4543,14 +4679,14 @@ static void exec(const Cmd *m, int depth) {
         if (a[6]) { r[0] = r[1] = r[2] = 0; r[3] = lvl(t->b.width, level); r[4] = lvl(t->b.height, level); r[5] = t->b.target == 2 ? lvl(t->b.depth, level) : 1; }
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1]);
         glFramebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, 0, 0);
-        glScissorIndexed(0, r[0], r[1], r[3], r[4]);
+        glScissorIndexed(0, rsx(t, r[0]), rsy(t, r[1]), rsx(t, r[0] + r[3]) - rsx(t, r[0]), rsy(t, r[1] + r[4]) - rsy(t, r[1]));
         glColorMaski(0, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);
         for (int z = 0; z < (r[5] > 0 ? r[5] : 1); z++) {
             if (layered) glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, level, (t->b.target == 2 ? 0 : layer) + r[2] + z);
             else glFramebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, level);
             if (a[5] == 1) glClearBufferiv(GL_COLOR, 0, (const GLint *)(blob + 48)); else if (a[5] == 2) glClearBufferuiv(GL_COLOR, 0, (const GLuint *)(blob + 48)); else glClearBufferfv(GL_COLOR, 0, (const GLfloat *)(blob + 48));
         }
-        glScissorIndexed(0, S.sc0[0], S.sc0[1], S.sc0[2], S.sc0[3]);
+        apply_sc(0);
         apply_chanmask();
         fbo_detach(g_fbo_tmp[1]);
         glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
@@ -4781,7 +4917,7 @@ static void job_submit(void *arg) {
 static void job_submit_async(void *arg) { SubmitJob *j = arg; j->handles = (const uint64_t *)(j + 1); job_submit(j); }
 
 static void save_bmp(const char *path, Tex *t) {
-    int w = t->b.width, h = t->b.height;
+    int w = tw(t), h = th(t);
     uint8_t *px = malloc((size_t)w * h * 3), head[54] = {'B', 'M'};
     uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
     static const uint8_t pad[4];
@@ -5048,6 +5184,7 @@ static void job_present(void *arg) {
     if (t && !t->dead && t->o.gl) {
         int sr[4] = {0, 0, t->b.width, t->b.height};
         if (j->win->crop[2] > 0 && j->win->crop[3] > 0) memcpy(sr, j->win->crop, sizeof sr);
+        if (t->rw) { int x0 = rsx(t, sr[0]), y0 = rsy(t, sr[1]); sr[2] = rsx(t, sr[0] + sr[2]) - x0; sr[3] = rsy(t, sr[1] + sr[3]) - y0; sr[0] = x0; sr[1] = y0; }      /* resolution scale */
         glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_read);
         glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
         void display_fit(int sw, int sh, int dw, int dh, int out[4]);      /* PR #24, display.c: the picture keeps its 16:9 shape */
@@ -5079,7 +5216,7 @@ static void job_present(void *arg) {
                 glBindFramebuffer(GL_READ_FRAMEBUFFER_, fb[0]); glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, fb[1]); glFramebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, smalltex, 0);
                 glDisable(GL_SCISSOR_TEST);
-                glBlitFramebuffer(0, 0, t->b.width, t->b.height, 0, 0, 480, 270, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                glBlitFramebuffer(0, 0, tw(t), th(t), 0, 0, 480, 270, GL_COLOR_BUFFER_BIT, GL_LINEAR);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER_, fb[1]);
                 glPixelStorei(GL_PACK_ALIGNMENT, 1);
                 glReadPixels(0, 0, 480, 270, 0x1908 /* RGBA */, GL_UNSIGNED_BYTE, px);
@@ -5311,7 +5448,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     glEnable(GL_FRAMEBUFFER_SRGB_);
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS_);
     glEnable(GL_SCISSOR_TEST);
-    for (GLuint i = 0; i < 16; i++) glScissorIndexed(i, 0, 0, 16384, 16384);
+    for (GLuint i = 0; i < 16; i++) { glScissorIndexed(i, 0, 0, 16384, 16384); S.gsc[i][2] = S.gsc[i][3] = 16384; }
     glGenBuffers(1, &g_arena);
     glBindBuffer(GL_ARRAY_BUFFER_, g_arena);
     glBufferData(GL_ARRAY_BUFFER_, (ptrdiff_t)ARENA_SIZE, NULL, GL_STREAM_DRAW_);
@@ -5890,7 +6027,10 @@ static void poly_defaults(Ctx *c) { static const uint8_t d[4] = {0, 1, 2, 0}; me
 static void poly_cull(Ctx *c) { wr8(A0, (uint8_t)A1); }
 static void poly_front(Ctx *c) { wr8(A0 + 1, (uint8_t)A1); }
 static void poly_mode(Ctx *c) { wr8(A0 + 2, (uint8_t)A1); }
-static void poly_offset(Ctx *c) { wr8(A0 + 3, (uint8_t)A1); }
+static void poly_offset(Ctx *c) {
+    wr8(A0 + 3, (uint8_t)A1);
+    { static int n; if (getenv("TOMO_POLYLOG") && A1 && n < 20) { n++; printf("polylog: nvnPolygonStateSetPolygonOffsetEnables(%llx, %llx)\n",(unsigned long long)A0, (unsigned long long)A1); } }
+}
 static void poly_get_cull(Ctx *c) { RET(rd8(A0)); }
 static void poly_get_front(Ctx *c) { RET(rd8(A0 + 1)); }
 static void poly_get_mode(Ctx *c) { RET(rd8(A0 + 2)); }
@@ -6295,7 +6435,7 @@ static void job_present_movie(void *arg) {
     PresentJob *j = arg;
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     if (!t || t->dead || !t->o.gl || t->b.width <= 0 || t->b.height <= 0) return;
-    int w = t->b.width, h = t->b.height;
+    int w = tw(t), h = th(t);
     uint8_t *px = malloc((size_t)w * h * 4);
     if (!px) return;
     glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_read);
@@ -6753,6 +6893,7 @@ static void job_read_texels(void *arg) {
         if (j->row_stride && f.kind != 4) glPixelStorei(0x0D02 /* PACK_ROW_LENGTH */, (GLint)(j->row_stride / f.bpb));
         if (j->image_stride && j->row_stride && f.kind != 4) glPixelStorei(0x806C /* PACK_IMAGE_HEIGHT */, (GLint)(j->image_stride / j->row_stride));
         if (f.kind == 4) glGetCompressedTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, (GLsizei)bytes, j->out);
+        else if (t->rw && d == 1) rs_get(t, level, r[0], r[1], r[3], r[4], fo, f.type, (GLsizei)bytes, j->out);      /* resolution scale */
         else glGetTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, fo, f.type, (GLsizei)bytes, j->out);
         glPixelStorei(0x0D02, 0); glPixelStorei(0x806C, 0);
     } else if (t->mem && t->gpu_written && !t->b.packaged) {
@@ -6776,6 +6917,7 @@ static void job_read_texels(void *arg) {
                 if (lin > tmp_cap) { tmp_cap = lin * 2; tmp = realloc(tmp, tmp_cap); }
                 int is3d = t->b.target == 2;
                 if (f.kind == 4) glGetCompressedTextureSubImage(t->o.gl, level, 0, 0, is3d ? 0 : layer, L.lvl_w[level], L.lvl_h[level], is3d ? L.lvl_d[level] : 1, (GLsizei)lin, tmp);
+                else if (t->rw && !is3d) rs_get(t, level, 0, 0, L.lvl_w[level], L.lvl_h[level], fo, f.type, (GLsizei)lin, tmp);      /* resolution scale */
                 else glGetTextureSubImage(t->o.gl, level, 0, 0, is3d ? 0 : layer, L.lvl_w[level], L.lvl_h[level], is3d ? L.lvl_d[level] : 1, fo, f.type, (GLsizei)lin, tmp);
                 tex_swizzle_level(&L, level, tmp, dst);
             }

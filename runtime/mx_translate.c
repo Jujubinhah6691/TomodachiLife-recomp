@@ -213,7 +213,7 @@ static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
         return S(e, "U(in_attr%u[%u])", n, c);
     }
     if (st == MX_FRAGMENT) {
-        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->target == 1) { e->uses_fcs = 1; return S(e, "U(gl_FragCoord[%u] * mx_fcs)", c); }      /* track O: the game's pixel position */
+        if (a >= 0x70 && a < 0x80 && c < 2 && e->in->screen_scale && e->in->stage == MX_FRAGMENT) { e->uses_fcs = 1; return S(e, "U(gl_FragCoord[%u] * mx_fcs)", c); }      /* track O: the game's pixel position */
         if (a >= 0x70 && a < 0x80) return S(e, "U(gl_FragCoord[%u])", c);
         if (a == 0x3fc) return "(gl_FrontFacing ? 0xffffffffu : 0u)";
         if ((a == 0x2e0 || a == 0x2e4) && e->in->target == 1 && c == 1) return "U(1.0 - gl_PointCoord[1])";      /* Vulkan: t runs the other way (flipped viewport) */
@@ -432,7 +432,7 @@ static void op_texs(Mx *e, uint64_t i) {
  * the game was told (c2 words 96 + 4u, the table TXQ reads); it returns them unchanged when the two are equal. An offset
  * is added first (then *off is cleared). */
 static const char *tf_scaled(Mx *e, int unit, const char *smp, const char *coords, const char **off) {
-    if (!e->in->screen_scale || e->in->target != 1 || e->in->stage != MX_FRAGMENT) return coords;
+    if (!e->in->screen_scale || e->in->stage != MX_FRAGMENT) return coords;
     unsigned w = 96 + 4 * (unsigned)unit;
     e->uses_tf = 1; e->cbufs |= 4;
     if (off && *off) { coords = S(e, "(%s + %s)", coords, *off); *off = NULL; }
@@ -477,7 +477,7 @@ static void op_tlds(Mx *e, uint64_t i) {
     switch (enc) {
     case 0: call = S(e, "texelFetch(%s, %s, 0)", SMP(e, unit, "1D", 0), IR(e, a)); break;
     case 1: call = S(e, "texelFetch(%s, %s, %s)", SMP(e, unit, "1D", 0), IR(e, a), IR(e, b)); break;
-#define TLDS_RS (e->in->screen_scale && e->in->target == 1 && e->in->stage == MX_FRAGMENT)       /* track O: see tf_scaled */
+#define TLDS_RS (e->in->screen_scale && e->in->stage == MX_FRAGMENT)       /* track O: see tf_scaled */
     case 2: if (TLDS_RS) { const char *sm = SMP(e, unit, "2D", 0); call = S(e, "texelFetch(%s, %s, 0)", sm, tf_scaled(e, unit, sm, S(e, "ivec2(%s, %s)", IR(e, a), IR(e, b)), NULL)); break; }
         call = S(e, "texelFetch(%s, ivec2(%s, %s), 0)", SMP(e, unit, "2D", 0), IR(e, a), IR(e, b)); break;
     case 4: off = tex_offset(e, 2, X(e, b), 4);
@@ -1642,7 +1642,8 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
-        if (vk && e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
+        if (!vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(location = 1) uniform float mx_fcs;\n");      /* resolution scale, OpenGL (nvn_gl.c) */
+        if (e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
         if (vk && in->stage == MX_VERTEX) {
             /* PR #47 (v1Ta44): keep position exports outside the translated loop/switch dispatcher. NVIDIA can lose a
              * position written before a continuation, even when replaying the same arithmetic with stores gives the right
@@ -1759,7 +1760,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
     out->ssbos = e->ssbos; out->ssbo_written = e->uses_gstore ? e->ssbos : 0;
     out->images = e->images; out->images_read = e->images_read; out->images_written = e->images_written;
     memcpy(out->image_gl_format, e->image_fmt, sizeof out->image_gl_format);
-    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha;
+    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha; out->uses_fcs = e->uses_fcs;
     out->nsmp = e->nsmp; memcpy(out->smp, e->smp, sizeof out->smp);
 done:
     free(e->s); free(e->reach); free(e->leader); free(e->jt); free(e->stk_of); free(e->stks);

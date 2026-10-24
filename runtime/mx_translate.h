@@ -62,8 +62,8 @@ typedef struct {
      * (VUID-RuntimeSpirv-OpEntryPoint-08743); in OpenGL such an input is undefined. */
     uint32_t force_out;
     /* Track O, internal resolution scale (plan\phases\O1_options.md, session 7). 0 = the text exactly as before. 1 (fragment
-     * stage, target 1 only): gl_FragCoord.xy is multiplied by the push constant mx_fcs (a fourth member of MXPC: game pixels
-     * per real pixel of the pass, 1.0 on a target that is not scaled), and the coordinates of a texelFetch from a 2D sampler
+     * stage): gl_FragCoord.xy is multiplied by mx_fcs (game pixels per real pixel of the pass, 1.0 on a target that is not
+     * scaled; Vulkan: a fourth member of the push constants MXPC, OpenGL: the uniform at location 1), and the coordinates of a texelFetch from a 2D sampler
      * are mapped from the game's texel grid (the size table in c2) to the image's real one (textureSize). */
     int screen_scale;
 } MxIn;
@@ -79,7 +79,7 @@ typedef struct {
     uint32_t images, images_read, images_written;      /* image units used (SULD / SUST) */
     uint16_t image_gl_format[8];     /* internal format each used image must be bound with (typed accesses name their own) */
     uint32_t int_dep;                /* which bits of int_attrs / int_tex influenced the code (vertex: attrs, fragment: textures) */
-    int insns, blocks, uses_alpha;
+    int insns, blocks, uses_alpha, uses_fcs;      /* uses_fcs: the fragment stage reads mx_fcs (screen_scale) */
     /* target 1: the samplers the text declares in set 1 (the back end binds a view of that type, or a dummy of that type) */
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64];
     int nsmp;

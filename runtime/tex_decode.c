@@ -1088,6 +1088,19 @@ int tex_decode_rgba8(int nf, const void *src, int w, int h, uint8_t *dst) {
                 for (y = 0; y < ch; y++) memcpy(dst + (size_t)(y0 + y) * pitch + x0 * 4, tmp + y * f->bw * 4, (size_t)cw * 4);
             }
         }
+    {   /* TEST ONLY, TOMO_ASTC_DUMP=<dir>: the blocks of the first 400 ASTC images decoded and the result (tools: compare with a reference decoder) */
+        static int n;
+        const char *dir = f->codec == TEX_CODEC_ASTC ? getenv("TOMO_ASTC_DUMP") : NULL, *only = getenv("TOMO_ASTC_DUMP_FMT");      /* _FMT=<hex>: that format only */
+        if (dir && n < 400 && (!only || strtol(only, NULL, 16) == nf)) {
+            char path[400];
+            FILE *o;
+            snprintf(path, sizeof path, "%s/astc_%03d_%x_%dx%d_%dx%d.bin", dir, n, nf, w, h, f->bw, f->bh);
+            if ((o = fopen(path, "wb"))) { fwrite(src, 1, (size_t)wb * hb * f->bpb, o); fclose(o); }
+            snprintf(path, sizeof path, "%s/astc_%03d_%x_%dx%d_%dx%d.rgba", dir, n, nf, w, h, f->bw, f->bh);
+            if ((o = fopen(path, "wb"))) { fwrite(dst, 1, (size_t)w * h * 4, o); fclose(o); }
+            n++;
+        }
+    }
     return 0;
 }
 

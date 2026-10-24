@@ -115,6 +115,7 @@
 #define glProgramBinary plat_sys_glProgramBinary
 #define glProgramParameteri plat_sys_glProgramParameteri
 #define glProgramStringARB plat_sys_glProgramStringARB
+#define glProgramUniform1f plat_sys_glProgramUniform1f
 #define glProgramUniform2ui plat_sys_glProgramUniform2ui
 #define glPushDebugGroup plat_sys_glPushDebugGroup
 #define glRasterSamplesEXT plat_sys_glRasterSamplesEXT
@@ -244,6 +245,7 @@
 #undef glProgramBinary
 #undef glProgramParameteri
 #undef glProgramStringARB
+#undef glProgramUniform1f
 #undef glProgramUniform2ui
 #undef glPushDebugGroup
 #undef glRasterSamplesEXT
