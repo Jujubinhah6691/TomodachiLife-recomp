@@ -1016,7 +1016,7 @@ static TexObj *tex_view_obj(Tex *t, const View *v) {
                 glTexParameteri(tg, GL_TEXTURE_MIN_FILTER, e.nlvl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
                 glTexParameteri(tg, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                 set_swizzle(tg, e.swz);
-                n->is_copy = 1; n->copy_gen = t->rt_gen - 1;          /* filled by view_copies_refresh */
+                n->is_copy = 1; n->copy_gen = t->rt_gen - 1; t->vc_gen = 0;    /* filled by view_copies_refresh */
                 g_copy_views++;
                 InterlockedIncrement64(&g_tex_live);
                 g_st.views++;
@@ -2893,8 +2893,9 @@ static void view_copies_refresh(void) {               /* the copies standing for
             Tex *t;
             if (!(m & 1) || !(t = unit_tex(s, u)) || t->dead || !t->o.gl) continue;
             if (t->alias_from) alias_refresh(t);
-            if (!t->views) continue;
+            if (!t->views || t->vc_gen == t->rt_gen + 1) continue;      /* every copy already up to date: no walk (2760 draws a frame) */
             for (VNode *n = t->views; n; n = n->next) if (n->is_copy && n->copy_gen != t->rt_gen) view_copy_fill(t, n);
+            t->vc_gen = t->rt_gen + 1;
         }
 }
 static void feedback_guard(void) {

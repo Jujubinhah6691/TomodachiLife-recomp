@@ -51,6 +51,7 @@ typedef struct Tex {
     uint8_t *packaged_copy;                /* PR #41: owned until the initial upload consumes packaged texels */
     long long ahead_seen;                  /* session 8 (nvn_vk_draw.c tex_ahead): 1 + the frame the render thread first saw this record; -1 = looked at, not taken */
     uint32_t rt_gen;                       /* nvn_gl.c: bumped each time the texture becomes a render target */
+    uint32_t vc_gen;                       /* nvn_gl.c view_copies_refresh: rt_gen + 1 when every copy view was last brought up to date (0: look) */
     long long born, upframe;               /* nvn_gl.c TOMO_TEXBINDLOG: the frame of nvnTextureInitialize and of the last upload */
     long long last_bind, dead_frame;       /* nvn_gl.c: the last frame a draw resolved it, the frame it was finalized (gl_housekeeping) */
     struct Tex *alias_from;                /* nvn_gl.c rt_alias_note: a texture of the same shape over the same memory that was a render target */
