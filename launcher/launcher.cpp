@@ -441,6 +441,9 @@ static void page_display(ImVec2 avail) {
         }
     }
     hint("In a window the picture keeps its 16:9 shape; other shapes get bars.");
+    static const char *const rv[] = {"1.0", "1.5", "2.0", "3.0"}, *const rl[] = {"1080p (the console's)", "1620p", "2160p (4K)", "3240p"};
+    label_col("Internal resolution"); ini_combo("resolution_scale", "1.0", rv, rl, 4);
+    hint("The game's 3D picture is drawn at this size and fitted to the window. 4K needs a recent graphics card.");
     static const char *const vv[] = {"auto", "display", "clock", "off"}, *const vl[] = {"Automatic", "Follow the display (smoothest)", "Own 60 Hz clock", "Off (lowest latency, may tear)"};
     label_col("Vertical sync"); ini_combo("vsync", "auto", vv, vl, 4);
     static const char *const lv[] = {"normal", "low", "lowest"}, *const ll[] = {"Normal", "Low", "Lowest"};
