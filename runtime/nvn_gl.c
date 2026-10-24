@@ -1375,10 +1375,27 @@ static GLuint g_arena;
 static size_t g_arena_pos;
 static struct { uint64_t addr, size; size_t off; uint32_t gen; } g_acache[8192];
 static uint32_t g_arena_gen = 1;
+typedef struct ArenaOld { GLuint buf; struct ArenaOld *next; } ArenaOld;
+static ArenaOld *g_arena_old;
+static void arena_retire(void) {
+    while (g_arena_old) {
+        ArenaOld *old = g_arena_old; g_arena_old = old->next;
+        glDeleteBuffers(1, &old->buf); free(old);
+    }
+}
 
 static size_t arena_put_raw(const void *p, size_t n) {
     g_arena_pos = (g_arena_pos + 255) & ~(size_t)255;
-    if (g_arena_pos + n > ARENA_SIZE) { HS_IN("buffer streaming: new 96 MB store (glBufferData)", 0); glBufferData(GL_ARRAY_BUFFER_, (ptrdiff_t)ARENA_SIZE, NULL, GL_STREAM_DRAW_); HS_OUT(); g_arena_pos = 0; g_arena_gen++; }
+    if (g_arena_pos + n > ARENA_SIZE) {
+        /* Earlier bindings of this draw still read the old store; replacing its storage erases those inputs. */
+        ArenaOld *old = malloc(sizeof *old);
+        if (!old) { fprintf(stderr, "nvn_gl: cannot retain the upload buffer\n"); ExitProcess(5); }
+        old->buf = g_arena; old->next = g_arena_old; g_arena_old = old;
+        HS_IN("buffer streaming: new 96 MB store (glBufferData)", 0);
+        glGenBuffers(1, &g_arena); glBindBuffer(GL_ARRAY_BUFFER_, g_arena);
+        glBufferData(GL_ARRAY_BUFFER_, (ptrdiff_t)(n > ARENA_SIZE ? n : ARENA_SIZE), NULL, GL_STREAM_DRAW_);
+        HS_OUT(); g_arena_pos = 0; g_arena_gen++;
+    }
     size_t off = g_arena_pos;
     LONG64 pf0 = pf_now();
     HS_IN("buffer streaming (glBufferSubData)", 0);
@@ -1388,6 +1405,22 @@ static size_t arena_put_raw(const void *p, size_t n) {
     g_arena_pos += n;
     g_st.arena_bytes += (LONG64)n;
     return off;
+}
+static void arena_selftest(void) {
+    if (!getenv("SSBU_ARENA_SELFTEST")) return;
+    const uint32_t first = 0x12345678, second = 0xabcdef01;
+    uint32_t got = 0;
+    size_t off = arena_put_raw(&first, sizeof first);
+    GLuint before = g_arena;
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 0, before, (ptrdiff_t)off, sizeof first);
+    g_arena_pos = ARENA_SIZE;                     /* wrap after a draw has already bound one of its inputs */
+    arena_put_raw(&second, sizeof second);
+    glGetNamedBufferSubData(before, (ptrdiff_t)off, sizeof got, &got);
+    int bad = before == g_arena || got != first || glGetError() != GL_NO_ERROR;
+    printf("arena self-test: rollover keeps bound input %08x (expected %08x): %s\n", got, first, bad ? "FAIL" : "PASS");
+    arena_retire();
+    fflush(stdout);
+    ExitProcess(bad ? 1 : 0);
 }
 /* Read-backs in flight: at the end of a batch the buffers the GPU wrote (dispatches, fragment stages) are copied into mapped
  * staging memory behind a fence instead of read with a stall (the CPU waited for the whole batch: 6 ms a frame on the island).
@@ -5522,6 +5555,7 @@ static void job_present(void *arg) {
                    (long long)g_fs_big, (long long)g_fs_bigclr, (long long)g_fs_rt, (long long)g_fs_disp);
         g_fs_big = g_fs_bigclr = g_fs_rt = g_fs_disp = 0;
     }
+    arena_retire();                              /* all draws using the previous stores have been submitted */
     g_st.frames = frame;
     g_gpu_ts_base = now_ns(); g_gpu_ts_k = 0;
     if (frame <= 3 || frame % 600 == 0 || g_frame_draws != 0 && g_logn < 40 && (g_logn++, 1))
@@ -5688,6 +5722,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     fflush(stdout);
     shd_init();
     hitch_set_render();
+    arena_selftest();                            /* SSBU_ARENA_SELFTEST: rollover must preserve this draw's inputs */
     nvn_c4_gl_selftest_hook();                  /* SSBU_NVN_GLTEST: OpenGL self-test of nvn_c4.c, then exit */
     SetEvent(g_ready_event);
     render_loop();
