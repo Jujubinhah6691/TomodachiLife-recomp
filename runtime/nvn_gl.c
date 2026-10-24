@@ -3168,7 +3168,37 @@ static int g_dbg_noscissor, g_dbg_skipdraw = -1, g_frame_draw_index;      /* deb
  * programs reference a texture unit (MxOut.tex_units of the translated stage) that holds the dummy texture; split by cause:
  * the game bound handle 0 to the unit / never bound it, or the handle names a texture that is gone or was never registered. */
 static long long g_dummy_draws, g_dummy_unbound, g_dummy_dead;
+/* TEST ONLY, TOMO_DRAWSIG=<from>-<to>: one line per presented frame with a signature of each draw (programs, index count,
+ * target size, size and format of each texture the fragment stage samples): a one-frame flash shows as the draws whose
+ * signature differs from the frames around it (texture identities change every frame here, their shapes do not). */
+static uint32_t *g_dsig; static int g_dsig_n, g_dsig_cap;
+static long long g_dsig_lo = -2, g_dsig_hi;
+static uint32_t fnv(uint32_t h, uint32_t v) { for (int i = 0; i < 4; i++) { h ^= (v >> (8 * i)) & 255; h *= 16777619u; } return h; }
+static void drawsig_note(void) {
+    if (g_dsig_lo == -2) { const char *e = getenv("TOMO_DRAWSIG"); g_dsig_lo = -1; if (e) sscanf(e, "%lld-%lld", &g_dsig_lo, &g_dsig_hi); }
+    if (g_dsig_lo < 0 || (long long)g_st.frames + 1 < g_dsig_lo || (long long)g_st.frames + 1 > g_dsig_hi) return;
+    uint32_t h = 2166136261u;
+    h = fnv(h, S.prog[0] ? (uint32_t)S.prog[0]->serial : 0); h = fnv(h, S.prog[1] ? (uint32_t)S.prog[1]->serial : 0);
+    h = fnv(h, g_fd_count); h = fnv(h, (uint32_t)S.fbo_w << 16 | (uint32_t)S.fbo_h);
+    for (uint32_t m = units_sampled(1), u = 0; m; m >>= 1, u++) {
+        Tex *t;
+        if (!(m & 1)) continue;
+        t = unit_tex(1, u);
+        h = fnv(h, t ? (uint32_t)t->b.width << 16 ^ (uint32_t)t->b.height ^ (uint32_t)t->b.format << 24 : 0xffffffffu);
+        h = fnv(h, S.gl_tex[1][4 + u] == g_dummy_handle);
+    }
+    if (g_dsig_n == g_dsig_cap) { g_dsig_cap = g_dsig_cap ? g_dsig_cap * 2 : 4096; g_dsig = realloc(g_dsig, sizeof *g_dsig * (size_t)g_dsig_cap); }
+    g_dsig[g_dsig_n++] = h;
+}
+static void drawsig_frame(long long frame) {             /* job_present */
+    if (g_dsig_lo < 0 || !g_dsig_n) { g_dsig_n = 0; return; }
+    printf("drawsig %lld %d:", frame, g_dsig_n);
+    for (int i = 0; i < g_dsig_n; i++) printf(" %08x", g_dsig[i]);
+    printf("\n");
+    g_dsig_n = 0;
+}
 static void count_dummy_samples(void) {
+    drawsig_note();
     {   /* TOMO_GLERR_DRAW=1 (diagnosis): a GL error after a draw, with the framebuffer it went to */
         static int on = -1, nlog;
         if (on < 0) on = getenv("TOMO_GLERR_DRAW") != NULL;
@@ -3566,6 +3596,15 @@ static int draw_prepare(void) {
             if (!(a & 0xff)) continue;
             printf("  attr %d: format 0x%x stream %d offset %u stride %u buffer %llx+%llu", i, a & 0xff, stream, a >> 14, S.vstream[stream].stride, (unsigned long long)S.vbuf[stream].addr, (unsigned long long)S.vbuf[stream].size);
             if (S.vbuf[stream].addr && S.vbuf[stream].size >= (a >> 14) + 16) { const float *f = (const float *)((const uint8_t *)P(S.vbuf[stream].addr) + (a >> 14)); printf("  first: %g %g %g %g", f[0], f[1], f[2], f[3]); }
+            if (i == 0 && (a & 0xff) == 0x22 && S.vstream[stream].stride >= 12 && S.vbuf[stream].addr) {     /* three floats: the box of all the buffer's vertices */
+                float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+                const uint8_t *b0 = (const uint8_t *)P(S.vbuf[stream].addr) + (a >> 14);
+                for (uint64_t o = 0; o + 12 <= S.vbuf[stream].size - (a >> 14); o += S.vstream[stream].stride) {
+                    const float *v = (const float *)(b0 + o);
+                    for (int k = 0; k < 3; k++) { if (v[k] < mn[k]) mn[k] = v[k]; if (v[k] > mx[k]) mx[k] = v[k]; }
+                }
+                printf("  box: %g..%g %g..%g %g..%g", mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
+            }
             if (S.vbuf[stream].addr && (a & 0xff) == 0x29) {          /* RGBA16F: the first four vertices as half floats */
                 const uint16_t *h = (const uint16_t *)((const uint8_t *)P(S.vbuf[stream].addr) + (a >> 14));
                 printf("  halves:");
@@ -4525,6 +4564,41 @@ static void exec(const Cmd *m, int depth) {
         int count = (int)a[2];
         LONG64 pf0 = pf_now();
         int ok;
+        {   /* TEST ONLY, TOMO_WATCHDRAW=<index count>,<uniform binding>,<byte offset>,<from frame>: at the first such draw, a
+             * hardware write watchpoint on that word of the vertex stage's buffer (debug_mode.c: the writers' guest stacks) */
+            static int wc = -2, wb, wo, wf;
+            if (wc == -2) { const char *e = getenv("TOMO_WATCHDRAW"); wc = -1; if (e && sscanf(e, "%d,%d,%d,%d", &wc, &wb, &wo, &wf) != 4) wc = -1; }
+            if (wc > 0 && count == wc && (int)g_st.frames >= wf && wb >= 0 && wb < 16 && S.ubo[0][wb].addr) {
+                void debug_watch(const uint64_t *addrs, int n);
+                uint64_t w = (uint64_t)(uintptr_t)P(S.ubo[0][wb].addr) + (uint64_t)wo;
+                printf("watchdraw: frame %lld: draw of %d indices, binding %d at %llx+%d = host %llx (value %08x)\n", (long long)g_st.frames, count, wb,
+                       (unsigned long long)S.ubo[0][wb].addr, wo, (unsigned long long)w, *(uint32_t *)(uintptr_t)w);
+                {   /* the 48 bytes (a 3x4 matrix) at the start of that buffer: the other copies in memory (the scene's own); the first
+                     * outside the buffer is watched at the same offset */
+                    uint8_t pat[48]; const uint8_t *src = P(S.ubo[0][wb].addr);
+                    memcpy(pat, src, sizeof pat);
+                    printf("watchdraw: matrix"); for (int i = 0; i < 12; i++) { float f; memcpy(&f, pat + 4 * i, 4); printf(" %g", f); } printf("\n");
+                    SYSTEM_INFO si; GetSystemInfo(&si);
+                    uint8_t *p = (uint8_t *)si.lpMinimumApplicationAddress; MEMORY_BASIC_INFORMATION mi; int hits = 0; uint64_t first = 0;
+                    while (p < (uint8_t *)si.lpMaximumApplicationAddress && VirtualQuery(p, &mi, sizeof mi)) {
+                        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && mi.RegionSize < (1ull << 32)) {
+                            const uint8_t *bb = mi.BaseAddress;
+                            for (size_t i = 0; i + 48 <= mi.RegionSize; i += 4)
+                                if (bb[i] == pat[0] && !memcmp(bb + i, pat, 48) && bb + i != src) {
+                                    if (hits < 16) printf("watchdraw: copy at host %p\n", (const void *)(bb + i));
+                                    if (!first) first = (uint64_t)(uintptr_t)(bb + i);
+                                    hits++;
+                                }
+                        }
+                        p = (uint8_t *)mi.BaseAddress + mi.RegionSize;
+                    }
+                    printf("watchdraw: %d copies\n", hits);
+                    if (first) w = first + (uint64_t)wo;
+                }
+                debug_watch(&w, 1);
+                wc = -1;
+            }
+        }
         feedback_guard();
         g_draw_ibuf.addr = a[3]; g_draw_ibuf.size = (uint64_t)(count > 0 ? count : 0) << t;
         { HS_IN("draw state (pipeline, bindings)", 0); ok = count > 0 && a[3] && draw_prepare(); HS_OUT(); }
@@ -5142,6 +5216,7 @@ static void job_present(void *arg) {
     RECT r;
     LONG64 frame = g_st.frames + 1;
     LONG64 pf0 = pf_now();
+    drawsig_frame(frame);
     if (shot == -2) { shot = getenv("SSBU_SHOT") ? atoi(getenv("SSBU_SHOT")) : -1; every = getenv("SSBU_SHOT_EVERY") ? atoi(getenv("SSBU_SHOT_EVERY")) : 0; shot_from = getenv("SSBU_SHOT_FROM") ? atoi(getenv("SSBU_SHOT_FROM")) : 0; shot_to = getenv("SSBU_SHOT_TO") ? atoi(getenv("SSBU_SHOT_TO")) : 0x7fffffff; }
     {   /* debug: TOMO_DBGBUF=<frame>: 64 KB of floats at storage binding 38 for override shaders (TOMO_SHOVR) to write; rows of 80 printed at that frame */
         static int dbf = -2;

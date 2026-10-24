@@ -660,6 +660,27 @@ void display_init(void) {
 /* Called after every presented frame (nvn_gl.c has already put it in the window): holds the caller to 60 Hz. */
 static volatile LONG g_interval = 1;         /* nvnWindowSetPresentInterval: display refreshes per presented frame (0 = do not wait) */
 int gfx_frame_rate(void);
+/* frame_rate = 60, adaptive: the game steps its logic once per refresh that passed, so a frame that misses a refresh makes the
+ * next one heavier (two or three steps): forced to one refresh per frame, a scene that cannot hold 60 fell to 20 fps (the
+ * house close-up, 2026-10-24). The busy time of each frame (from the end of its refresh wait to its present) decides: over
+ * 15.5 ms on average for 15 frames -> two refreshes per frame (30 fps); under 11 ms for 3 s at two -> one again. */
+static volatile LONG g_adapt;                 /* 1: the interval is the game's halved and adapts (frame_rate = 60) */
+static LARGE_INTEGER g_release_at;            /* end of the last refresh wait */
+static void adapt_frame(LARGE_INTEGER now) {
+    static double ema;
+    static int over, under;
+    if (!g_adapt || !g_release_at.QuadPart) return;
+    double ms = (double)(now.QuadPart - g_release_at.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
+    if (ms < 0 || ms > 500) return;
+    ema = ema ? ema * 0.85 + ms * 0.15 : ms;
+    if (g_interval == 1) {
+        over = ema > 15.5 ? over + 1 : 0;
+        if (over >= 15) { InterlockedExchange(&g_interval, 2); over = under = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 30 fps for now%c", ema, 10); }
+    } else if (g_interval == 2) {
+        under = ema < 11.0 ? under + 1 : 0;
+        if (under >= 90) { InterlockedExchange(&g_interval, 1); over = under = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 60 fps again%c", ema, 10); }
+    }
+}
 void display_set_interval(int n) {
     /* frame_rate = 60 (graphics.ini): the game asks for 2 refreshes per frame (30 fps); its logic steps by the refreshes
      * its VSync Count Thread counted, so presenting every refresh keeps its speed (measured 2026-10-24: a fade after a
@@ -667,7 +688,8 @@ void display_set_interval(int n) {
     static int force = -2;
     if (force == -2) force = getenv("TOMO_INTERVAL") ? atoi(getenv("TOMO_INTERVAL")) : -1;
     if (force >= 0) n = force;
-    else if (n > 1 && gfx_frame_rate() >= 60) n /= 2;
+    else if (n > 1 && gfx_frame_rate() >= 60) { n /= 2; InterlockedExchange(&g_adapt, n == 1); }
+    else InterlockedExchange(&g_adapt, 0);
     InterlockedExchange(&g_interval, n < 0 ? 0 : n > 5 ? 5 : n);
 }
 void nvn_pf_pace(LONG64 ticks);            /* nvn_gl.c: timing scopes */
@@ -704,6 +726,7 @@ static void frame_queued(void) {
     if (!second_start.QuadPart) second_start = now;
     LONG64 n = InterlockedIncrement64(&g_frames);
     second_frames++;
+    adapt_frame(now);
     {   /* session 14: the game's thread on the performance cores (set once), and where it is seen at each present */
         static DWORD tid;
         if (tid != GetCurrentThreadId()) { tid = GetCurrentThreadId(); display_perf_thread(); }
@@ -1095,6 +1118,7 @@ int display_wait_refresh(void) {
         }
     }
     lat_release();                                         /* L1: latency = low / lowest; the release time */
+    QueryPerformanceCounter(&g_release_at);                /* frame_rate = 60: the frame's busy time starts here (adapt_frame) */
     hitch_pacing(0);
     QueryPerformanceCounter(&b);
     nvn_pf_pace(b.QuadPart - a.QuadPart);
