@@ -2960,6 +2960,7 @@ static int layered_rt(Tex *t, const View *v) {
 typedef struct { Tex *t; int level, layer, w, h; GLuint gl; TexObj o; int pending; GLenum fmt, type; int bpb; } BcShadow;
 static BcShadow g_bcsh[64];
 static int g_bcsh_n;
+static unsigned g_bcsh_next;
 static void bc_flush(void) {
     for (int i = 0; i < g_bcsh_n; i++) {
         BcShadow *b = &g_bcsh[i];
@@ -2997,7 +2998,7 @@ static TexObj *bc_target(Tex *t, const View *v) {     /* NULL: not a render targ
         BcShadow *b = &g_bcsh[i];
         if (b->t == t && b->level == level && b->layer == layer && b->w == w && b->h == h) { b->pending = 1; return &b->o; }
     }
-    BcShadow *b = g_bcsh_n < 64 ? &g_bcsh[g_bcsh_n++] : &g_bcsh[(g_bcsh_n++) & 63];
+    BcShadow *b = g_bcsh_n < 64 ? &g_bcsh[g_bcsh_n++] : &g_bcsh[(g_bcsh_next++) & 63];
     if (b->gl) { fbo_purge(b->gl); glDeleteTextures(1, &b->gl); }
     memset(b, 0, sizeof *b);
     b->t = t; b->level = level; b->layer = layer; b->w = w; b->h = h; b->fmt = vf.format; b->type = vf.type; b->bpb = tf.bpb;
@@ -3009,6 +3010,46 @@ static TexObj *bc_target(Tex *t, const View *v) {     /* NULL: not a render targ
     static int nlog;
     logf_limited(&nlog, 5, "nvn_gl: compressed render target: texture format 0x%x %dx%d level %d drawn through a %dx%d scratch of format 0x%x\n", t->b.format, t->b.width, t->b.height, level, w, h, v->format);
     return &b->o;
+}
+static void bc_cache_selftest(void) {
+    if (!getenv("SSBU_BC_CACHE_SELFTEST")) return;
+    Tex targets[130] = {0};
+    View view = {0};
+    Fmt tf, vf;
+    view.set = 0x84; view.format = 0x2f;
+    fmt_get(0x48, &tf); fmt_get(view.format, &vf);
+    int bad = 0, checked = 0;
+    GLenum error = GL_NO_ERROR;
+    for (int i = 0; i < 130; i++) {
+        Tex *t = &targets[i];
+        t->b.target = 1; t->b.width = t->b.height = 4; t->b.depth = t->b.levels = 1; t->b.format = 0x48;
+        glGenTextures(1, &t->o.gl); glBindTexture(GL_TEXTURE_2D, t->o.gl);
+        glTexStorage2D(GL_TEXTURE_2D, 1, tf.internal, 4, 4);
+        TexObj *scratch = bc_target(t, &view);
+        if (!scratch || g_bcsh_n > 64) { bad = 1; break; }  /* fail before an unbounded scan can read past the cache */
+        uint32_t block[4] = {(uint32_t)i, 0x12345678, 0x87654321, 0xabcdef01};
+        glClearTexImage(scratch->gl, 0, vf.format, vf.type, block);
+        error = glGetError();
+        if (error) { bad = 1; break; }
+        bc_flush();
+        checked++;
+    }
+    for (int i = 0; i < checked; i++) {
+        uint32_t got[4] = {0}, expected[4] = {(uint32_t)i, 0x12345678, 0x87654321, 0xabcdef01};
+        glGetCompressedTextureSubImage(targets[i].o.gl, 0, 0, 0, 0, 4, 4, 1, sizeof got, got);
+        if (memcmp(got, expected, sizeof got)) bad = 1;
+    }
+    if (!bad) {
+        int count = g_bcsh_n;
+        TexObj *first = bc_target(&targets[129], &view), *again = bc_target(&targets[129], &view);
+        if (!first || first != again || g_bcsh_n != count) bad = 1;
+        bc_flush();
+    }
+    GLenum read_error = glGetError();
+    if (read_error) { error = read_error; bad = 1; }
+    printf("BC cache self-test: %d targets, %d cached, preserved compressed blocks and reused target, GL error 0x%x: %s\n",
+           checked, g_bcsh_n, error, bad ? "FAIL" : "PASS");
+    fflush(stdout); ExitProcess(bad ? 1 : 0);
 }
 static TexObj *rt_view(Tex *t, const View *v) {
     {   TexObj *o = bc_target(t, v); if (o) return o; }
@@ -5762,6 +5803,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     shd_init();
     hitch_set_render();
     arena_selftest();                            /* SSBU_ARENA_SELFTEST: rollover must preserve this draw's inputs */
+    bc_cache_selftest();                         /* SSBU_BC_CACHE_SELFTEST: wrap the scratch cache twice and check its copies */
     frozen_clear_selftest();                     /* SSBU_FROZEN_CLEAR_SELFTEST: a new UI must outlive an old snapshot */
     nvn_c4_gl_selftest_hook();                  /* SSBU_NVN_GLTEST: OpenGL self-test of nvn_c4.c, then exit */
     SetEvent(g_ready_event);
