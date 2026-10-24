@@ -687,6 +687,7 @@ static LONG64 g_spare_same_mem, g_spare_cleared;
 /* The game remakes a render target over the same pool memory and may read what the last one there held (a UI layer
  * kept from frame to frame): a spare made at the same memory is taken first, its texels are the right ones. A spare from
  * other memory holds another target's picture: it is cleared to zero (a new GL texture would start out that way). */
+static void alias_inherit(Tex *t);
 static int tex_take_spare(Tex *t) {
     if (!t->gpu_written || g_rb == &rb_vk) return 0;
     int pick = -1;
@@ -712,6 +713,7 @@ static int tex_take_spare(Tex *t) {
             while (glGetError()) {}
             g_spare_cleared++;
         }
+        alias_inherit(t);
     }
     return 1;
 }
@@ -770,6 +772,7 @@ static void tex_realize(Tex *t) {
     }
     if (e || g_debug) logf_limited(&nlog, 80, "nvn_gl: texture target %d format 0x%x %dx%dx%d levels %d samples %d flags 0x%x -> gl %u%s (error 0x%x)\n", b->target, b->format,
                                    b->width, b->height, b->depth, b->levels, b->samples, b->flags, t->o.gl, e ? " FAILED" : "", e);
+    if (!e) alias_inherit(t);
 }
 
 /* One level (one layer / face, or all slices of a 3D level) of tightly packed texels into the GL texture. */
@@ -1118,7 +1121,14 @@ void nvn_front_crash_notes(FILE *out) {                   /* hostrt.c: the textu
         if (g_freed[i].vinfo[0]) fprintf(out, "      views:%s\n", g_freed[i].vinfo);
     }
 }
+static void alias_handoff(Tex *t);
+static int rtlog_match(const Tex *t) {         /* TEST ONLY, TOMO_RTLOG=<w>x<h>[:<format hex>]: writes into such textures are logged */
+    static int lw = -2, lh, lf = -1;
+    if (lw == -2) { const char *e = getenv("TOMO_RTLOG"); lw = -1; if (e && sscanf(e, "%dx%d", &lw, &lh) != 2) lw = -1; if (e && strchr(e, ':')) lf = (int)strtol(strchr(e, ':') + 1, NULL, 16); }
+    return lw > 0 && t && t->b.width == lw && t->b.height == lh && (lf < 0 || t->b.format == lf);
+}
 static void tex_free_gl(Tex *t) {
+    alias_handoff(t);
     {   unsigned i = g_freed_n % 16; int nv = 0;
         for (VNode *n = t->views; n; n = n->next) nv++;
         g_freed[i].gl = t->o.gl; g_freed[i].target = t->b.target; g_freed[i].format = t->b.format; g_freed[i].w = t->b.width; g_freed[i].h = t->b.height; g_freed[i].d = t->b.depth;
@@ -3005,6 +3015,49 @@ static void alias_refresh(Tex *t) {
         glCopyImageSubData(a->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
     t->alias_tick = a->rt_tick;
 }
+/* A texture's new GL storage starts with the texels of the newest picture drawn into a texture of its shape over the same
+ * memory, as the console's memory would hold them. Seen: behind "Add a Mii" the game keeps a blurred copy of the frozen
+ * island in a texture object it makes anew every few frames over the same memory; with fresh (empty) storage the menu's
+ * background turned black (the older object, still named by the pool, kept its storage, so no same-memory spare existed). */
+static void alias_inherit(Tex *t) {
+    if (!t->mem || !t->storage || !t->o.gl || t->b.samples > 1) return;
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    Tex *best = NULL;
+    AcquireSRWLockShared(&g_tex_range_lock);
+    for (size_t i = tex_range_lower(begin); i < g_tex_range_count && g_tex_ranges[i].begin == begin; i++) {
+        Tex *o = g_tex_ranges[i].tex;
+        if (o == t || !o->o.gl || o->o.gl == t->o.gl || !o->rt_tick || (best && o->rt_tick <= best->rt_tick)) continue;
+        if (o->b.width != t->b.width || o->b.height != t->b.height || o->b.depth != t->b.depth || o->b.format != t->b.format
+            || o->b.target != t->b.target || o->b.levels != t->b.levels || o->b.samples != t->b.samples || o->rw != t->rw) continue;
+        best = o;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+    if (!best || !gl_has(glCopyImageSubData, "glCopyImageSubData")) return;
+    GLenum tg = gl_target(t->b.target, t->b.samples);
+    int w = tw(t), h = th(t), d = tex_layers(&t->b);
+    for (int l = 0; l < t->glevels && l < best->glevels; l++)
+        glCopyImageSubData(best->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
+    while (glGetError()) {}
+    t->alias_tick = best->rt_tick; t->gpu_written = 1;
+    {   static int nlog; logf_limited(&nlog, 5, "nvn_gl: new texture %dx%d format 0x%x takes the texels of the texture drawn last over its memory\n", t->b.width, t->b.height, t->b.format); }
+}
+/* Before the GL storage of a texture goes (finalized): the textures of its shape over the same memory that take their texels
+ * from it (alias_from) take them now; later there is nothing to take them from. Seen: the game draws the island into a
+ * texture made anew each frame and, behind its menus ("Add a Mii"), stops drawing it and shows a long-lived texture over the
+ * same memory (the last picture on the console): it stayed black. */
+static void alias_handoff(Tex *t) {
+    Tex *to[16];
+    int n = 0;
+    if (!g_alias_any || !t->mem || !t->storage || !t->o.gl || !t->rt_tick) return;
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    AcquireSRWLockShared(&g_tex_range_lock);
+    for (size_t i = tex_range_lower(begin); i < g_tex_range_count && g_tex_ranges[i].begin == begin && n < 16; i++) {
+        Tex *o = g_tex_ranges[i].tex;
+        if (o != t && o->alias_from == t && o->o.gl && o->o.gl != t->o.gl) to[n++] = o;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+    for (int i = 0; i < n; i++) { alias_refresh(to[i]); to[i]->alias_from = NULL; }
+}
 /* Before a texture becomes a render target: the newest picture drawn into another texture of its shape over the same memory
  * comes into it (the game binds a second texture object over a depth buffer for the colour pass of a depth pre-pass; with
  * its own empty GL storage the colour pass's depth test for equality let nothing through: the new Mii stayed invisible). */
@@ -3088,12 +3141,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         if (!S.fbo_w) { S.fbo_w = t->b.width; S.fbo_h = t->b.height; }
     }
     g_rt0_layer = k.layer[0]; g_rt0_level = k.level[0]; g_rt0_vset = n ? col[0].view.set : 0;
-    {   /* TEST ONLY, TOMO_RTLOG=<w>x<h>[:<format hex>]: a line each time such a texture becomes colour target 0 */
-        static int lw = -2, lh, lf = -1;
-        if (lw == -2) { const char *e = getenv("TOMO_RTLOG"); lw = -1; if (e && sscanf(e, "%dx%d", &lw, &lh) != 2) lw = -1; if (e && strchr(e, ':')) lf = (int)strtol(strchr(e, ':') + 1, NULL, 16); }
-        if (lw > 0 && S.color0 && S.color0->b.width == lw && S.color0->b.height == lh && (lf < 0 || S.color0->b.format == lf))
-            printf("rtlog: frame %lld gl %u mem %p born %lld\n", (long long)g_st.frames + 1, S.color0->o.gl, (void *)S.color0->mem, S.color0->born);
-    }
+    if (rtlog_match(S.color0)) printf("rtlog: frame %lld gl %u mem %p born %lld\n", (long long)g_st.frames + 1, S.color0->o.gl, (void *)S.color0->mem, S.color0->born);      /* TOMO_RTLOG */
     if (g_rsf != 1.0f) rs_pass(S.color0 ? S.color0 : S.depth_tex);
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
     g_fbo_bad_last = 0;
@@ -3127,7 +3175,9 @@ static int g_dlrt_n;                        /* draws logged by SSBU_DRAWLOG_RT *
 static int dlrt_match(void) {
     static int rw = -2, rh, rmax, rf = -1;      /* <w>x<h>[:<format hex>] */
     if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; if (e && strchr(e, ':')) rf = (int)strtol(strchr(e, ':') + 1, NULL, 16); rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
-    return rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && (rf < 0 || S.color0->b.format == rf) && g_dlrt_n < rmax;
+    static long long from = -2;                 /* SSBU_DRAWLOG_RT_FROM=<frame>: not before that frame */
+    if (from == -2) from = getenv("SSBU_DRAWLOG_RT_FROM") ? atoll(getenv("SSBU_DRAWLOG_RT_FROM")) : 0;
+    return rw > 0 && (long long)g_st.frames + 1 >= from && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && (rf < 0 || S.color0->b.format == rf) && g_dlrt_n < rmax;
 }
 static int drawlog_now(void) {
     static int drawlog = -2, mindraws, mindisp;
@@ -3853,6 +3903,8 @@ static void compute_bind_glsl(Prog *p) {
         int level = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, w = (st->glsl_images_w >> k & 1) != 0;
         GLenum fmt = st->glsl_img_fmt[k] ? st->glsl_img_fmt[k] : fmt_get(t->b.format, &f) ? f.internal : 0x8058;
         if (t->rw) { static int said; if (!said++) printf("nvn_gl: resolution scale: a compute stage uses a scaled texture (%dx%d format 0x%x) as an image: its coordinates are the game's (not converted)\n", t->b.width, t->b.height, t->b.format); }
+        if (w) { t->gpu_written = 1; t->rt_gen++; }              /* written by the dispatch: view copies of it refresh */
+        if (rtlog_match(t)) printf("rtlog: frame %lld image %d (compute) gl %u mem %p\n", (long long)g_st.frames + 1, k, t->o.gl, (void *)t->mem);
         glBindImageTexture((GLuint)k, tex_view_obj(t, &v)->gl, level, GL_TRUE, 0, w ? ((st->glsl_images_r >> k & 1) ? 0x88BA : 0x88B9) : 0x88B8, fmt);
         if (w) { t->gpu_written = 1; t->uploaded = 1; }
     }
@@ -4080,8 +4132,9 @@ static void rs_get(Tex *t, int level, int x, int y, int w, int h, GLenum fo, GLe
     glDeleteTextures(1, &tmp);
 }
 static void blit_tex(Tex *src, const View *sv, const int *sr, Tex *dst, const View *dv, const int *dr, int linear) {
+    if (rtlog_match(dst)) printf("rtlog: frame %lld copy into gl %u mem %p from %dx%d format 0x%x gl %u mem %p\n", (long long)g_st.frames + 1, dst->o.gl, (void *)dst->mem, src->b.width, src->b.height, src->b.format, src->o.gl, (void *)src->mem);
     tex_sync(src); tex_sync(dst);
-    dst->gpu_written = 1;
+    dst->gpu_written = 1; dst->rt_gen++;              /* view copies of it are refreshed (view_copies_refresh) */
     int s2[6], d2[6];
     if (src->rw || dst->rw) {                         /* resolution scale: the game's rectangles on the storage of each */
         memcpy(s2, sr, sizeof s2); memcpy(d2, dr, sizeof d2);
@@ -4512,6 +4565,8 @@ static void exec(const Cmd *m, int depth) {
         unsigned i = (unsigned)a[0] & 7, mask = (unsigned)a[2];
         if (!S.have_fbo || S.render_off) break;
         memcpy(v, blob, 16);
+        if (drawlog_now() || rtlog_match(S.color[i])) printf("clear: frame %lld colour %u of fbo %u (%dx%d, gl %u): %g %g %g %g mask %x\n", (long long)g_st.frames + 1, i, S.fbo, S.fbo_w, S.fbo_h,
+                                                          S.color[i] ? S.color[i]->o.gl : 0, v[0], v[1], v[2], v[3], mask);
         glColorMaski(i, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);
         if (a[5] == 1) glClearBufferiv(GL_COLOR, (GLint)i, (const GLint *)v);              /* ClearColori / ClearColorui say what the four words are */
         else if (a[5] == 2) glClearBufferuiv(GL_COLOR, (GLint)i, (const GLuint *)v);
@@ -4677,7 +4732,7 @@ static void exec(const Cmd *m, int depth) {
         else if (t->b.target != 2) layer += r[2];
         tex_put(t, &f, level, layer, r[0], r[1], r[2], r[3], r[4], r[5] > 0 ? r[5] : 1, P(a[0]));
         glPixelStorei(GL_UNPACK_ROW_LENGTH_, 0); glPixelStorei(0x806E, 0);
-        t->gpu_written = 1; t->uploaded = 1;
+        t->gpu_written = 1; t->uploaded = 1; t->rt_gen++;
         g_st.copies++;
         break;
     }
@@ -4753,7 +4808,12 @@ static void exec(const Cmd *m, int depth) {
         GLenum att[2] = {GL_DEPTH_ATTACHMENT_, GL_STENCIL_ATTACHMENT_};
         if (!S.have_fbo || !gl_has(glInvalidateFramebuffer, "glInvalidateFramebuffer")) break;
         if (a[0] == ~0ull) glInvalidateFramebuffer(GL_FRAMEBUFFER_, 2, att);
-        else { att[0] = GL_COLOR_ATTACHMENT0_ + (GLenum)(a[0] & 7); if (S.color[a[0] & 7]) glInvalidateFramebuffer(GL_FRAMEBUFFER_, 1, att); }
+        else {
+            static int keep = -1;            /* TEST TOMO_KEEPCOLOR=1: colour discards are not passed on (the driver may drop the texels; the console keeps them) */
+            if (keep < 0) keep = getenv("TOMO_KEEPCOLOR") && atoi(getenv("TOMO_KEEPCOLOR"));
+            att[0] = GL_COLOR_ATTACHMENT0_ + (GLenum)(a[0] & 7);
+            if (S.color[a[0] & 7] && !keep) glInvalidateFramebuffer(GL_FRAMEBUFFER_, 1, att);
+        }
         break;
     }
     case OP_CLEARTEX: {                        /* a0 texture, a4 channel mask, a5 0 float / 1 int / 2 uint, a6 whole level; blob: view, region, colour */
@@ -4764,7 +4824,7 @@ static void exec(const Cmd *m, int depth) {
         if (!t || t->dead || !gl_has(glFramebufferTextureLayer, "glFramebufferTextureLayer")) break;
         memcpy(&v, blob, sizeof v); copy_region(blob + 24, r);
         tex_sync(t);
-        t->gpu_written = 1; t->uploaded = 1;
+        t->gpu_written = 1; t->uploaded = 1; t->rt_gen++;
         int level = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, layer = (v.set & 0x82) == 0x82 ? v.lay0 : 0, layered = t->b.target == 2 || t->b.target == 3 || t->b.target == 4 || t->b.target == 8 || t->b.target == 9;
         if (a[6]) { r[0] = r[1] = r[2] = 0; r[3] = lvl(t->b.width, level); r[4] = lvl(t->b.height, level); r[5] = t->b.target == 2 ? lvl(t->b.depth, level) : 1; }
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo_tmp[1]);
@@ -4869,6 +4929,14 @@ static void exec(const Cmd *m, int depth) {
         GLuint tex = 0, smp = 0;
         static int nlog;
         if (!S.have_fbo || S.render_off) break;
+        {   /* the source takes the texels of the texture drawn last over its memory first, as a draw's textures do (view_copies_refresh) */
+            uint32_t tid = (uint32_t)a[0] & 0xfffff;
+            Tex *st = S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
+            if (st && !st->dead && st->o.gl && st->alias_from) alias_refresh(st);
+            if (drawlog_now() || rtlog_match(S.color0))
+                printf("drawtexture: frame %lld into fbo %u (%dx%d) from id 0x%x %dx%d format 0x%x gl %u mem %p\n", (long long)g_st.frames + 1, S.fbo, S.fbo_w, S.fbo_h, tid,
+                       st ? st->b.width : 0, st ? st->b.height : 0, st ? st->b.format : 0, st ? st->o.gl : 0, st ? (void *)st->mem : NULL);
+        }
         if (!resolve_names(S.tpool, S.spool, a[0], &tex, &smp)) { logf_limited(&nlog, 20, "nvn_gl: DrawTexture with handle 0x%llx: no such texture in the bound texture pool; nothing to draw\n", (unsigned long long)a[0]); break; }
         if (!nvn_c4_draw_texture_gl(tex, smp, (const NvnC4DrawTexture *)blob, S.alpha_func, S.alpha_ref)) {
             printf("nvn: stopping: nvnCommandBufferDrawTexture with a texture view that is not 2D or rectangle: what the GPU does is not established\n");
