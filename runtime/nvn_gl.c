@@ -7109,6 +7109,7 @@ static void fence_now(SyncObj *o, int flags) {
     if (o->dead) return;
     if (o->s) glDeleteSync(o->s);
     o->s = glFenceSync(0x9117 /* SYNC_GPU_COMMANDS_COMPLETE */, 0);
+    o->fence_frame = (long long)g_st.frames + 1;
     if (flags & 1) glFlush();                           /* NVN_SYNC_FLAG_FLUSH_FOR_CPU */
 }
 static void job_fence(void *arg) { SyncJob *j = arg; fence_now(j->o, j->flags); }
@@ -7129,7 +7130,11 @@ static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> 
     L1T("sync wait %llx%s", (unsigned long long)A0, hobj(A0, K_SYNC) == g_window_sync ? " (WINDOW texture)" : "");
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3};
+    LONG64 sw0 = pf_now();
     if (o) gl_run(g_rb->sync_wait, &j);
+    {   static int on = -1, n; if (on < 0) on = getenv("TOMO_SYNCLOG") != NULL;      /* TEST ONLY: which fence the game waits for, and how long */
+        if (on && o && g_st.frames > 1500 && n++ < 80) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+            printf("synclog: frame %lld waits on fence of frame %lld%s: %.2f ms, result %d%c", (long long)g_st.frames + 1, o->fence_frame, o == g_window_sync ? " (window)" : "", (double)(pf_now() - sw0) * 1000.0 / (double)f.QuadPart, j.result, 10); } }
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */
         l1_early_present();                                    /* L1 (latency = early / SSBU_L1_EARLY=1): the picture the game finished before this wait goes to the window now (at its tick) */

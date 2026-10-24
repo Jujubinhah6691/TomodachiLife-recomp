@@ -76,7 +76,7 @@ typedef struct {
     int r_n;
 } CmdBuf;
 typedef struct { int count, interval, nactive; Tex *tex[8]; int crop[4]; uint64_t native; } Window;
-typedef struct { void *s; volatile LONG dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
+typedef struct { void *s; volatile LONG dead; long long fence_frame; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
 
 /* ---------------------------------------------------------------- command lists */
 enum {
