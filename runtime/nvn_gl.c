@@ -260,7 +260,7 @@ static __declspec(thread) HANDLE t_done;
 static void gl_housekeeping(void);
 static void (*pf_job_submit)(void *), (*pf_job_present)(void *);
 static LONG64 g_joblog_frame, g_joblog_cur;
-static void joblog(void (*fn)(void *), LONG64 t);
+static void joblog(void (*fn)(void *), LONG64 t); static void job_read_texels(void *arg); static void job_write_texels(void *arg); static void job_rb_land_range(void *arg); static void job_submit_async(void *arg);
 static inline LONG64 pf_now(void);
 static int g_copy_views;                       /* views made as copies (tex_view_obj); none: view_copies_refresh has nothing to do */
 static inline void pf_add(int k, LONG64 t0);
@@ -301,6 +301,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     hitch_wait_render(1);
     WaitForSingleObject(j.done, INFINITE);
     hitch_wait_render(0);
+    if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) printf("joblog:   done after %.3f ms%c", (double)(pf_now() - pf0) * 1000.0 / 1e7, 10);
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
     if (fn != pf_job_submit && fn != pf_job_present) {           /* nvn_perf: the other jobs waited for, by function */
         LONG64 dt = pf_now() - pf0;
@@ -334,6 +335,7 @@ static int gl_async_on(void) {
 }
 static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /* run fn(copy of arg) on the render thread, in order, without waiting */
     if (GetCurrentThreadId() == g_render_tid) { fn((void *)arg); return; }
+    if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) joblog(fn, pf_now());      /* (posted, not waited for) */
     Job *j = malloc(sizeof *j + size + 8);
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
@@ -1400,12 +1402,32 @@ static GLuint g_arena;
 static size_t g_arena_pos;
 static struct { uint64_t addr, size; size_t off; uint32_t gen; } g_acache[8192];
 static uint32_t g_arena_gen = 1;
+/* Redundant state calls skipped: on the island (2760 draws a frame) most of the 80 000 GL calls a frame repeated the draw
+ * before. These remember what the render context has bound: every storage buffer range goes through gs_ssbo, and the code
+ * that binds pipeline 0 or deletes buffers calls gs_invalidate. TOMO_GSCACHE=0: every call made, as before. */
+static struct { GLuint buf; ptrdiff_t off, size; } g_gs_ssbo[96];
+static struct { GLuint buf; ptrdiff_t off; GLsizei stride; GLuint div; } g_gs_vb[16];
+static uint32_t g_gs_attr[16];
+static GLuint g_gs_vs, g_gs_fs;
+static int g_gs_pipe, g_gs_arb_on = 1, g_gs_alpha_on = 1, g_gs_on = -1;
+static void gs_invalidate(void) {
+    memset(g_gs_ssbo, 0, sizeof g_gs_ssbo); memset(g_gs_vb, 0, sizeof g_gs_vb); memset(g_gs_attr, 0, sizeof g_gs_attr);
+    g_gs_pipe = 0; g_gs_vs = g_gs_fs = 0; g_gs_arb_on = g_gs_alpha_on = 1;
+}
+static void gs_mode(void) { if (g_gs_on < 0) g_gs_on = getenv("TOMO_GSCACHE") ? atoi(getenv("TOMO_GSCACHE")) : 15; }      /* bits: 1 storage ranges, 2 programs, 4 attributes, 8 vertex buffers */
+static void gs_ssbo(GLuint i, GLuint buf, ptrdiff_t off, ptrdiff_t size) {
+    gs_mode();
+    if ((g_gs_on & 1) && i < 96 && g_gs_ssbo[i].buf == buf && g_gs_ssbo[i].off == off && g_gs_ssbo[i].size == size) return;
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, i, buf, off, size);
+    if (i < 96) { g_gs_ssbo[i].buf = buf; g_gs_ssbo[i].off = off; g_gs_ssbo[i].size = size; }
+}
 typedef struct ArenaOld { GLuint buf; struct ArenaOld *next; } ArenaOld;
 static ArenaOld *g_arena_old;
 static void arena_retire(void) {
     while (g_arena_old) {
         ArenaOld *old = g_arena_old; g_arena_old = old->next;
         glDeleteBuffers(1, &old->buf); free(old);
+        gs_invalidate();                             /* (a new buffer may get the old name) */
     }
 }
 
@@ -1437,7 +1459,7 @@ static void arena_selftest(void) {
     uint32_t got = 0;
     size_t off = arena_put_raw(&first, sizeof first);
     GLuint before = g_arena;
-    glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 0, before, (ptrdiff_t)off, sizeof first);
+    gs_ssbo(0, before, (ptrdiff_t)off, sizeof first);
     g_arena_pos = ARENA_SIZE;                     /* wrap after a draw has already bound one of its inputs */
     arena_put_raw(&second, sizeof second);
     glGetNamedBufferSubData(before, (ptrdiff_t)off, sizeof got, &got);
@@ -1486,7 +1508,7 @@ static int rb_stage(uint64_t size) {               /* a free staging buffer of a
     glCreateBuffers(1, &g_rbs[k].buf);
     glNamedBufferStorage(g_rbs[k].buf, (ptrdiff_t)cap, NULL, 0x1 | 0x40 | 0x80 | 0x200);      /* MAP_READ | PERSISTENT | COHERENT | CLIENT_STORAGE */
     g_rbs[k].map = glMapNamedBufferRange(g_rbs[k].buf, 0, (ptrdiff_t)cap, 0x1 | 0x40 | 0x80);
-    if (!g_rbs[k].map) { glDeleteBuffers(1, &g_rbs[k].buf); g_rbs[k].buf = 0; return -1; }
+    if (!g_rbs[k].map) { glDeleteBuffers(1, &g_rbs[k].buf); g_rbs[k].buf = 0; gs_invalidate(); return -1; }
     g_rbs[k].cap = cap;
     return k;
 }
@@ -3268,7 +3290,8 @@ static void bind_handle_table(int s, GLenum target, GLuint index, int skip) {
         S.tex_off[s] = arena_put_raw(S.gl_tex[s], sizeof S.gl_tex[s]);
         S.tex_gen[s] = g_arena_gen; S.tex_dirty[s] = 0;
     }
-    glBindBufferRange(target, index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
+    if (target == GL_SHADER_STORAGE_BUFFER_) gs_ssbo(index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
+    else glBindBufferRange(target, index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
 }
 /* Debug aid SSBU_DRAWLOG=<frame>: state of every draw of that frame, and how many samples each draw produced. */
 static LONG64 g_prev_frame_draws, g_drawlog_frame = -1, g_disp_frames, g_frame_dispatch;
@@ -3476,6 +3499,7 @@ static int draw_prepare(void) {
     PP(0);
     if (!S.have_fbo || S.render_off) return 0;
     if (g_frame_draw_index++ == g_dbg_skipdraw) return 0;
+    gs_mode();
     frozen_scene(S.depth_tex != NULL);
     for (int i = 0; i < 16 && i < S.nattr; i++) {
         int size, norm, integer = 0;
@@ -3499,20 +3523,21 @@ static int draw_prepare(void) {
             empty_fs = glCreateShaderProgramv(0x8B30, 1, src);
             printf("nvn_gl: first draw with a vertex stage only (program #%d): depth-only pass, empty fragment shader %u\n", S.prog[0]->serial, empty_fs);
         }
-        for (int s = 0; s < 5; s++) glDisable(k_prog_target[s]);
+        if (g_gs_arb_on || !(g_gs_on & 2)) { for (int s = 0; s < 5; s++) glDisable(k_prog_target[s]); g_gs_arb_on = 0; }
         GLuint pair = pair_mode() ? pair_get(S.prog[0]->st[0].glsl, depth_only ? empty_fs : S.prog[1]->st[1].glsl, depth_only ? "#version 450\nvoid main() {}\n" : NULL) : 0;
         if (pair) { if (g_pair_cur != pair) { glUseProgram(pair); g_pair_cur = pair; } g_pair_draws++; }
         else {
         pair_off();
-        glBindProgramPipeline(g_pipeline);
-        glUseProgramStages(g_pipeline, 1, S.prog[0]->st[0].glsl);
-        glUseProgramStages(g_pipeline, 2, depth_only ? empty_fs : S.prog[1]->st[1].glsl);
+        GLuint fsp = depth_only ? empty_fs : S.prog[1]->st[1].glsl;
+        if (!g_gs_pipe || !(g_gs_on & 2)) { glBindProgramPipeline(g_pipeline); g_gs_pipe = 1; g_gs_vs = g_gs_fs = 0; }
+        if (g_gs_vs != S.prog[0]->st[0].glsl) { glUseProgramStages(g_pipeline, 1, S.prog[0]->st[0].glsl); g_gs_vs = S.prog[0]->st[0].glsl; }
+        if (g_gs_fs != fsp) { glUseProgramStages(g_pipeline, 2, fsp); g_gs_fs = fsp; }
         }
         {   GLuint now[2] = {S.prog[0]->st[0].glsl, depth_only ? empty_fs : S.prog[1]->st[1].glsl};
             g_gs_draws++; g_gs_prog_same += now[0] == g_gs_last_prog[0] && now[1] == g_gs_last_prog[1];
             g_gs_last_prog[0] = now[0]; g_gs_last_prog[1] = now[1];
             pn_vs = now[0]; pn_fs = now[1]; pn_empty = depth_only; }
-        glDisable(GL_ALPHA_TEST);
+        if (g_gs_alpha_on || !(g_gs_on & 2)) { glDisable(GL_ALPHA_TEST); g_gs_alpha_on = 0; }
         for (int s = 0; s < (depth_only ? 1 : 2); s++)
             if (S.prog[s]->label_dirty) {          /* nvnProgramSetDebugLabel: the label goes to the OpenGL programs of its stages */
                 Prog *lp = S.prog[s];
@@ -3546,10 +3571,10 @@ static int draw_prepare(void) {
                     if (cb) {
                         if (st->glsl_ssbo_w >> n & 1) { if (!cb->dirty) cb->frag = 1; cb->dirty = 1; g_frag_ssbo_pending = 1; }
                         else if (g_frag_ssbo_pending) { glMemoryBarrier(0x2000); g_frag_ssbo_pending = 0; }     /* reads what an earlier draw's fragment stage wrote */
-                        glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, cb->buf, 0, (ptrdiff_t)S.ssbo[s][n].size);
+                        gs_ssbo(40 + (GLuint)s * 16 + n, cb->buf, 0, (ptrdiff_t)S.ssbo[s][n].size);
                     } else {
                         size_t off = arena_put(S.ssbo[s][n].addr, S.ssbo[s][n].size);
-                        glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
+                        gs_ssbo(40 + (GLuint)s * 16 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
                     }
                 }
             if (st->glsl_cbufs & 0x80000000u) bl_bind();        /* TEX.B: the bindless handle table */
@@ -3569,7 +3594,7 @@ static int draw_prepare(void) {
                 }
                 if (r.addr && r.size) {
                     size_t off = arena_put(r.addr, r.size);
-                    glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, (GLuint)s * 20 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
+                    gs_ssbo((GLuint)s * 20 + n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
                     g_gs_buf_bind++;
                 }
             }
@@ -3578,7 +3603,7 @@ static int draw_prepare(void) {
         PP(4);
     } else {
     pair_off();
-    glBindProgramPipeline(0);
+    glBindProgramPipeline(0); g_gs_pipe = 0; g_gs_arb_on = g_gs_alpha_on = 1;
     if (S.alpha_func && S.alpha_func != 8) { glEnable(GL_ALPHA_TEST); glAlphaFunc(nvn_func((unsigned)S.alpha_func), S.alpha_ref); } else glDisable(GL_ALPHA_TEST);
     if (!S.prog[0] || !stage_ready(S.prog[0], 0) || !S.prog[1] || !stage_ready(S.prog[1], 1)) {
         logf_limited(&nlog, 10, "nvn_gl: draw skipped: no usable vertex/fragment program (vertex #%d state %d, fragment #%d state %d)\n", S.prog[0] ? S.prog[0]->serial : -1,
@@ -3604,7 +3629,7 @@ static int draw_prepare(void) {
         for (uint32_t m = st->storage & ~storage, n = 0; m; m >>= 1, n++)
             if ((m & 1) && S.ssbo[s][n].addr && S.ssbo[s][n].size) {
                 size_t off = arena_put(S.ssbo[s][n].addr, S.ssbo[s][n].size);
-                glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
+                gs_ssbo(n, g_arena, (ptrdiff_t)off, (ptrdiff_t)S.ssbo[s][n].size);
                 storage |= 1u << n;
             }
     }
@@ -3614,9 +3639,12 @@ static int draw_prepare(void) {
         int fmt = (int)(a & 0xff), stream = (int)((a >> 8) & 31), size, norm, integer, on = 0;
         GLenum type;
         if (fmt && S.vbuf[stream].addr && S.vbuf[stream].size && vfmt_get(fmt, &size, &type, &norm, &integer)) {
-            if (integer) glVertexAttribIFormat((GLuint)i, size, type, a >> 14);
-            else glVertexAttribFormat((GLuint)i, size, type, (GLboolean)norm, a >> 14);
-            glVertexAttribBinding((GLuint)i, (GLuint)stream);
+            if (g_gs_attr[i] != a || !(g_gs_on & 4)) {
+                if (integer) glVertexAttribIFormat((GLuint)i, size, type, a >> 14);
+                else glVertexAttribFormat((GLuint)i, size, type, (GLboolean)norm, a >> 14);
+                glVertexAttribBinding((GLuint)i, (GLuint)stream);
+                g_gs_attr[i] = a;
+            }
             g_gs_attr_set++; g_gs_attr_same += g_gs_last_attr[i] == a; g_gs_last_attr[i] = a;
             on = 1;
         }
@@ -3631,9 +3659,12 @@ static int draw_prepare(void) {
     for (int i = 0; i < 16; i++)
         if (S.vbuf[i].addr && S.vbuf[i].size) {
             size_t off = arena_put(S.vbuf[i].addr, S.vbuf[i].size);
-            glBindVertexBuffer((GLuint)i, g_arena, (ptrdiff_t)off, (GLsizei)S.vstream[i].stride);
-            g_gs_vbuf_bind++;
-            glVertexBindingDivisor((GLuint)i, S.vstream[i].divisor);
+            if (g_gs_vb[i].buf != g_arena || g_gs_vb[i].off != (ptrdiff_t)off || g_gs_vb[i].stride != (GLsizei)S.vstream[i].stride || !(g_gs_on & 8)) {
+                glBindVertexBuffer((GLuint)i, g_arena, (ptrdiff_t)off, (GLsizei)S.vstream[i].stride);
+                g_gs_vb[i].buf = g_arena; g_gs_vb[i].off = (ptrdiff_t)off; g_gs_vb[i].stride = (GLsizei)S.vstream[i].stride;
+                g_gs_vbuf_bind++;
+            }
+            if (g_gs_vb[i].div != S.vstream[i].divisor + 1 || !(g_gs_on & 8)) { glVertexBindingDivisor((GLuint)i, S.vstream[i].divisor); g_gs_vb[i].div = S.vstream[i].divisor + 1; }
         }
     PP(6);
     apply_stencil();
@@ -4052,7 +4083,7 @@ static void compute_bind_glsl(Prog *p) {
         if (n == 1) { r.addr = (uint64_t)(uintptr_t)st->cdata_copy; r.size = st->cdata_copy ? st->ctl[3] : 0; } else r = S.ubo[5][n - 3];
         if (r.addr && r.size) {
             size_t off = arena_put(r.addr, r.size);
-            glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
+            gs_ssbo(n, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
         }
     }
     for (int k = 0; k < 8; k++) {
@@ -4074,7 +4105,7 @@ static void compute_bind_glsl(Prog *p) {
         static const uint32_t zero;
         if (!g_wmask_buf) glCreateBuffers(1, &g_wmask_buf);
         glNamedBufferData(g_wmask_buf, 4, &zero, 0x88EA);
-        glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, WMASK_BINDING, g_wmask_buf, 0, 4);
+        gs_ssbo(WMASK_BINDING, g_wmask_buf, 0, 4);
     }
 }
 static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
@@ -4128,15 +4159,15 @@ static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
         GLuint binding = text ? (GLuint)n : 40 + (GLuint)n;
         if (!(used >> n & 1) || !r.addr || !r.size) continue;
         held[n] = written >> n & 1 ? cbuf_get(r.addr, r.size) : cbuf_find(r.addr, r.size);
-        if (held[n]) glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, binding, held[n]->buf, 0, (ptrdiff_t)r.size);
+        if (held[n]) gs_ssbo(binding, held[n]->buf, 0, (ptrdiff_t)r.size);
         else {
             size_t off = arena_put(r.addr, r.size);
-            glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, binding, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
+            gs_ssbo(binding, g_arena, (ptrdiff_t)off, (ptrdiff_t)r.size);
         }
     }
     if (text) {
         pair_off();
-        glBindProgramPipeline(0);
+        glBindProgramPipeline(0); g_gs_pipe = 0;
         glEnable(GL_COMPUTE_PROGRAM_NV_);
         glBindProgramARB(GL_COMPUTE_PROGRAM_NV_, st->gl);
         for (int i = 0; i < st->nbuf; i++) {
@@ -5361,7 +5392,7 @@ static void bl_update(void) {                                /* render thread, b
         (void)nlog;
     }
 }
-static void bl_bind(void) { if (g_bl_buf) glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 39, g_bl_buf, 0, 65537 * 16); }
+static void bl_bind(void) { if (g_bl_buf) gs_ssbo(39, g_bl_buf, 0, 65537 * 16); }
 static void job_submit(void *arg) {
     SubmitJob *j = arg;
     static int nlog;
@@ -5598,7 +5629,8 @@ static void joblog(void (*fn)(void *), LONG64 t) {
     if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
     printf("joblog: frame %lld t=%.3f ms thread %lu %s%c", (long long)g_joblog_cur, (double)(t % (freq * 100)) * 1000.0 / (double)freq, (unsigned long)GetCurrentThreadId(),
            fn == job_submit ? "SubmitCommands" : fn == job_present ? "PresentTexture" : fn == job_fence ? "FenceSync" : fn == job_sync_wait ? "SyncWait" : fn == job_flush ? "Flush" :
-           fn == job_finish ? "Finish" : "other", 10);
+           fn == job_finish ? "Finish" : fn == job_submit_async ? "SubmitCommands (posted)" : fn == job_read_texels ? "ReadTexels" : fn == job_write_texels ? "WriteTexels" :
+           fn == job_nop ? "barrier" : fn == job_housekeeping ? "housekeeping" : fn == job_server_wait ? "QueueWaitSync" : fn == job_rb_land_range ? "rb_land_range" : "other", 10);
 }
 static void job_present(void *arg) {
     if (g_rbp_n) rb_land(0);
@@ -5633,7 +5665,7 @@ static void job_present(void *arg) {
                 fflush(stdout);
                 free(v);
             }
-            glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 38, dbb, 0, 65536);
+            gs_ssbo(38, dbb, 0, 65536);
         }
     }
     GetClientRect(g_hwnd, &r);
