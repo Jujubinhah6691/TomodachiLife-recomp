@@ -2794,12 +2794,16 @@ static Tex *unit_tex(int s, unsigned u) {
     uint32_t tid = (uint32_t)nh & 0xfffff;
     return nh && S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
 }
-static void view_copies_refresh(void) {               /* the copies standing for views of render targets (tex_view_obj), before a draw */
-    if (!g_copy_views) return;
+static void alias_refresh(Tex *t);
+static int g_alias_any;
+static void view_copies_refresh(void) {               /* the copies standing for views of render targets (tex_view_obj), and aliases, before a draw */
+    if (!g_copy_views && !g_alias_any) return;
     for (int s = 0; s < 5; s++)
         for (uint32_t m = units_sampled(s), u = 0; m; m >>= 1, u++) {
             Tex *t;
-            if (!(m & 1) || !(t = unit_tex(s, u)) || t->dead || !t->views || !t->o.gl) continue;
+            if (!(m & 1) || !(t = unit_tex(s, u)) || t->dead || !t->o.gl) continue;
+            if (t->alias_from) alias_refresh(t);
+            if (!t->views) continue;
             for (VNode *n = t->views; n; n = n->next) if (n->is_copy && n->copy_gen != t->rt_gen) view_copy_fill(t, n);
         }
 }
@@ -2916,6 +2920,36 @@ static TexObj *rt_view(Tex *t, const View *v) {
     return tex_view_obj(t, &v2);
 }
 static int g_rt0_layer, g_rt0_level, g_rt0_vset;      /* the draw log: layer / level of colour target 0 (-1: the whole texture or a view) */
+/* Textures of one shape over the same memory: the game renders into one (made anew each frame) and samples another one it
+ * keeps; on the console both are that memory. Here each has its own GL texture: the sampled one takes the texels of the
+ * one rendered last before a draw reads it (alias_refresh). Seen: the 140x900 side panels of the residents list showed
+ * another target's leftovers as coloured noise. */
+static long long g_rt_tick;
+static void rt_alias_note(Tex *t) {
+    t->rt_tick = ++g_rt_tick;
+    if (!t->mem || !t->storage) return;
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    AcquireSRWLockShared(&g_tex_range_lock);
+    for (size_t i = tex_range_lower(begin); i < g_tex_range_count && g_tex_ranges[i].begin == begin; i++) {
+        Tex *o = g_tex_ranges[i].tex;
+        if (o == t || o->dead || o->b.width != t->b.width || o->b.height != t->b.height || o->b.depth != t->b.depth || o->b.format != t->b.format
+            || o->b.target != t->b.target || o->b.levels != t->b.levels || o->b.samples != t->b.samples) continue;
+        o->alias_from = t; g_alias_any = 1;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+}
+static void alias_refresh(Tex *t) {
+    Tex *a = t->alias_from;
+    if (!a || a->rt_tick <= t->alias_tick || a->rt_tick <= t->rt_tick || !a->o.gl || !t->o.gl || a->o.gl == t->o.gl) return;
+    if (a == S.depth_tex) return;
+    for (int i = 0; i < 8; i++) if (S.color[i] == a) return;           /* still being drawn: later */
+    if (!gl_has(glCopyImageSubData, "glCopyImageSubData")) return;
+    GLenum tg = gl_target(t->b.target, t->b.samples);
+    int w = t->b.width > 0 ? t->b.width : 1, h = t->b.height > 0 ? t->b.height : 1, d = tex_layers(&t->b);
+    for (int l = 0; l < t->glevels && l < a->glevels; l++)
+        glCopyImageSubData(a->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, lvl(w, l), lvl(h, l), t->b.target == 2 ? lvl(t->b.depth > 0 ? t->b.depth : 1, l) : d);
+    t->alias_tick = a->rt_tick;
+}
 static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
     FboKey k;
     Fmt f;
@@ -2927,7 +2961,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = col[i].tex;
         if (!t || t->dead) continue;
         tex_sync(t);
-        t->gpu_written = 1; t->rt_gen++;
+        t->gpu_written = 1; t->rt_gen++; rt_alias_note(t);
         k.layer[i] = -1;
         if (layered_rt(t, &col[i].view)) {
             k.color[i] = t->o.gl;
@@ -2943,7 +2977,7 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         Tex *t = depth->tex;
         S.depth_tex = t;
         tex_sync(t);
-        t->gpu_written = 1; t->rt_gen++;
+        t->gpu_written = 1; t->rt_gen++; rt_alias_note(t);
         k.dlayer = -1;
         if (layered_rt(t, &depth->view)) {
             k.depth = t->o.gl;

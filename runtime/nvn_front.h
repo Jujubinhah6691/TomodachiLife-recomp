@@ -53,6 +53,8 @@ typedef struct Tex {
     uint32_t rt_gen;                       /* nvn_gl.c: bumped each time the texture becomes a render target */
     long long born, upframe;               /* nvn_gl.c TOMO_TEXBINDLOG: the frame of nvnTextureInitialize and of the last upload */
     long long last_bind, dead_frame;       /* nvn_gl.c: the last frame a draw resolved it, the frame it was finalized (gl_housekeeping) */
+    struct Tex *alias_from;                /* nvn_gl.c rt_alias_note: a texture of the same shape over the same memory that was a render target */
+    long long rt_tick, alias_tick;         /* when it was last a render target / last took its alias's texels (one counter for all textures) */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; } TexPoolEnt;
