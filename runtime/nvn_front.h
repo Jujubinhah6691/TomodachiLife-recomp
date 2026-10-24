@@ -35,6 +35,7 @@ typedef struct VNode { EView e; TexObj o; struct VNode *next; uint32_t copy_gen;
 typedef struct Tex {
     TexBuilder b;
     volatile LONG dead;
+    volatile LONG pool_refs;               /* nvn_gl.c: texture pool entries naming it; a finalized texture keeps its GL object while any does */
     uint8_t *mem, *limit;                  /* storage in the memory pool and the end of that pool */
     uint64_t guest;                        /* the NVNtexture */
     size_t storage, data_size;
@@ -50,6 +51,8 @@ typedef struct Tex {
     uint8_t *packaged_copy;                /* PR #41: owned until the initial upload consumes packaged texels */
     long long ahead_seen;                  /* session 8 (nvn_vk_draw.c tex_ahead): 1 + the frame the render thread first saw this record; -1 = looked at, not taken */
     uint32_t rt_gen;                       /* nvn_gl.c: bumped each time the texture becomes a render target */
+    long long born, upframe;               /* nvn_gl.c TOMO_TEXBINDLOG: the frame of nvnTextureInitialize and of the last upload */
+    long long last_bind, dead_frame;       /* nvn_gl.c: the last frame a draw resolved it, the frame it was finalized (gl_housekeeping) */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; } TexPoolEnt;

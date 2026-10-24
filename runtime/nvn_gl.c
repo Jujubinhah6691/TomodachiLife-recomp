@@ -361,6 +361,7 @@ static struct {
            dispatches, dispatch_run, dispatch_skipped, compute_bytes, draws_from_compute;
 } g_st;
 static LONG64 g_frame_draws, g_frame_skipped, g_frame_clears;
+static LONG64 g_fs_big, g_fs_bigclr, g_fs_rt, g_fs_disp;     /* TOMO_FRAMESUM: draws and clears on 2048-wide targets, target switches, dispatches */
 static int g_debug, g_logn;
 static const char *g_cur_op = "";
 static volatile LONG g_setshaders_calls, g_with_text, g_without_text;
@@ -875,6 +876,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
 /* Make the GL texture exist and hold what the guest memory holds. */
 static void tex_sync(Tex *t) {
     Fmt f;
+    if (t->dead) return;                           /* finalized: its memory may hold something else now */
     if (!t->o.gl) tex_realize(t);
     if (t->label_dirty && t->o.gl) { t->label_dirty = 0; if (glObjectLabel) glObjectLabel(0x1702 /* TEXTURE */, t->o.gl, -1, nvn_label_get(t->guest)); }
     if (t->checked == g_serial) return;
@@ -900,14 +902,15 @@ static void tex_sync(Tex *t) {
     while (glGetError()) {}
     pf0 = pf_now();
     { static int lf = -2; if (lf == -2) lf = getenv("TOMO_UPLOADLOG") ? atoi(getenv("TOMO_UPLOADLOG")) : -1;
-      if (lf >= 0 && g_st.frames >= lf && g_st.frames < lf + 2) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s\n", (long long)g_st.frames,
+      static int ln = -2; if (ln == -2) ln = getenv("TOMO_UPLOADLOG_N") ? atoi(getenv("TOMO_UPLOADLOG_N")) : 2;
+      if (lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s\n", (long long)g_st.frames,
           t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, t->uploaded ? " (again)" : " (first)", t->dirty ? " dirty" : ""); }
     { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f); HS_OUT(); }
     pf_add(PF_TEXUP, pf0);
     GLenum e = glGetError();
     static int nlog;
     if (e) logf_limited(&nlog, 20, "nvn_gl: upload of texture %dx%d format 0x%x target %d failed with GL error 0x%x\n", t->b.width, t->b.height, t->b.format, t->b.target, e);
-    t->hash = h; t->uploaded = 1; t->dirty = 0;
+    t->hash = h; t->uploaded = 1; t->dirty = 0; t->upframe = g_st.frames;
     tex_release_packaged(t);
     g_st.tex_uploads++;
 }
@@ -1185,7 +1188,11 @@ static int handle_lookup(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, Vie
     return have_sampler;
 }
 static uint64_t handle_make(Tex *t, View v, SamplerParams p, int have_sampler, uint64_t nh, uint32_t *dims, int *isint) {
-    if (!t || t->dead) return g_dummy_handle;
+    /* A finalized texture keeps being sampled until its GL object goes (deferred, gl_housekeeping): the game finalizes a texture
+     * while commands already recorded still name its pool entry, and the GPU reads the old texels from memory that is still
+     * there (its texture streaming moves the house's textures every few frames: they turned black or dark red for a frame). */
+    if (!t || (t->dead && !t->o.gl)) return g_dummy_handle;
+    t->last_bind = g_st.frames;
     tex_sync(t);
     TexObj *o = tex_view_obj(t, &v);
     {   /* what TXQ reports, and whether the shader must use an integer sampler */
@@ -1332,7 +1339,29 @@ static size_t arena_put_raw(const void *p, size_t n) {
  * staging memory behind a fence instead of read with a stall (the CPU waited for the whole batch: 6 ms a frame on the island).
  * They land in guest memory when the game's own wait on a later fence succeeds (job_sync_wait, Finish), at a present when
  * done, and before anything on this thread reads or writes guest memory over them (rb_land_range). Render thread only. */
-typedef struct { uint64_t addr, size; int slot; void *fence; } RbPend;
+typedef struct { uint64_t addr, size; int slot; void *fence; uint8_t *snap; } RbPend;
+/* GPU results go back to guest memory only where the GPU changed them: the words that differ from what the buffer held when it
+ * went to the GPU (snap). The game's CPU writes its inputs (camera near, far, aspect...) into the same buffers the compute
+ * programs write their results into; copied back whole, a late copy put last frame's inputs back over the new ones and the
+ * island's shadows jumped for a frame. */
+static void gpu_merge(uint8_t *dst, const uint8_t *gpu, const uint8_t *snap, size_t n) {
+    size_t i = 0;
+    if (!snap) { memcpy(dst, gpu, n); return; }
+    {   static int dbg = -1, nlog;                 /* TOMO_MERGELOG=1: words the CPU changed while the buffer was on the GPU */
+        if (dbg < 0) dbg = getenv("TOMO_MERGELOG") != NULL;
+        if (dbg && nlog < 400) {
+            int cpu = 0, both = 0, first = -1;
+            for (size_t k = 0; k + 4 <= n; k += 4) {
+                uint32_t d, g, o; memcpy(&d, dst + k, 4); memcpy(&g, gpu + k, 4); memcpy(&o, snap + k, 4);
+                if (d != o) { cpu++; if (first < 0) first = (int)k; if (g != o) both++; }
+            }
+            if (cpu) { nlog++; printf("mergelog: frame %lld buffer %p+%zu: %d words changed by the CPU (%d also by the GPU), first at +0x%x: cpu %08x snap %08x gpu %08x\n", (long long)g_st.frames, (void *)dst, n, cpu, both, first,
+                                    *(const uint32_t *)(dst + first), *(const uint32_t *)(snap + first), *(const uint32_t *)(gpu + first)); }
+        }
+    }
+    for (; i + 4 <= n; i += 4) { uint32_t g, o; memcpy(&g, gpu + i, 4); memcpy(&o, snap + i, 4); if (g != o) memcpy(dst + i, &g, 4); }
+    for (; i < n; i++) if (gpu[i] != snap[i]) dst[i] = gpu[i];
+}
 static RbPend g_rbp[64];
 static struct { GLuint buf; void *map; uint64_t cap; int busy; } g_rbs[64];
 static int rb_stage(uint64_t size) {               /* a free staging buffer of at least size bytes, or -1 */
@@ -1355,7 +1384,8 @@ static void rb_land(int wait) {                    /* land the read-backs the GP
         RbPend *q = &g_rbp[i];
         GLenum r = glClientWaitSync(q->fence, wait ? 1 : 0, wait ? 0xFFFFFFFFFFFFFFFFull : 0);
         if (r == 0x911B /* TIMEOUT_EXPIRED */) break;        /* the later ones are not done either (the GPU finishes in order) */
-        memcpy(P(q->addr), g_rbs[q->slot].map, (size_t)q->size);
+        gpu_merge(P(q->addr), g_rbs[q->slot].map, q->snap, (size_t)q->size);
+        free(q->snap); q->snap = NULL;
         g_rbs[q->slot].busy = 0;
         if (i + 1 == g_rbp_n || g_rbp[i + 1].fence != q->fence) glDeleteSync(q->fence);
         landed++;
@@ -2429,14 +2459,23 @@ static void gl_housekeeping(void) {
     if (g_grave_n) grave_sweep(0);
     if (!g_dead_n) return;
     EnterCriticalSection(&g_dead_lock);
+    int kept = 0;
     for (int i = 0; i < g_dead_n; i++) {
+        /* a finalized texture that a texture pool entry still names and that draws still use keeps its GL object for a while:
+         * the game goes on drawing through that entry for up to a second (the GPU reads the descriptor and the texels still in
+         * memory) before it registers the moved texture there; freed at once, those draws sampled the black dummy (the
+         * house's walls, deck and door flashing while its textures moved). Not drawn in the last two frames: freed. */
+        if (g_dead[i].kind == K_TEX) {
+            Tex *dt = g_dead[i].p;
+            if (dt->pool_refs > 0 && dt->last_bind >= g_st.frames - 2 && g_st.frames - dt->dead_frame < 300) { g_dead[kept++] = g_dead[i]; continue; }
+        }
         if (g_dead[i].kind == K_TEX) tex_free_gl(g_dead[i].p);
         else if (g_dead[i].kind == K_PROG) {
             Prog *p = g_dead[i].p;
             for (int s = 0; s < 6; s++) { if (p->st[s].gl) glDeleteProgramsARB(1, &p->st[s].gl); if (p->st[s].glsl && (s > 1 || g_shc_off > 0)) glDeleteProgram(p->st[s].glsl); free(p->st[s].text); memset(&p->st[s], 0, sizeof p->st[s]); }
         }
     }
-    g_dead_n = 0;
+    g_dead_n = kept;
     LeaveCriticalSection(&g_dead_lock);
 }
 
@@ -2968,8 +3007,9 @@ static int crange_hit(uint64_t addr, uint64_t size);
 static void compute_flush_at(int line);
 #define compute_flush() compute_flush_at(__LINE__)   /* the line: TOMO_LISTLOG counts read-backs by call site */
 static struct { int line; LONG64 n; } g_cfl_site[32];
-typedef struct { uint64_t addr, size; GLuint buf; int dirty, live, frag; } CBuf;   /* frag: written by a draw's fragment stage only */
+typedef struct { uint64_t addr, size; GLuint buf; int dirty, live, frag; uint8_t *snap; } CBuf;   /* frag: written by a draw's fragment stage only; snap: guest memory when it went to GL (gpu_merge) */
 static CBuf g_cbuf[64];
+static int g_frag_ssbo_pending;               /* a draw's fragment stage wrote a storage buffer since the last storage barrier */
 static int g_cbuf_live;
 static CBuf *cbuf_find(uint64_t addr, uint64_t size);
 static CBuf *cbuf_get(uint64_t addr, uint64_t size);
@@ -3116,7 +3156,8 @@ static int draw_prepare(void) {
                     static int nofrag = -1; if (nofrag < 0) nofrag = getenv("TOMO_NOFRAGSSBO") != NULL;
                     CBuf *cb = nofrag ? NULL : (st->glsl_ssbo_w >> n & 1) ? cbuf_get(S.ssbo[s][n].addr, S.ssbo[s][n].size) : cbuf_find(S.ssbo[s][n].addr, S.ssbo[s][n].size);
                     if (cb) {
-                        if (st->glsl_ssbo_w >> n & 1) { if (!cb->dirty) cb->frag = 1; cb->dirty = 1; }
+                        if (st->glsl_ssbo_w >> n & 1) { if (!cb->dirty) cb->frag = 1; cb->dirty = 1; g_frag_ssbo_pending = 1; }
+                        else if (g_frag_ssbo_pending) { glMemoryBarrier(0x2000); g_frag_ssbo_pending = 0; }     /* reads what an earlier draw's fragment stage wrote */
                         glBindBufferRange(GL_SHADER_STORAGE_BUFFER_, 40 + (GLuint)s * 16 + n, cb->buf, 0, (ptrdiff_t)S.ssbo[s][n].size);
                     } else {
                         size_t off = arena_put(S.ssbo[s][n].addr, S.ssbo[s][n].size);
@@ -3398,7 +3439,14 @@ static void compute_flush_at(int line) {
     for (int k = 0; k < 64; k++) {
         CBuf *b = &g_cbuf[k];
         if (!b->live) continue;
-        if (b->dirty) { LONG64 pf0 = pf_now(); HS_IN("compute read-back (glGetNamedBufferSubData)", 0); glGetNamedBufferSubData(b->buf, 0, (ptrdiff_t)b->size, P(b->addr)); HS_OUT(); pf_add(PF_CFLUSH, pf0); g_pf_cflush_bytes += (LONG64)b->size; g_st.compute_bytes += (LONG64)b->size; any = 1; }
+        if (b->dirty) {
+            static uint8_t *tmp; static size_t cap;
+            LONG64 pf0 = pf_now();
+            if (cap < b->size) { cap = (size_t)b->size; tmp = realloc(tmp, cap); }
+            HS_IN("compute read-back (glGetNamedBufferSubData)", 0); glGetNamedBufferSubData(b->buf, 0, (ptrdiff_t)b->size, tmp); HS_OUT();
+            gpu_merge(P(b->addr), tmp, b->snap, (size_t)b->size);
+            pf_add(PF_CFLUSH, pf0); g_pf_cflush_bytes += (LONG64)b->size; g_st.compute_bytes += (LONG64)b->size; any = 1;
+        }
         b->live = b->dirty = 0;
     }
     g_cbuf_live = 0;
@@ -3430,6 +3478,7 @@ static void compute_flush_async(void) {
             glCopyNamedBufferSubData(b->buf, g_rbs[st].buf, 0, 0, (ptrdiff_t)b->size);
             g_rbs[st].busy = 1;
             g_rbp[g_rbp_n].addr = b->addr; g_rbp[g_rbp_n].size = b->size; g_rbp[g_rbp_n].slot = st; g_rbp[g_rbp_n].fence = NULL;
+            g_rbp[g_rbp_n].snap = b->snap; b->snap = NULL;          /* the pending read-back owns it now */
             g_rbp_n++;
             g_st.compute_bytes += (LONG64)b->size;
         }
@@ -3453,6 +3502,7 @@ static CBuf *cbuf_get(uint64_t addr, uint64_t size) {
     if (!b) { compute_flush(); b = &g_cbuf[0]; }
     if (!b->buf) glCreateBuffers(1, &b->buf);
     glNamedBufferData(b->buf, (ptrdiff_t)size, P(addr), 0x88EA /* DYNAMIC_COPY */);
+    b->snap = realloc(b->snap, (size_t)size); if (b->snap) memcpy(b->snap, P(addr), (size_t)size);
     b->addr = addr; b->size = size; b->live = 1; b->dirty = 0; b->frag = 0;
     g_cbuf_live++;
     return b;
@@ -3674,10 +3724,13 @@ static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
         compute_bind_glsl(p);
     }
     nvn_front_ccmp_dispatch(S.ubo[5], S.ssbo[5], written, st->code, st->code_len, gx, gy, gz);      /* SSBU_COMPUTE_CMP */
+    if (g_frag_ssbo_pending) { glMemoryBarrier(0x2000 | 0x4 /* SHADER_STORAGE | UNIFORM */); g_frag_ssbo_pending = 0; }     /* what fragment stages wrote */
     glDispatchCompute(gx, gy, gz);
     if (glsl && st->glsl_images_w) glMemoryBarrier(0xffffffffu);
     if (written) {
-        glMemoryBarrier(0x200 /* BUFFER_UPDATE_BARRIER_BIT */);
+        /* later draws and dispatches read these buffers from GL (bound as storage, uniform, vertex, index or indirect data): without
+         * the barrier they could see part of the old contents (the island's shadow fit is computed this way: it jumped for a frame) */
+        glMemoryBarrier(0x2000 | 0x200 | 0x4 | 0x1 | 0x2 | 0x40 /* SHADER_STORAGE | BUFFER_UPDATE | UNIFORM | VERTEX_ATTRIB | ELEMENT | COMMAND */);
         if (glsl && log) {                       /* a translated program reports which storage buffers it really wrote (a GPU sync: only for the log) */
             uint32_t wm = 0;
             glGetNamedBufferSubData(g_wmask_buf, 0, 4, &wm);
@@ -3692,7 +3745,7 @@ static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
     }
     if (text) glDisable(GL_COMPUTE_PROGRAM_NV_);
     g_chist[h].run++;
-    g_st.dispatch_run++;
+    g_st.dispatch_run++; g_fs_disp++;
 }
 
 
@@ -3994,6 +4047,16 @@ static void exec(const Cmd *m, int depth) {
             int isint = 0;
             unsigned u = (unsigned)(first + i);
             { LONG64 pf0 = pf_now(); HS_IN("texture handle (view, sampler, bindless handle)", 0); S.gl_tex[stage][4 + u] = resolve_handle(S.tpool, S.spool, h, dims, &isint); HS_OUT(); pf_add(PF_HANDLE, pf0); }
+            {   static long long lo = -2, hi;      /* TOMO_TEXBINDLOG=<from>-<to>: binds of textures born or uploaded in the last 8 frames, or finalized */
+                if (lo == -2) { const char *e = getenv("TOMO_TEXBINDLOG"); lo = -1; if (e) sscanf(e, "%lld-%lld", &lo, &hi); }
+                if (lo >= 0 && g_st.frames >= lo && g_st.frames <= hi && S.tpool) {
+                    uint32_t tid = (uint32_t)h & 0xfffff;
+                    Tex *bt = tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
+                    if (bt && (bt->dead || g_st.frames - bt->born < 8 || (bt->uploaded && g_st.frames - bt->upframe < 8)))
+                        printf("texbind: frame %lld draw %d stage %d unit %u id 0x%x: %dx%dx%d fmt 0x%x mem %p gl %u born %lld uploaded %lld%s%s\n", (long long)g_st.frames, g_frame_draw_index, stage, u, tid,
+                               bt->b.width, bt->b.height, bt->b.depth, bt->b.format, (void *)bt->mem, bt->o.gl, bt->born, bt->uploaded ? bt->upframe : -1LL, bt->dead ? " DEAD" : "", S.gl_tex[stage][4 + u] == g_dummy_handle ? " DUMMY" : "");
+                }
+            }
             memcpy(&S.gl_tex[stage][48 + 2 * u], dims, 16);
             S.tex_int[stage] = (S.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
             S.tex_sint[stage] = (S.tex_sint[stage] & ~(1u << u)) | ((uint32_t)(isint == 2) << u);
@@ -4093,7 +4156,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_DEPTHRANGES:
         for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) { float v[2]; memcpy(v, blob + i * 8, 8); glDepthRangeIndexed((GLuint)a[0] + (GLuint)i, v[0], v[1]); }
         break;
-    case OP_TARGETS: set_targets((int)a[0], (const TargetRef *)blob, (const TargetRef *)blob + 8); if (S.ms_ext & 8) apply_multisample(); break;
+    case OP_TARGETS: g_fs_rt++; set_targets((int)a[0], (const TargetRef *)blob, (const TargetRef *)blob + 8); if (S.ms_ext & 8) apply_multisample(); break;
     case OP_STENCIL_REF: case OP_STENCIL_VMASK: case OP_STENCIL_MASK: {
         int *dst = m->op == OP_STENCIL_REF ? S.sref : m->op == OP_STENCIL_VMASK ? S.svmask : S.swmask;
         if (a[0] & 1) dst[0] = (int)a[1];
@@ -4133,7 +4196,7 @@ static void exec(const Cmd *m, int depth) {
             else glClearBufferuiv(GL_COLOR, (GLint)i, (const GLuint *)v);
         }
         apply_chanmask();
-        g_st.clears++; g_frame_clears++;
+        g_st.clears++; g_frame_clears++; if (S.fbo_w >= 2048) g_fs_bigclr++;
         break;
     }
     case OP_CLEARDS: {
@@ -4148,7 +4211,7 @@ static void exec(const Cmd *m, int depth) {
         glClear(bits);
         glDepthMask((S.ds >> 1) & 1);
         S.stencil_dirty = 1;
-        g_st.clears++; g_frame_clears++;
+        g_st.clears++; g_frame_clears++; if (S.fbo_w >= 2048) g_fs_bigclr++;
         break;
     }
     case OP_DRAW_ARRAYS: {
@@ -4170,7 +4233,7 @@ static void exec(const Cmd *m, int depth) {
         if (g_hitch_ms) hitch_draw(pf0);
         drawlog_end();
         draw_shot();
-        g_st.draws++; g_frame_draws++; count_dummy_samples();
+        g_st.draws++; g_frame_draws++; count_dummy_samples(); if (S.fbo_w >= 2048) g_fs_big++;
         break;
     }
     case OP_DRAW_ELEMENTS: {
@@ -4205,7 +4268,7 @@ static void exec(const Cmd *m, int depth) {
         if (g_hitch_ms) hitch_draw(pf0);
         drawlog_end();
         draw_shot();
-        g_st.draws++; g_frame_draws++; count_dummy_samples();
+        g_st.draws++; g_frame_draws++; count_dummy_samples(); if (S.fbo_w >= 2048) g_fs_big++;
         break;
     }
     case OP_COPY_BUF_TEX: {                    /* a0 buffer address, a1 texture, a4 flags, a5 / a6 row / image stride of its command buffer; blob: view, region */
@@ -4853,13 +4916,14 @@ static void job_present(void *arg) {
         }
         {   /* TOMO_FLICKER=1 (diagnosis): one-frame spikes in the presented picture. 48x27 cells of mean luminance; a cell of a frame
              * that differs by more than 12 from both the frame before and the one after, while those two agree, flickered. */
-            static int on = -1; static GLuint fb[2], smalltex; static uint8_t hist[3][48 * 27], *px; static int nh; static LONG64 seen, flick;
+            static int on = -1; static GLuint fb[2], smalltex; static uint8_t hist[3][48 * 27], *px, *ring[3]; static int nh; static LONG64 seen, flick;
             if (on < 0) on = getenv("TOMO_FLICKER") != NULL;
             if (on && t && t->o.gl && t->b.width > 0 && t->b.height > 0) {
                 if (!fb[0]) {
                     glGenFramebuffers(2, fb); glGenTextures(1, &smalltex);
                     glBindTexture(GL_TEXTURE_2D, smalltex); glTexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* RGBA8 */, 480, 270);
                     px = malloc(480 * 270 * 4);
+                    for (int k = 0; k < 3; k++) ring[k] = calloc(480 * 270, 4);
                 }
                 glBindFramebuffer(GL_READ_FRAMEBUFFER_, fb[0]); glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, fb[1]); glFramebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, smalltex, 0);
@@ -4871,6 +4935,7 @@ static void job_present(void *arg) {
                 glEnable(GL_SCISSOR_TEST);
                 glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
                 memmove(hist[0], hist[1], sizeof hist[0] * 2);
+                { uint8_t *o = ring[0]; ring[0] = ring[1]; ring[1] = ring[2]; ring[2] = o; memcpy(ring[2], px, 480 * 270 * 4); }
                 for (int cy = 0; cy < 27; cy++)
                     for (int cx = 0; cx < 48; cx++) {
                         unsigned sum = 0;
@@ -4885,13 +4950,32 @@ static void job_present(void *arg) {
                     }
                     seen++;
                     if (n) { flick++; printf("flicker: frame %lld: %d cells in x %d..%d y %d..%d (of 48x27)\n", (long long)frame - 1, n, x0, x1, y0, y1); }
-                    {   static int period = -2;     /* TOMO_FLICKER_PERIOD=<p>: after the first big flicker past frame 3000, the draw log of the frame p later and of the one before */
-                        if (period == -2) period = getenv("TOMO_FLICKER_PERIOD") ? atoi(getenv("TOMO_FLICKER_PERIOD")) : -1;
-                        if (period > 0 && n >= 20 && frame > 3000 && g_dl_force[0] < 0) {
+                    {   static int dumps = -2, dfrom;   /* TOMO_FLICKER_DUMP=<n>[,<frame>]: the frames before, of and after the first n flickers of 20 cells or more (past <frame>), 480x270 */
+                        if (dumps == -2) { const char *e = getenv("TOMO_FLICKER_DUMP"); dumps = e ? atoi(e) : 0; dfrom = e && strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 0; }
+                        if (dumps > 0 && n >= 20 && frame > dfrom) {
+                            dumps--;
+                            for (int k = 0; k < 3; k++) {
+                                char path[64]; snprintf(path, sizeof path, "flk_%lld_%c.ppm", (long long)frame - 1, 'a' + k);
+                                FILE *fp = fopen(path, "wb");
+                                if (!fp) continue;
+                                fprintf(fp, "P6 480 270 255\n");
+                                for (int y = 269; y >= 0; y--) for (int x = 0; x < 480; x++) fwrite(ring[k] + ((size_t)y * 480 + x) * 4, 1, 3, fp);
+                                fclose(fp);
+                            }
+                        }
+                    }
+                    {   static int period = -2, pfrom;     /* TOMO_FLICKER_PERIOD=<p>[,<frame>]: after the first big flicker past <frame> (3000), the draw log of the frame p later and of the one before */
+                        if (period == -2) { const char *e = getenv("TOMO_FLICKER_PERIOD"); period = e ? atoi(e) : -1; pfrom = e && strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 3000; }
+                        if (period > 0 && n >= 20 && frame > pfrom && g_dl_force[0] < 0) {
                             g_dl_force[0] = frame - 2 + period - 1; g_dl_force[1] = frame - 2 + period;
                             printf("flicker: draw log scheduled for rendered frames %lld and %lld\n", (long long)g_dl_force[0], (long long)g_dl_force[1]);
                         }
                         if (g_dl_force[0] >= 0 && (frame == g_dl_force[0] + 1 || frame == g_dl_force[1] + 1)) { char path[64]; snprintf(path, sizeof path, "flick_%lld.bmp", (long long)frame); save_bmp(path, t); }
+                    }
+                    {   static int shots = -2, from = 0, left;     /* TOMO_FLICKER_SHOTS=<n>[,<frame>]: after the first flicker of 100 cells or more past <frame> (2000), the next n frames as flick_<frame>.bmp */
+                        if (shots == -2) { const char *e = getenv("TOMO_FLICKER_SHOTS"); shots = e ? atoi(e) : 0; from = e && strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 2000; }
+                        if (shots > 0 && !left && n >= 100 && frame > from) { left = shots; shots = 0; printf("flicker: saving the next %d frames\n", left); }
+                        if (left > 0) { char path[64]; snprintf(path, sizeof path, "flick_%lld.bmp", (long long)frame); save_bmp(path, t); left--; }
                     }
                     if (seen % 600 == 0) printf("flicker: %lld of %lld frames flickered\n", (long long)flick, (long long)seen);
                 }
@@ -4929,6 +5013,13 @@ static void job_present(void *arg) {
     glEnable(GL_FRAMEBUFFER_SRGB_);
     glEnable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_FRAMEBUFFER_, S.have_fbo ? S.fbo : 0);
+    {   static long long lo = -2, hi;          /* TOMO_FRAMESUM=<from>-<to>: one line per frame with the counts above */
+        if (lo == -2) { const char *e = getenv("TOMO_FRAMESUM"); lo = -1; if (e) sscanf(e, "%lld-%lld", &lo, &hi); }
+        if (lo >= 0 && frame >= lo && frame <= hi)
+            printf("framesum: frame %lld: draws %lld clears %lld | 2048 targets: draws %lld clears %lld | target switches %lld dispatches %lld\n", (long long)frame, (long long)g_frame_draws, (long long)g_frame_clears,
+                   (long long)g_fs_big, (long long)g_fs_bigclr, (long long)g_fs_rt, (long long)g_fs_disp);
+        g_fs_big = g_fs_bigclr = g_fs_rt = g_fs_disp = 0;
+    }
     g_st.frames = frame;
     g_gpu_ts_base = now_ns(); g_gpu_ts_k = 0;
     if (frame <= 3 || frame % 600 == 0 || g_frame_draws != 0 && g_logn < 40 && (g_logn++, 1))
@@ -4981,7 +5072,7 @@ static void job_write_texels(void *arg) {
 /* The render thread's job loop (both back ends). */
 static void render_loop(void) {
     for (;;) {
-        WaitForSingleObject(g_job_event, INFINITE);
+        if (WaitForSingleObject(g_job_event, g_rbp_n ? 1 : INFINITE) == WAIT_TIMEOUT) { if (g_rb->idle) g_rb->idle(); continue; }     /* read-backs pending: look again in 1 ms */
         for (;;) {
             EnterCriticalSection(&g_job_lock);
             Job *j = g_job_head;
@@ -5534,6 +5625,7 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
                                t->b.width, t->b.height, t->b.format, (unsigned long long)t->b.packaged, (unsigned long long)t->data_size);
     }
     t->guest = A0;
+    t->born = g_st.frames;
     tex_range_add(t);
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
     RET(1);
@@ -5543,6 +5635,7 @@ static void tex_finalize(Ctx *c) {
     Tex *t = hobj(A0, K_TEX);
     if (!t) return;
     if (!t->dead) tex_range_remove(t);
+    t->dead_frame = g_st.frames;
     InterlockedExchange(&t->dead, 1);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
@@ -5622,6 +5715,8 @@ static void tpool_register(Ctx *c) {                   /* (pool, id, texture, vi
     e.tex = hobj(A2, K_TEX);
     if (A3) memcpy(&e.view, P(A3), sizeof e.view);
     AcquireSRWLockExclusive(&g_pool_lock);
+    Tex *old = tp->e[(uint32_t)A1].tex;
+    if (old != e.tex) { if (e.tex) InterlockedIncrement(&e.tex->pool_refs); if (old) InterlockedDecrement(&old->pool_refs); }
     tp->e[(uint32_t)A1] = e;
     ReleaseSRWLockExclusive(&g_pool_lock);
 }
@@ -6568,6 +6663,7 @@ static void tpool_finalize(Ctx *c) {
     TexPool *tp = hobj(A0, K_TPOOL);
     if (!tp) return;
     AcquireSRWLockExclusive(&g_pool_lock);
+    for (int i = 0; i < tp->count; i++) if (tp->e[i].tex) { InterlockedDecrement(&tp->e[i].tex->pool_refs); tp->e[i].tex = NULL; }
     tp->count = 0;                                      /* the record itself stays: recorded SetTexturePool commands may still name it */
     ReleaseSRWLockExclusive(&g_pool_lock);
     wr32(A0 + 8, 0);
@@ -6745,7 +6841,7 @@ void nvn_front_memory_retire(uint64_t addr, uint64_t size) {
         if (hit) { Range range = {addr, size}; gl_run(job_rb_land_range, &range); } }   /* OpenGL: TOMO_RETIRE_BARRIER=0 skips it (tried: the sea foam drew wrong); the game frees storage only after its fences (nvnSyncWait), which pass through the render thread (Tomodachi Life: 1.6 buffer finalizes a frame, 14 ms of waiting) */
 }
 /* Seam step S2: the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
-static void rb_gl_idle(void) { gl_housekeeping(); }
+static void rb_gl_idle(void) { gl_housekeeping(); if (g_rbp_n) rb_land(0); }     /* read-backs land as soon as the GPU is done (the game reads some results without a fence: late data made the island's shadows jump) */
 const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_present_movie, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,
                         job_write_texels, job_read_texels, job_housekeeping, job_reset_status, job_grid, rb_gl_idle};
 
