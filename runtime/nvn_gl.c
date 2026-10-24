@@ -3088,6 +3088,12 @@ static void set_targets(int n, const TargetRef *col, const TargetRef *depth) {
         if (!S.fbo_w) { S.fbo_w = t->b.width; S.fbo_h = t->b.height; }
     }
     g_rt0_layer = k.layer[0]; g_rt0_level = k.level[0]; g_rt0_vset = n ? col[0].view.set : 0;
+    {   /* TEST ONLY, TOMO_RTLOG=<w>x<h>[:<format hex>]: a line each time such a texture becomes colour target 0 */
+        static int lw = -2, lh, lf = -1;
+        if (lw == -2) { const char *e = getenv("TOMO_RTLOG"); lw = -1; if (e && sscanf(e, "%dx%d", &lw, &lh) != 2) lw = -1; if (e && strchr(e, ':')) lf = (int)strtol(strchr(e, ':') + 1, NULL, 16); }
+        if (lw > 0 && S.color0 && S.color0->b.width == lw && S.color0->b.height == lh && (lf < 0 || S.color0->b.format == lf))
+            printf("rtlog: frame %lld gl %u mem %p born %lld\n", (long long)g_st.frames + 1, S.color0->o.gl, (void *)S.color0->mem, S.color0->born);
+    }
     if (g_rsf != 1.0f) rs_pass(S.color0 ? S.color0 : S.depth_tex);
     if (!k.n && !k.depth) { glBindFramebuffer(GL_FRAMEBUFFER_, 0); return; }
     g_fbo_bad_last = 0;
@@ -3119,9 +3125,9 @@ static int g_dlrt_n;                        /* draws logged by SSBU_DRAWLOG_RT *
 /* SSBU_DRAWLOG_RT=<w>x<h>: the draws into a colour target of that size, in any frame (at most SSBU_DRAWLOG_RT_MAX, 300);
  * SSBU_DRAWLOG_RT_SHOT=1: also the target after each of them (dlrt_<n>.bmp and its alpha, dlrt_<n>_a.bmp) */
 static int dlrt_match(void) {
-    static int rw = -2, rh, rmax;
-    if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
-    return rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && g_dlrt_n < rmax;
+    static int rw = -2, rh, rmax, rf = -1;      /* <w>x<h>[:<format hex>] */
+    if (rw == -2) { const char *e = getenv("SSBU_DRAWLOG_RT"); rw = -1; if (e && sscanf(e, "%dx%d", &rw, &rh) != 2) rw = -1; if (e && strchr(e, ':')) rf = (int)strtol(strchr(e, ':') + 1, NULL, 16); rmax = getenv("SSBU_DRAWLOG_RT_MAX") ? atoi(getenv("SSBU_DRAWLOG_RT_MAX")) : 300; }
+    return rw > 0 && S.color0 && S.color0->b.width == rw && S.color0->b.height == rh && (rf < 0 || S.color0->b.format == rf) && g_dlrt_n < rmax;
 }
 static int drawlog_now(void) {
     static int drawlog = -2, mindraws, mindisp;
@@ -4613,6 +4619,16 @@ static void exec(const Cmd *m, int depth) {
             uint32_t mx = 0, mn = 0xffffffffu, first[6] = {0};
             for (int k = 0; k < count; k++) { uint32_t ix = t == 0 ? rd8(a[3] + (uint64_t)k) : t == 1 ? rd16(a[3] + (uint64_t)k * 2) : rd32(a[3] + (uint64_t)k * 4); if (k < 6) first[k] = ix; if (ix > mx) mx = ix; if (ix < mn) mn = ix; }
             printf("  indices at %llx: %u %u %u %u %u %u ... range %u..%u%c", (unsigned long long)a[3], first[0], first[1], first[2], first[3], first[4], first[5], mn, mx, 10);
+            if (S.nattr > 0 && (S.vattr[0] & 0xff) == 0x22 && mn <= mx) {          /* attribute 0 as three floats: the box of the vertices drawn */
+                int st = (int)((S.vattr[0] >> 8) & 31);
+                uint64_t stride = S.vstream[st].stride, base = S.vbuf[st].addr + (S.vattr[0] >> 14);
+                float bmn[3] = {1e30f, 1e30f, 1e30f}, bmx[3] = {-1e30f, -1e30f, -1e30f};
+                for (uint64_t v = mn + (uint64_t)(int64_t)(int32_t)a[4]; S.vbuf[st].addr && stride >= 12 && v <= mx + (uint64_t)(int64_t)(int32_t)a[4] && (v * stride + 12 + (S.vattr[0] >> 14)) <= S.vbuf[st].size; v++) {
+                    const float *p = P(base + v * stride);
+                    for (int k = 0; k < 3; k++) { if (p[k] < bmn[k]) bmn[k] = p[k]; if (p[k] > bmx[k]) bmx[k] = p[k]; }
+                }
+                printf("  drawn box: %g..%g %g..%g %g..%g%c", bmn[0], bmx[0], bmn[1], bmx[1], bmn[2], bmx[2], 10);
+            }
         }
         if (getenv("SSBU_DRAWSHOT_CLEAR") && getenv("SSBU_DRAWSHOT") && g_st.frames == atoi(getenv("SSBU_DRAWSHOT"))) { glDisable(GL_SCISSOR_TEST); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); glEnable(GL_SCISSOR_TEST); }
         drawlog_begin();
