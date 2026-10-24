@@ -638,8 +638,10 @@ static void vsync_test_key(void) {
 }
 
 void hitch_init(void); void hitch_pacing(int on);      /* hitch.c: SSBU_HITCH */
+static void pace_release_selftest(void);
 void display_init(void) {
     QueryPerformanceFrequency(&g_freq);
+    pace_release_selftest();
     /* P3 round 3: the console's waits with a time-out (nn::os::TimedWaitEvent, TimedReceiveMessageQueue, timed condition
      * variables: os_threads.c, SleepConditionVariableCS with whole milliseconds) end at the time asked for. At the
      * default Windows timer period they ended at the next 15.6 ms tick, so a thread that polls with a 1 ms time-out ran
@@ -1051,7 +1053,10 @@ void display_present_done(int fight) {
 /* New pacing, part 2: holds the caller until the refresh that shows the last queued frame. Returns 1 if it waited. */
 int display_wait_refresh(void) {
     if (old_pacing() || !InterlockedExchange(&g_latch_pending, 0)) return 0;
-    if (g_vsync_n >= g_latch) return 0;
+    if (g_vsync_n >= g_latch) {
+        QueryPerformanceCounter(&g_release_at);        /* An already-due refresh still starts a new frame's busy time. */
+        return 0;
+    }
     if (g_lockstep) {                                              /* SSBU_SPEED: see the comment at g_speed */
         static LONG64 due;                                         /* wall-clock time of the next refresh (QPC ticks) */
         LARGE_INTEGER a, now;
@@ -1123,6 +1128,32 @@ int display_wait_refresh(void) {
     QueryPerformanceCounter(&b);
     nvn_pf_pace(b.QuadPart - a.QuadPart);
     return 1;
+}
+static void pace_release_selftest(void) {
+    if (!getenv("SSBU_PACE_RELEASE_SELFTEST")) return;
+    int failed = 0;
+    g_old_pacing = 0;
+    g_adapt = 1;
+    g_interval = 1;
+    for (int i = 0; i < 15; i++) {
+        LARGE_INTEGER before, after, present;
+        QueryPerformanceCounter(&before);
+        g_release_at.QuadPart = before.QuadPart - g_freq.QuadPart / 10;
+        g_latch = 1;
+        g_vsync_n = 1 + (i & 1);
+        g_latch_pending = 1;
+        int waited = display_wait_refresh();
+        QueryPerformanceCounter(&after);
+        failed += waited != 0 || g_latch_pending != 0 || g_release_at.QuadPart < before.QuadPart || g_release_at.QuadPart > after.QuadPart;
+        present.QuadPart = after.QuadPart + g_freq.QuadPart * 8 / 1000;
+        adapt_frame(present);
+        LONGLONG released = g_release_at.QuadPart;
+        failed += display_wait_refresh() != 0 || g_release_at.QuadPart != released;
+    }
+    failed += g_interval != 1;
+    printf("display: release timestamp self-test: %s (%d failures, interval %ld)\n", failed ? "FAIL" : "PASS", failed, (long)g_interval);
+    fflush(stdout);
+    ExitProcess(failed ? 1 : 0);
 }
 /* Before a present: a frame queued earlier that nobody waited for (a caller that does not wait on the window sync). */
 void display_before_present(void) {
