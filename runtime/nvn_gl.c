@@ -7334,8 +7334,8 @@ static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> 
     SyncJob j = {o, 0, A1, 3};
     LONG64 sw0 = pf_now();
     if (o) gl_run(g_rb->sync_wait, &j);
-    {   static int on = -1, n; if (on < 0) on = getenv("TOMO_SYNCLOG") != NULL;      /* TEST ONLY: which fence the game waits for, and how long */
-        if (on && o && g_st.frames > 1500 && n++ < 80) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    {   static int on = -1, n; if (on < 0) on = getenv("TOMO_SYNCLOG") ? (atoi(getenv("TOMO_SYNCLOG")) > 1 ? atoi(getenv("TOMO_SYNCLOG")) : 1500) : 0;      /* TEST ONLY, TOMO_SYNCLOG=1|<from frame>: which fence the game waits for, and how long */
+        if (on && o && g_st.frames > on && n++ < 80) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
             printf("synclog: frame %lld waits on fence of frame %lld%s: %.2f ms, result %d%c", (long long)g_st.frames + 1, o->fence_frame, o == g_window_sync ? " (window)" : "", (double)(pf_now() - sw0) * 1000.0 / (double)f.QuadPart, j.result, 10); } }
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */
@@ -8065,10 +8065,28 @@ typedef struct { uint64_t addr, size; } InvalJob;
 static void job_invalidate(void *arg) {
     InvalJob *j = arg;
     uint64_t end = j->addr + j->size;
-    int n = 0;
+    int n = 0, walked = 0;
+    LONG64 t0 = pf_now(), t1;
     if (g_rbp_n) rb_land(1);
     if (g_cbuf_live) cbuf_flush_if(j->addr, j->size);
-    for (Tex *t = g_all_tex; t; t = t->all_next) {
+    t1 = pf_now();
+    /* the live textures over the range, from the range index: walking every record ever made (56,000 on the island)
+     * took 2.4 ms, twice a frame for the map's GPU pick */
+    static Tex **cand;
+    static size_t ccap;
+    size_t nc = 0;
+    AcquireSRWLockShared(&g_tex_range_lock);
+    if (g_tex_range_fallback)
+        for (Tex *t = g_all_tex; t; t = t->all_next) { if (nc == ccap) { ccap = ccap ? ccap * 2 : 64; cand = realloc(cand, ccap * sizeof *cand); } cand[nc++] = t; }
+    else {
+        size_t lo = 0, hi = g_tex_range_count;
+        while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (g_tex_ranges[mid].prefix_end <= j->addr) lo = mid + 1; else hi = mid; }
+        for (size_t i = lo; i < g_tex_range_count && g_tex_ranges[i].begin < end; i++)
+            if (g_tex_ranges[i].end > j->addr) { if (nc == ccap) { ccap = ccap ? ccap * 2 : 64; cand = realloc(cand, ccap * sizeof *cand); } cand[nc++] = g_tex_ranges[i].tex; }
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+    for (size_t k = 0; k < nc; k++, walked++) {         /* records are never freed: the pointers stay good */
+        Tex *t = cand[k];
         if (t->dead || !t->mem || !t->gpu_written || t->b.packaged || !t->o.gl) continue;
         uint64_t a = (uint64_t)(uintptr_t)t->mem;
         if (a >= end || a + t->storage <= j->addr) continue;
@@ -8079,7 +8097,8 @@ static void job_invalidate(void *arg) {
         n++;
     }
     static int log = -1; if (log < 0) log = getenv("TOMO_COPYLOG") != NULL;
-    if (log) printf("invalidate: %llx+%llu, %d texture(s) written back%c", (unsigned long long)j->addr, (unsigned long long)j->size, n, 10);
+    if (log) printf("invalidate: %llx+%llu, %d texture(s) written back (%d records walked; %.3f ms landing, %.3f ms walk and read)%c", (unsigned long long)j->addr, (unsigned long long)j->size, n, walked,
+                    (double)(t1 - t0) / 1e4, (double)(pf_now() - t1) / 1e4, 10);
 }
 static void obj_invalidate_range(Ctx *c) {
     uint64_t nvn_obj_memory(uint64_t obj), m = A0 ? nvn_obj_memory(A0) : 0;
@@ -8096,7 +8115,10 @@ static void obj_invalidate_range(Ctx *c) {
             hit = g_tex_ranges[i].end > j.addr && g_tex_ranges[i].tex->gpu_written;
     }
     ReleaseSRWLockShared(&g_tex_range_lock);
+    LONG64 w0 = pf_now();
     if (hit) gl_run(job_invalidate, &j);
+    static int log = -1; if (log < 0) log = getenv("TOMO_COPYLOG") != NULL;
+    if (log && hit) printf("invalidate: the game waited %.3f ms%c", (double)(pf_now() - w0) / 1e4, 10);
 }
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {
     {"nvnDeviceSetWindowOriginMode", dev_origin_mode}, {"nvnDeviceSetDepthMode", dev_depth_mode}, {"nvnDeviceGetTextureHandle", dev_texture_handle},
