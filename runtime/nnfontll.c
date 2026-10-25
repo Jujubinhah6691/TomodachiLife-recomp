@@ -712,6 +712,34 @@ static int32_t advance_fixed(const Engine *e, const FontData *f, uint32_t glyph)
     return (int32_t)(((int64_t)advance_units(f, glyph) * e->scale[0] + f->upem / 2) / f->upem);
 }
 
+/* The HOME button icon (U+E0F4). The open-source stand-in for the system's icon font (fonts_open: YuzuOSSExtension) has
+ * the filled A B X Y L R ZL ZR SL SR + - icons but not HOME, which the game names when you stop playing ("Please press
+ * HOME to return to the HOME Menu"); it drew its orange "?" there. A system font without it gets one here: the A icon's
+ * circle (its size and place, its advance) with a house cut out. The console's own font has it and is left alone. */
+#define HOME_CHAR 0xe0f4u
+#define HOME_LIKE 0xe0e0u
+static int synth_home(const FontData *f, uint32_t code) { return code == HOME_CHAR && f->shared && !map_char(f, code) && map_char(f, HOME_LIKE); }
+static void home_path(Path *path) {               /* path: the A icon's outline, replaced */
+    if (!path->n) return;
+    double x0 = path->p[0].x, x1 = x0, y0 = path->p[0].y, y1 = y0;
+    for (int i = 1; i < path->n; i++) {
+        if (path->p[i].x < x0) x0 = path->p[i].x;
+        if (path->p[i].x > x1) x1 = path->p[i].x;
+        if (path->p[i].y < y0) y0 = path->p[i].y;
+        if (path->p[i].y > y1) y1 = path->p[i].y;
+    }
+    double cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, r = (x1 - x0 < y1 - y0 ? x1 - x0 : y1 - y0) / 2;
+    static const double house[][2] = {{0, .52}, {.52, .02}, {.36, .02}, {.36, -.48}, {-.36, -.48}, {-.36, .02}, {-.52, .02}};   /* clockwise: a hole */
+    static const double door[][2] = {{-.1, -.48}, {.1, -.48}, {.1, -.16}, {-.1, -.16}};                                       /* counter-clockwise: filled */
+    path->n = path->contours = 0;
+    for (int k = 0; k < 64; k++) path_point(path, cx + r * cos(k * 6.283185307179586 / 64), cy + r * sin(k * 6.283185307179586 / 64));
+    path_close(path);
+    for (int k = 0; k < 7; k++) path_point(path, cx + r * house[k][0], cy + r * house[k][1]);
+    path_close(path);
+    for (int k = 0; k < 4; k++) path_point(path, cx + r * door[k][0], cy + r * door[k][1]);
+    path_close(path);
+}
+
 /* Builds a glyph map (malloc) for a character; never NULL unless memory runs out. */
 static uint8_t *make_glyphmap(Engine *e, uint32_t code, unsigned type) {
     FontData *f = current(e);
@@ -721,7 +749,8 @@ static uint8_t *make_glyphmap(Engine *e, uint32_t code, unsigned type) {
     memset(&g, 0, sizeof g);
     memset(&path, 0, sizeof path);
     if (f) {
-        uint32_t glyph = map_char(f, code);
+        int home = synth_home(f, code);
+        uint32_t glyph = map_char(f, home ? HOME_LIKE : code);
         if (f->no_alt && !alt_somewhere()) {
             LONG n = InterlockedIncrement(&f->drawn);
             if (code == ALT_CHAR) InterlockedIncrement(&f->alt_drawn);
@@ -730,6 +759,7 @@ static uint8_t *make_glyphmap(Engine *e, uint32_t code, unsigned type) {
         }
         dx = advance_fixed(e, f, glyph);
         glyph_path(f, glyph, e->scale, &path);
+        if (home) home_path(&path);
         rasterise(&path, &g);
         free(path.p);
         free(path.end);
@@ -1120,8 +1150,14 @@ static void note_miss(FontData *f, uint32_t code) {
     int k = 0;
     for (; k < f->miss_count && f->miss_codes[k] != code; k++) {}
     if (k == f->miss_count && f->miss_count < (int)(sizeof f->miss_codes / sizeof f->miss_codes[0])) { f->miss_codes[f->miss_count++] = code; fresh = f->miss_count; }
+    {   static uint32_t pua[64]; static int npua;        /* button icons (private use area) are always named: the list above fills with text */
+        int j = 0;
+        for (; j < npua && pua[j] != code; j++) {}
+        if (!fresh && code >= 0xe000 && code <= 0xf8ff && j == npua && npua < 64) { pua[npua++] = code; fresh = -1; }
+    }
     LeaveCriticalSection(&g_lock);
-    if (fresh) printf("nn::fontll: font \"%s\" has no glyph for U+%04X (distinct miss %d, misses so far %ld)\n", f->name, (unsigned)code, fresh, (long)n);
+    if (fresh < 0) printf("nn::fontll: font \"%s\" has no glyph for U+%04X (a button icon; misses so far %ld)\n", f->name, (unsigned)code, (long)n);
+    else if (fresh) printf("nn::fontll: font \"%s\" has no glyph for U+%04X (distinct miss %d, misses so far %ld)\n", f->name, (unsigned)code, fresh, (long)n);
     else if ((n & (n - 1)) == 0 && n >= 64) printf("nn::fontll: font \"%s\": %ld glyph checks missed so far, %ld glyph maps made, %ld of them the U+25A1 box\n",
                                                    f->name, (long)n, (long)f->drawn, (long)f->alt_drawn);
 }
@@ -1129,7 +1165,7 @@ static void note_miss(FontData *f, uint32_t code) {
 static void fe_CheckGlyphExist(Ctx *c) {
     Engine *e = engine(A0);
     FontData *f = current(e);
-    int yes = f && (map_char(f, (uint32_t)A1) & 0xffff) != 0;
+    int yes = f && ((map_char(f, (uint32_t)A1) & 0xffff) != 0 || synth_home(f, (uint32_t)A1));
     if (f && !yes && f->no_alt && !alt_somewhere()) {
         static volatile LONG told;
         if (!InterlockedExchange(&told, 1))
@@ -1147,7 +1183,7 @@ static void fe_CheckGlyphExist(Ctx *c) {
 static void fe_GetAdvance(Ctx *c) {
     Engine *e = engine(A0);
     FontData *f = current(e);
-    int32_t dx = f ? advance_fixed(e, f, map_char(f, (uint32_t)A5)) : 0;
+    int32_t dx = f ? advance_fixed(e, f, map_char(f, synth_home(f, (uint32_t)A5) ? HOME_LIKE : (uint32_t)A5)) : 0;
     e->error = f ? 0 : ERR_NO_FONT;
     if (A1) put16(HOST(A1), (dx + 0x8000) >> 16);
     if (A2) put16(HOST(A2), 0);
@@ -1300,6 +1336,7 @@ void register_fontll_imports(void) {
 #else
 /* ---------------------------------------------------------------- offline test: clang -DFONTLL_TEST nnfontll.c -lgdi32
  * fonttest <font file> <pixels> <text or U+hex ...> [outline n]: metrics, advances, glyph maps as text, kerning. */
+static int alt_somewhere(void) { return 1; }      /* one font, no game: no missing-character bookkeeping */
 int main(int argc, char **argv) {
     if (argc < 4) { printf("usage: fonttest <font> <pixels> <text|U+xxxx> [outline width] [pgm prefix]\n"); return 1; }
     InitializeCriticalSection(&g_lock);
@@ -1316,6 +1353,7 @@ int main(int argc, char **argv) {
     e.fonts[0].fd = font_data(data, 0);
     if (!e.fonts[0].fd) { printf("not a font\n"); return 1; }
     FontData *f = e.fonts[0].fd;
+    f->shared = 1;                                /* as a system font: the HOME stand-in (synth_home) applies */
     e.count = 1;
     e.current = 0;
     e.scale[0] = e.scale[3] = atoi(argv[2]) << 16;
