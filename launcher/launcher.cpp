@@ -1,724 +1,814 @@
-/* Tomodachi Life: Living the Dream - PC launcher.
+/* Tomodachi Life: Living the Dream - PC launcher (TomodachiLauncher.exe, beside the game in build\work).
  *
- * A small SDL3 + Dear ImGui program that lives beside the game in build\work (TomodachiLauncher.exe):
- *   - Play: checks the game files, starts the game the way scripts\play.ps1 does (a copy of the exe, the same
- *     environment, the log in build\work\play_<date>.log), hides itself while the game runs and reports how it ended;
- *   - Display / Audio: the options of build\config\graphics.ini that this port reads (gfx_options.c), edited in place
- *     (comments and unknown keys are kept);
- *   - Controls: the controllers SDL sees, and build\config\controllers.ini;
- *   - Saves: backups of build\userdata into build\saves\, restore (the current save is backed up first), open folders;
- *   - Tools: shader cache, logs, folders.
- * Built by scripts\build_launcher.sh with the toolchain of the port (clang, SDL3, imgui from ..\ssbu-recomp\deps). */
+ * Modelled on the Smash 4 PC launcher: a full-window picture of the island, the game's logo, and a menu for a pad, the
+ * keyboard or the mouse (chevrons around the selected item, its value at the right), a status line, a shader note and
+ * the version.
+ *   PLAY       starts the game the way scripts\play.ps1 does (a copy of the exe, the same environment, the log in
+ *              build\work\play_<date>.log), hides itself while it runs and says how it ended;
+ *   GAME       the game's files: a folder holding exefs\main.elf and romfs\ (build\dump unless another is chosen);
+ *   SETTINGS   the options of build\config\graphics.ini that the port reads, written when changed (comments and other
+ *              keys are kept);
+ *   SAVE DATA  backups of build\userdata into build\saves, restore (the current save is backed up first), folders;
+ *   CONTROLS   the controller SDL sees and the keyboard's keys; build\config\controllers.ini;
+ *   MORE       logs, graphics.ini, the shader cache, the port's folder.
+ * Pictures beside the exe, made from the player's own game files (scripts\launcher_art.py): title-logo.png, the game's
+ * logo; launcher-background.jpg, the island. Without them: a plain gradient and the name in text.
+ * --shot <file.bmp> [main|settings|saves|controls|more]: draws that screen off screen into a picture and exits.
+ * Built by scripts\build_launcher.sh (clang, SDL3 of ..\ssbu-recomp\deps, third_party\stb). */
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <time.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#include "stb_image.h"
+#include "paint.h"      // before the stb_truetype implementation below
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
 #include <SDL3/SDL.h>
-#include "imgui.h"
-#include "imgui_impl_sdl3.h"
-#include "imgui_impl_sdlrenderer3.h"
+#include <SDL3/SDL_main.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #ifndef LAUNCHER_VERSION
 #define LAUNCHER_VERSION "dev"
 #endif
 
+namespace fs = std::filesystem;
+using namespace paint;
+
+namespace {
+
 /* ------------------------------------------------------------------ paths */
-static char g_work[MAX_PATH], g_build[MAX_PATH], g_repo[MAX_PATH];
-static char g_ini[MAX_PATH], g_pads_ini[MAX_PATH], g_userdata[MAX_PATH], g_saves[MAX_PATH], g_cache[MAX_PATH];
-static char g_exe[MAX_PATH], g_play_exe[MAX_PATH], g_romfs[MAX_PATH], g_elf[MAX_PATH];
+fs::path g_work, g_build, g_repo, g_ini, g_pads_ini, g_launcher_ini, g_userdata, g_saves, g_cache, g_exe, g_play_exe;
 
-static void path_join(char *out, const char *a, const char *b) { snprintf(out, MAX_PATH, "%s\\%s", a, b); }
-static int file_exists(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
-static int dir_exists(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
-static void parent(char *p) { char *s = strrchr(p, '\\'); if (s) *s = 0; }
-
-static void paths_init(void) {
-    GetModuleFileNameA(NULL, g_work, MAX_PATH);
-    parent(g_work);                                          /* build\work */
-    strcpy(g_build, g_work); parent(g_build);                /* build */
-    strcpy(g_repo, g_build); parent(g_repo);
-    path_join(g_ini, g_build, "config\\graphics.ini");
-    path_join(g_pads_ini, g_build, "config\\controllers.ini");
-    path_join(g_userdata, g_build, "userdata");
-    path_join(g_saves, g_build, "saves");
-    path_join(g_cache, g_build, "cache\\shaders");
-    path_join(g_exe, g_work, "tomodachi_native.exe");
-    path_join(g_play_exe, g_work, "tomodachi_play.exe");
-    path_join(g_romfs, g_build, "dump\\romfs");
-    path_join(g_elf, g_build, "dump\\exefs\\main.elf");
+void paths_init() {
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    g_work = fs::path(p).parent_path();                 // build\work
+    g_build = g_work.parent_path();
+    g_repo = g_build.parent_path();
+    g_ini = g_build / "config" / "graphics.ini";
+    g_pads_ini = g_build / "config" / "controllers.ini";
+    g_launcher_ini = g_build / "config" / "launcher.ini";
+    g_userdata = g_build / "userdata";
+    g_saves = g_build / "saves";
+    g_cache = g_build / "cache" / "shaders";
+    g_exe = g_work / "tomodachi_native.exe";
+    g_play_exe = g_work / "tomodachi_play.exe";
 }
+bool is_file(const fs::path& p) { std::error_code e; return fs::is_regular_file(p, e); }
+bool is_dir(const fs::path& p) { std::error_code e; return fs::is_directory(p, e); }
+void open_path(const fs::path& p) { ShellExecuteW(nullptr, L"open", p.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+void edit_file(const fs::path& p) { ShellExecuteW(nullptr, L"open", L"notepad.exe", p.wstring().c_str(), nullptr, SW_SHOWNORMAL); }
 
-static void open_in_explorer(const char *p) { ShellExecuteA(NULL, "open", p, NULL, NULL, SW_SHOWNORMAL); }
-
-/* ------------------------------------------------------------------ graphics.ini, edited in place */
-#define INI_MAX 400
-static char *g_lines[INI_MAX];
-static int g_nlines, g_ini_dirty;
-
-static void ini_load(void) {
-    for (int i = 0; i < g_nlines; i++) free(g_lines[i]);
-    g_nlines = 0;
-    FILE *f = fopen(g_ini, "rb");
-    if (!f) return;
-    char buf[1024];
-    while (g_nlines < INI_MAX && fgets(buf, sizeof buf, f)) {
-        size_t n = strlen(buf);
-        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-        g_lines[g_nlines++] = _strdup(buf);
+/* ------------------------------------------------------------------ a "key = value" file edited in place */
+struct Ini {
+    fs::path path;
+    std::vector<std::string> lines;
+    void load(const fs::path& p) {
+        path = p;
+        lines.clear();
+        if (FILE* f = _wfopen(p.wstring().c_str(), L"rb")) {
+            char buf[1024];
+            while (fgets(buf, sizeof buf, f)) {
+                std::string s = buf;
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+                lines.push_back(s);
+            }
+            fclose(f);
+        }
     }
-    fclose(f);
-}
-static int ini_find(const char *key) {                     /* the line "key = value" (not a comment) */
-    size_t k = strlen(key);
-    for (int i = 0; i < g_nlines; i++) {
-        const char *s = g_lines[i];
-        while (*s == ' ' || *s == '\t') s++;
-        if (*s == ';' || *s == '#') continue;
-        if (!strncmp(s, key, k) && (s[k] == ' ' || s[k] == '=' || s[k] == '\t')) return i;
+    int find(const std::string& key) const {           // the line "key = value" (not a comment)
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const char* s = lines[i].c_str();
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == ';' || *s == '#') continue;
+            if (!strncmp(s, key.c_str(), key.size()) && (s[key.size()] == ' ' || s[key.size()] == '=' || s[key.size()] == '\t')) return int(i);
+        }
+        return -1;
     }
-    return -1;
-}
-static const char *ini_get(const char *key, const char *def) {
-    static char out[8][256]; static int slot;
-    int i = ini_find(key);
-    if (i < 0) return def;
-    const char *eq = strchr(g_lines[i], '=');
-    if (!eq) return def;
-    eq++;
-    while (*eq == ' ' || *eq == '\t') eq++;
-    char *o = out[slot = (slot + 1) & 7];
-    snprintf(o, 256, "%s", eq);
-    char *c = strpbrk(o, ";#"); if (c) *c = 0;              /* trailing comment */
-    size_t n = strlen(o); while (n && (o[n - 1] == ' ' || o[n - 1] == '\t')) o[--n] = 0;
-    return o;
-}
-static void ini_set(const char *key, const char *val) {
-    char line[512];
-    snprintf(line, sizeof line, "%s = %s", key, val);
-    int i = ini_find(key);
-    if (i >= 0) { if (!strcmp(g_lines[i], line)) return; free(g_lines[i]); g_lines[i] = _strdup(line); }
-    else if (g_nlines < INI_MAX) g_lines[g_nlines++] = _strdup(line);
-    g_ini_dirty = 1;
-}
-static int ini_save(void) {
-    FILE *f = fopen(g_ini, "wb");
-    if (!f) return 0;
-    for (int i = 0; i < g_nlines; i++) fprintf(f, "%s\r\n", g_lines[i]);
-    fclose(f);
-    g_ini_dirty = 0;
-    return 1;
-}
-
-/* ------------------------------------------------------------------ status line (toast) */
-static char g_toast[256];
-static double g_toast_until;
-static void toast(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt); vsnprintf(g_toast, sizeof g_toast, fmt, ap); va_end(ap);
-    g_toast_until = ImGui::GetTime() + 4.0;
-}
-
-/* ------------------------------------------------------------------ the game process */
-static PROCESS_INFORMATION g_game;
-static int g_running;
-static double g_started;
-static char g_log[MAX_PATH], g_last_result[256];
-static int g_last_ok = 1;
-
-static void game_start(SDL_Window *win) {
-    if (g_running) return;
-    if (!file_exists(g_exe)) { toast("The game is not built yet: tomodachi_native.exe is missing."); return; }
-    if (!file_exists(g_elf) || !dir_exists(g_romfs)) { toast("The game files are missing (build\\dump\\exefs and romfs)."); return; }
-    if (g_ini_dirty) ini_save();
-    if (!CopyFileA(g_exe, g_play_exe, FALSE) && !file_exists(g_play_exe)) { toast("Could not prepare the game (copy failed)."); return; }
-    /* the environment of scripts\play.ps1 */
-    SetEnvironmentVariableA("SSBU_ROMFS", g_romfs);
-    SetEnvironmentVariableA("SSBU_ERROR_DIALOG", "0");
-    if (!GetEnvironmentVariableA("SSBU_RENDERER", NULL, 0)) SetEnvironmentVariableA("SSBU_RENDERER", "gl");
-    SetEnvironmentVariableA("SSBU_OS_CONSOLE_CORES", "1");
-    SetEnvironmentVariableA("SSBU_KEYBOARD_PLAYER", "1");
-    SetEnvironmentVariableA("SSBU_SHOW", "1");
-    time_t now = time(NULL);
-    struct tm lt; localtime_s(&lt, &now);
-    char name[64], rec[MAX_PATH]; strftime(name, sizeof name, "play_%Y%m%d_%H%M%S.rec", &lt);
-    path_join(rec, g_work, name);
-    SetEnvironmentVariableA("SSBU_REC", rec);                 /* player 1's input, for replaying a bug as a test */
-    strcpy(strrchr(name, '.'), ".log");
-    path_join(g_log, g_work, name);
-    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
-    HANDLE log = CreateFileA(g_log, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOA si; memset(&si, 0, sizeof si); si.cb = sizeof si;
-    if (log != INVALID_HANDLE_VALUE) { si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = log; si.hStdError = log; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); }
-    char cmd[MAX_PATH * 3];
-    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\"", g_play_exe, g_elf);
-    memset(&g_game, 0, sizeof g_game);
-    BOOL ok = CreateProcessA(g_play_exe, cmd, NULL, NULL, log != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW, NULL, g_work, &si, &g_game);
-    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
-    if (!ok) { toast("Could not start the game (error %lu).", GetLastError()); return; }
-    g_running = 1; g_started = ImGui::GetTime();
-    SDL_HideWindow(win);
-}
-static void game_poll(SDL_Window *win) {
-    if (!g_running) return;
-    if (WaitForSingleObject(g_game.hProcess, 0) != WAIT_OBJECT_0) return;
-    DWORD code = 0;
-    GetExitCodeProcess(g_game.hProcess, &code);
-    CloseHandle(g_game.hProcess); CloseHandle(g_game.hThread);
-    g_running = 0;
-    double mins = (ImGui::GetTime() - g_started) / 60.0;
-    g_last_ok = code == 0;
-    if (code == 0) snprintf(g_last_result, sizeof g_last_result, "Last session: %.0f min, ended normally.", mins);
-    else snprintf(g_last_result, sizeof g_last_result, "Last session: %.0f min, ended with code 0x%08lX. The log has the details.", mins, (unsigned long)code);
-    SDL_ShowWindow(win); SDL_RaiseWindow(win);
-}
+    std::string get(const std::string& key, const std::string& def) const {
+        const int i = find(key);
+        if (i < 0) return def;
+        size_t eq = lines[i].find('=');
+        if (eq == std::string::npos) return def;
+        std::string v = lines[i].substr(eq + 1);
+        if (size_t c = v.find_first_of(";#"); c != std::string::npos) v.resize(c);      // trailing comment
+        const size_t a = v.find_first_not_of(" \t"), b = v.find_last_not_of(" \t");
+        return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+    }
+    void set(const std::string& key, const std::string& val) {
+        const std::string line = key + " = " + val;
+        if (int i = find(key); i >= 0) lines[i] = line;
+        else lines.push_back(line);
+        save();
+    }
+    bool save() const {
+        fs::create_directories(path.parent_path());
+        FILE* f = _wfopen(path.wstring().c_str(), L"wb");
+        if (!f) return false;
+        for (const std::string& l : lines) fprintf(f, "%s\r\n", l.c_str());
+        fclose(f);
+        return true;
+    }
+};
 
 /* ------------------------------------------------------------------ saves */
-#define MAX_BACKUPS 64
-static char g_backups[MAX_BACKUPS][MAX_PATH];
-static int g_nbackups;
-static char g_save_info[256];
-
-static long long dir_size(const char *dir, FILETIME *newest) {
-    char pat[MAX_PATH]; path_join(pat, dir, "*");
-    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+long long dir_size(const fs::path& dir, fs::file_time_type* newest) {
     long long total = 0;
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-        char p[MAX_PATH]; path_join(p, dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) total += dir_size(p, newest);
-        else {
-            total += ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            if (newest && CompareFileTime(&fd.ftLastWriteTime, newest) > 0) *newest = fd.ftLastWriteTime;
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    std::error_code e;
+    for (auto it = fs::recursive_directory_iterator(dir, e); !e && it != fs::recursive_directory_iterator(); it.increment(e)) {
+        if (!it->is_regular_file(e)) continue;
+        total += (long long)it->file_size(e);
+        if (newest && it->last_write_time(e) > *newest) *newest = it->last_write_time(e);
+    }
     return total;
 }
-static void saves_scan(void) {
-    FILETIME newest = {0, 0};
-    long long sz = dir_exists(g_userdata) ? dir_size(g_userdata, &newest) : 0;
-    if (!sz) snprintf(g_save_info, sizeof g_save_info, "No save yet: the game starts a new island.");
-    else {
-        SYSTEMTIME st, lt; FileTimeToSystemTime(&newest, &st); SystemTimeToTzSpecificLocalTime(NULL, &st, &lt);
-        snprintf(g_save_info, sizeof g_save_info, "Save found (%.1f MB), last written %04d-%02d-%02d %02d:%02d.", sz / 1048576.0, lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute);
+std::string when(fs::file_time_type t) {              // "Oct 25, 13:51"
+    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(t - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+    const time_t tt = std::chrono::system_clock::to_time_t(sys);
+    tm lt;
+    localtime_s(&lt, &tt);
+    char b[32];
+    strftime(b, sizeof b, "%b %d, %H:%M", &lt);
+    return b;
+}
+bool shell_op(UINT func, const fs::path& from, const fs::path& to = {}) {
+    std::wstring f = from.wstring(), t = to.wstring();
+    f.push_back(0); t.push_back(0);                       // double-NUL lists
+    SHFILEOPSTRUCTW op{};
+    op.wFunc = func; op.pFrom = f.c_str(); op.pTo = to.empty() ? nullptr : t.c_str();
+    op.fFlags = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_NOERRORUI | FOF_SILENT | (func == FO_DELETE ? FOF_ALLOWUNDO : 0);
+    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+}
+bool copy_contents(const fs::path& from, const fs::path& to) { fs::create_directories(to); return shell_op(FO_COPY, from / "*", to); }
+bool recycle(const fs::path& p) { return shell_op(FO_DELETE, p); }
+
+/* ------------------------------------------------------------------ pictures */
+Image load_image(SDL_Renderer* r, const fs::path& path) {
+    int w = 0, h = 0, n = 0;
+    FILE* f = _wfopen(path.wstring().c_str(), L"rb");
+    if (!f) return {};
+    stbi_uc* px = stbi_load_from_file(f, &w, &h, &n, 4);
+    fclose(f);
+    if (!px) return {};
+    SDL_Texture* t = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (t) {
+        SDL_UpdateTexture(t, nullptr, px, w * 4);
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
     }
-    g_nbackups = 0;
-    char pat[MAX_PATH]; path_join(pat, g_saves, "backup_*");
-    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && g_nbackups < MAX_BACKUPS) snprintf(g_backups[g_nbackups++], MAX_PATH, "%s", fd.cFileName);
-        while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
-    for (int i = 0; i < g_nbackups; i++)                     /* newest first (the names sort by date) */
-        for (int j = i + 1; j < g_nbackups; j++)
-            if (strcmp(g_backups[j], g_backups[i]) > 0) { char t[MAX_PATH]; strcpy(t, g_backups[i]); strcpy(g_backups[i], g_backups[j]); strcpy(g_backups[j], t); }
-}
-static int shell_copy(const char *from_dir, const char *to_dir) {      /* the contents of from_dir into to_dir */
-    char from[MAX_PATH + 4], to[MAX_PATH + 2];
-    memset(from, 0, sizeof from); memset(to, 0, sizeof to);
-    snprintf(from, MAX_PATH, "%s\\*", from_dir);
-    snprintf(to, MAX_PATH, "%s", to_dir);
-    CreateDirectoryA(to_dir, NULL);
-    SHFILEOPSTRUCTA op; memset(&op, 0, sizeof op);
-    op.wFunc = FO_COPY; op.pFrom = from; op.pTo = to;
-    op.fFlags = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_NOERRORUI | FOF_SILENT;
-    return SHFileOperationA(&op) == 0 && !op.fAnyOperationsAborted;
-}
-static int shell_recycle(const char *path) {
-    char from[MAX_PATH + 2]; memset(from, 0, sizeof from); snprintf(from, MAX_PATH, "%s", path);
-    SHFILEOPSTRUCTA op; memset(&op, 0, sizeof op);
-    op.wFunc = FO_DELETE; op.pFrom = from;
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-    return SHFileOperationA(&op) == 0;
-}
-static int backup_now(const char *tag) {
-    if (!dir_exists(g_userdata)) { toast("There is no save to back up yet."); return 0; }
-    CreateDirectoryA(g_saves, NULL);
-    time_t now = time(NULL); struct tm lt; localtime_s(&lt, &now);
-    char name[64], dst[MAX_PATH];
-    strftime(name, sizeof name, "backup_%Y%m%d_%H%M%S", &lt);
-    if (tag && tag[0]) { size_t n = strlen(name); snprintf(name + n, sizeof name - n, "_%s", tag); }
-    path_join(dst, g_saves, name);
-    int ok = shell_copy(g_userdata, dst);
-    saves_scan();
-    return ok;
+    stbi_image_free(px);
+    return {t, float(w), float(h)};
 }
 
-/* ------------------------------------------------------------------ look */
-static ImFont *g_font_body, *g_font_head, *g_font_title, *g_font_small;
-static const ImU32 C_INK = IM_COL32(52, 38, 20, 255), C_SOFT = IM_COL32(120, 92, 52, 255), C_CARD = IM_COL32(255, 248, 228, 250);
-static const ImU32 C_ORANGE = IM_COL32(255, 122, 26, 255), C_ORANGE_HI = IM_COL32(255, 150, 60, 255), C_CREAM = IM_COL32(255, 243, 214, 255);
-
-static void style_init(void) {
-    ImGuiStyle &s = ImGui::GetStyle();
-    s.WindowRounding = 0; s.FrameRounding = 14; s.GrabRounding = 14; s.PopupRounding = 12; s.ChildRounding = 18; s.ScrollbarRounding = 12;
-    s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(12, 12); s.WindowPadding = ImVec2(0, 0); s.WindowBorderSize = 0; s.ChildBorderSize = 0;
-    s.FrameBorderSize = 0; s.PopupBorderSize = 0; s.GrabMinSize = 22; s.ScrollbarSize = 14;
-    ImVec4 *c = s.Colors;
-    c[ImGuiCol_Text] = ImColor(52, 38, 20); c[ImGuiCol_TextDisabled] = ImColor(150, 125, 90);
-    c[ImGuiCol_WindowBg] = ImColor(0, 0, 0, 0); c[ImGuiCol_ChildBg] = ImColor(0, 0, 0, 0); c[ImGuiCol_PopupBg] = ImColor(255, 248, 228);
-    c[ImGuiCol_FrameBg] = ImColor(255, 230, 170); c[ImGuiCol_FrameBgHovered] = ImColor(255, 218, 140); c[ImGuiCol_FrameBgActive] = ImColor(255, 205, 110);
-    c[ImGuiCol_Button] = ImColor(255, 214, 120); c[ImGuiCol_ButtonHovered] = ImColor(255, 190, 80); c[ImGuiCol_ButtonActive] = ImColor(255, 165, 50);
-    c[ImGuiCol_Header] = ImColor(255, 214, 120); c[ImGuiCol_HeaderHovered] = ImColor(255, 190, 80); c[ImGuiCol_HeaderActive] = ImColor(255, 165, 50);
-    c[ImGuiCol_CheckMark] = ImColor(255, 122, 26); c[ImGuiCol_SliderGrab] = ImColor(255, 122, 26); c[ImGuiCol_SliderGrabActive] = ImColor(230, 100, 10);
-    c[ImGuiCol_Separator] = ImColor(235, 205, 150); c[ImGuiCol_ScrollbarBg] = ImColor(0, 0, 0, 0); c[ImGuiCol_ScrollbarGrab] = ImColor(240, 200, 120);
-    c[ImGuiCol_NavHighlight] = ImColor(255, 122, 26);
+/* ------------------------------------------------------------------ settings shown in SETTINGS */
+struct Choice { const char* value; const char* label; };
+struct Option { const char* label; const char* key; const char* def; std::vector<Choice> choices; };
+const std::vector<Option>& options() {
+    static const std::vector<Option> o = {
+        {"DISPLAY", "window", "windowed", {{"windowed", "Window"}, {"borderless", "Borderless"}, {"fullscreen", "Fullscreen"}}},
+        {"WINDOW SIZE", "size", "1280x720", {{"1280x720", "1280 x 720"}, {"1600x900", "1600 x 900"}, {"1920x1080", "1920 x 1080"}, {"2560x1440", "2560 x 1440"}, {"3840x2160", "3840 x 2160"}}},
+        {"RESOLUTION", "resolution_scale", "1.0", {{"1.0", "1080p"}, {"1.5", "1620p"}, {"2.0", "4K"}, {"3.0", "3240p"}}},
+        {"WIDESCREEN", "widescreen", "off", {{"off", "Off (16:9)"}, {"auto", "Fit the monitor"}, {"21:9", "21:9"}, {"32:9", "32:9"}}},
+        {"VSYNC", "vsync", "auto", {{"auto", "Automatic"}, {"display", "Follow the display"}, {"clock", "Own 60 Hz clock"}, {"off", "Off"}}},
+        {"VOLUME", "volume", "auto", {{"auto", "System"}, {"0", "0 %"}, {"10", "10 %"}, {"20", "20 %"}, {"30", "30 %"}, {"40", "40 %"}, {"50", "50 %"}, {"60", "60 %"}, {"70", "70 %"}, {"80", "80 %"}, {"90", "90 %"}, {"100", "100 %"}}},
+        {"LANGUAGE", "language", "auto", {{"auto", "Automatic"}, {"en", "English"}, {"fr", "Francais"}, {"de", "Deutsch"}, {"es", "Espanol"}, {"it", "Italiano"}, {"nl", "Nederlands"}, {"ja", "Japanese"}}},
+        {"IN-GAME MENU (F1)", "menu", "on", {{"on", "On"}, {"off", "Off"}}},
+        {"FRAME-TIME COUNTER", "frame_time_overlay", "off", {{"off", "Off"}, {"on", "On"}}},
+    };
+    return o;
 }
-static void fonts_init(void) {
-    ImGuiIO &io = ImGui::GetIO();
-    char win[MAX_PATH], semi[MAX_PATH], bold[MAX_PATH];
-    GetWindowsDirectoryA(win, MAX_PATH);
-    snprintf(semi, MAX_PATH, "%s\\Fonts\\seguisb.ttf", win);
-    snprintf(bold, MAX_PATH, "%s\\Fonts\\segoeuib.ttf", win);
-    ImFontConfig cfg; cfg.OversampleH = 3; cfg.OversampleV = 2;
-    if (file_exists(semi)) {
-        g_font_body = io.Fonts->AddFontFromFileTTF(semi, 19.0f, &cfg);
-        g_font_small = io.Fonts->AddFontFromFileTTF(semi, 15.0f, &cfg);
-    }
-    if (file_exists(bold)) {
-        g_font_head = io.Fonts->AddFontFromFileTTF(bold, 28.0f, &cfg);
-        g_font_title = io.Fonts->AddFontFromFileTTF(bold, 44.0f, &cfg);
-    }
-    if (!g_font_body) g_font_body = io.Fonts->AddFontDefault();
-    if (!g_font_small) g_font_small = g_font_body;
-    if (!g_font_head) g_font_head = g_font_body;
-    if (!g_font_title) g_font_title = g_font_head;
-    io.FontDefault = g_font_body;
-}
+const char* const k_keys[][2] = {                         // nnpad_sdl.c g_kb_default
+    {"A / confirm", "Z"}, {"B / back", "X"}, {"X / menu", "C"}, {"Y / residents", "V"}, {"Left stick", "Arrow keys"}, {"Camera", "T F G H"},
+    {"D-pad", "I J K L"}, {"L / R", "Q / E"}, {"ZL / ZR", "A / S"}, {"+ / -", "Enter / Backspace"}, {"Fullscreen", "F11"}, {"Settings", "F1"}};
 
-/* the moving background: the game's own kind of doodles (rings, dots, squiggles, triangles) on warm yellow */
-static void draw_background(ImDrawList *dl, ImVec2 size, float t) {
-    dl->AddRectFilledMultiColor(ImVec2(0, 0), size, IM_COL32(255, 220, 80, 255), IM_COL32(255, 205, 64, 255), IM_COL32(255, 178, 46, 255), IM_COL32(255, 190, 52, 255));
-    const ImU32 doodle = IM_COL32(255, 238, 150, 120);
-    for (int i = 0; i < 26; i++) {
-        float sx = fmodf(i * 0.6180339f * size.x + t * (8.0f + (i % 5) * 3.0f), size.x + 120) - 60;
-        float sy = fmodf(i * 0.3819660f * size.y * 2.3f + t * (5.0f + (i % 3) * 2.0f), size.y + 120) - 60;
-        float r = 10.0f + (i % 4) * 7.0f, a = t * 0.3f + i;
-        switch (i % 4) {
-        case 0: dl->AddCircle(ImVec2(sx, sy), r, doodle, 32, 5.0f); break;
-        case 1: dl->AddCircleFilled(ImVec2(sx, sy), r * 0.45f, doodle); break;
-        case 2: {
-            ImVec2 p[12];
-            for (int k = 0; k < 12; k++) p[k] = ImVec2(sx + (k - 6) * 6.0f * cosf(a) - sinf(k * 0.9f) * 7.0f * sinf(a), sy + (k - 6) * 6.0f * sinf(a) + sinf(k * 0.9f) * 7.0f * cosf(a));
-            dl->AddPolyline(p, 12, doodle, 0, 5.0f);
+/* ------------------------------------------------------------------ the launcher */
+enum class Screen { kMain, kSettings, kSaves, kControls, kMore };
+struct Item {
+    std::string label, value;
+    bool chevrons = false;     // a setting: left / right change the value
+};
+
+class Launcher {
+public:
+    Launcher(SDL_Window* w, SDL_Renderer* r) : window_(w), r_(r), paint_(r) {
+        gfx_.load(g_ini);
+        lini_.load(g_launcher_ini);
+        font_.open({g_work / "fonts" / "launcher.ttf", g_work / "fonts" / "launcher.otf", "C:/Windows/Fonts/bahnschrift.ttf", "C:/Windows/Fonts/segoeui.ttf"});
+        logo_ = load_image(r_, g_work / "title-logo.png");
+        background_ = load_image(r_, g_work / "launcher-background.jpg");
+        if (!background_.texture) background_ = load_image(r_, g_work / "launcher-background.png");
+        refresh();
+    }
+    bool running() const { return !quit_; }
+    bool game_running() const { return game_.hProcess != nullptr; }
+    void open_screen(const std::string& s) {
+        if (s == "settings") go(Screen::kSettings);
+        if (s == "saves") go(Screen::kSaves);
+        if (s == "controls") go(Screen::kControls);
+        if (s == "more") go(Screen::kMore);
+    }
+
+    void event(SDL_Event& e) {
+        SDL_ConvertEventToRenderCoordinates(r_, &e);
+        switch (e.type) {
+        case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: quit_ = true; break;
+        case SDL_EVENT_KEY_DOWN:
+            switch (e.key.key) {
+            case SDLK_UP: case SDLK_W: move(-1); break;
+            case SDLK_DOWN: case SDLK_S: move(1); break;
+            case SDLK_LEFT: case SDLK_A: change(-1); break;
+            case SDLK_RIGHT: case SDLK_D: change(1); break;
+            case SDLK_RETURN: case SDLK_SPACE: case SDLK_KP_ENTER: if (!e.key.repeat) activate(); break;
+            case SDLK_ESCAPE: case SDLK_BACKSPACE: if (!e.key.repeat) back(); break;
+            case SDLK_F11: SDL_SetWindowFullscreen(window_, !(SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN)); break;
+            default: break;
+            }
+            break;
+        case SDL_EVENT_GAMEPAD_ADDED: SDL_OpenGamepad(e.gdevice.which); refresh(); break;
+        case SDL_EVENT_GAMEPAD_REMOVED: refresh(); break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            switch (e.gbutton.button) {
+            case SDL_GAMEPAD_BUTTON_DPAD_UP: move(-1); break;
+            case SDL_GAMEPAD_BUTTON_DPAD_DOWN: move(1); break;
+            case SDL_GAMEPAD_BUTTON_DPAD_LEFT: change(-1); break;
+            case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: change(1); break;
+            case SDL_GAMEPAD_BUTTON_SOUTH: case SDL_GAMEPAD_BUTTON_START: activate(); break;      // A (positional, as the game)
+            case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_BACK: back(); break;
+            default: break;
+            }
+            break;
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) stick_y_ = e.gaxis.value / 32767.0f;
+            if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) stick_x_ = e.gaxis.value / 32767.0f;
+            break;
+        case SDL_EVENT_MOUSE_MOTION:
+            if (time_ > 0.3f && (e.motion.xrel != 0 || e.motion.yrel != 0)) mouse_moved_ = true;     // (not the motion a new window reports)
+            if (int i = item_at(e.motion.x, e.motion.y); i >= 0 && mouse_moved_) selected_ = i;
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            if (e.button.button == SDL_BUTTON_LEFT) {
+                if (int i = item_at(e.button.x, e.button.y); i >= 0) {
+                    selected_ = i;
+                    if (list_[i].chevrons) change(e.button.x < layout_.right_chevron - layout_.h * 0.06f ? -1 : 1);
+                    else activate();
+                }
+            }
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_UP: if (e.button.button == 4 /* X1 */) back(); break;
+        default: break;
+        }
+    }
+
+    void update(float dt) {
+        time_ += dt;
+        const auto repeat = [&](float v, float& held, auto&& action) {      // the stick repeats while held
+            if (std::fabs(v) < 0.5f) { held = 0; return; }
+            if (held == 0 || held > 0.4f) { action(v > 0 ? 1 : -1); if (held > 0.4f) held = 0.28f; }
+            held += dt;
+        };
+        repeat(stick_y_, held_y_, [&](int d) { move(d); });
+        repeat(stick_x_, held_x_, [&](int d) { change(d); });
+        selection_y_ = ease(selection_y_, float(selected_), dt, 18);
+        fade_ = std::min(1.0f, fade_ + dt * 5.5f);
+        if (game_.hProcess && WaitForSingleObject(game_.hProcess, 0) == WAIT_OBJECT_0) {
+            DWORD code = 0;
+            GetExitCodeProcess(game_.hProcess, &code);
+            CloseHandle(game_.hProcess); CloseHandle(game_.hThread);
+            game_ = {};
+            exit_code_ = code;
+            session_min_ = int((SDL_GetTicks() - started_) / 60000);
+            SDL_ShowWindow(window_); SDL_RaiseWindow(window_);
+            refresh();
+        }
+        std::string chosen;
+        bool done = false;
+        {
+            std::lock_guard<std::mutex> lock(dialog_mutex_);
+            chosen.swap(dialog_result_);
+            std::swap(done, dialog_done_);
+        }
+        if (done && !chosen.empty()) {
+            game_dir_ = chosen;
+            lini_.set("game", chosen);
+            refresh();
+            if (play_after_dialog_ && ready()) play();
+        }
+        if (done) play_after_dialog_ = false;
+    }
+
+    void draw(SDL_Texture* target = nullptr) {
+        int w = 0, h = 0;
+        if (target) { float fw, fh; SDL_GetTextureSize(target, &fw, &fh); w = int(fw); h = int(fh); }
+        else SDL_GetCurrentRenderOutputSize(r_, &w, &h);
+        layout_ = Layout(float(w), float(h), list_.size(), screen_ == Screen::kMain);
+        const float W = layout_.w, H = layout_.h;
+        SDL_SetRenderDrawBlendMode(r_, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r_, 10, 14, 24, 255);
+        SDL_RenderClear(r_);
+        draw_background();
+        if (logo_.texture) {                                     // the logo, top left
+            const float lh = H * 0.30f, lw = lh * logo_.width / logo_.height;
+            paint_.image(logo_, {W * 0.055f, H * 0.055f, lw, lh});
+        } else {
+            font_.draw(r_, W * 0.07f, H * 0.17f, "TOMODACHI LIFE", H * 0.075f, kWhite);
+            font_.draw(r_, W * 0.07f, H * 0.24f, "Living the Dream - PC", H * 0.04f, kGold);
+        }
+        // the menu: the selected item between chevrons
+        const float alpha = fade_, slide = (1 - fade_) * H * 0.03f, px = H * layout_.px;
+        const float sel_y = layout_.item_y(selection_y_) - px * 0.36f;
+        const float pulse = 0.85f + 0.15f * std::sin(time_ * 4.0f);
+        const Color chev{1, 1, 1, alpha * pulse};
+        paint_.chevron(layout_.left_chevron - slide, sel_y, H * 0.034f, -1, H * 0.0042f, chev);
+        paint_.chevron(layout_.right_chevron + slide, sel_y, H * 0.034f, 1, H * 0.0042f, chev);
+        for (size_t i = 0; i < list_.size(); ++i) {
+            const bool on = int(i) == selected_;
+            const Color c{1, 1, 1, alpha * (on ? 1.0f : 0.72f)};
+            const float y = layout_.item_y(float(i)), x = layout_.text_x + slide;
+            const float tw = font_.draw(r_, x, y, list_[i].label, px, c);
+            if (list_[i].value.empty()) continue;
+            const float vpx = px * 0.74f;
+            const std::string v = fit(list_[i].value, vpx, layout_.right_chevron - x - tw - H * 0.08f);
+            const float vx = layout_.right_chevron - H * 0.03f - font_.width(r_, v, vpx);
+            const std::string& raw = list_[i].value;
+            Color vc = raw.rfind("Found", 0) == 0 || raw == "On" || raw.rfind("Saved", 0) == 0 ? kGood
+                     : raw == "Choose..." || raw == "Press again" ? kGold
+                     : raw == "Wrong folder" || raw == "Missing" ? kBad : kDim;
+            vc.a = c.a;
+            font_.draw(r_, vx, y - px * 0.04f, v, vpx, vc);
+        }
+        if (screen_ == Screen::kControls) draw_keys();
+        draw_status();
+        draw_toast();
+        const std::string version = std::string("Version ") + LAUNCHER_VERSION;
+        const float vpx = H * 0.030f;
+        font_.draw(r_, W * 0.95f - font_.width(r_, version, vpx), H * 0.94f, version, vpx, kWhite);
+    }
+
+private:
+    // main menu items
+    enum { kPlay, kGame, kSettings, kSaves, kControls, kMore, kQuit };
+
+    struct Layout {
+        float w = 1600, h = 900, text_x = 0, left_chevron = 0, right_chevron = 0, top = 0.445f, step = 0.06f, px = 0.044f;
+        Layout() = default;
+        Layout(float w_, float h_, size_t n, bool main) : w(w_), h(h_) {
+            text_x = std::max(w * 0.085f, h * 0.15f);
+            left_chevron = text_x - h * 0.05f;
+            right_chevron = text_x + std::min(w * 0.42f, h * 0.80f);
+            const float span = main ? 0.34f : 0.40f;                 // from the top item to the last
+            top = 0.43f;
+            step = n > 1 ? std::min(0.075f, span / float(n - 1)) : 0;
+            px = std::min(0.046f, step * 0.78f);
+        }
+        float item_y(float i) const { return h * (top + i * step); }
+    } layout_;
+
+    bool exe_ok() const { return is_file(g_exe); }
+    bool game_ok() const { return is_file(game_dir_ / "exefs" / "main.elf") && is_dir(game_dir_ / "romfs"); }
+    bool ready() const { return exe_ok() && game_ok(); }
+
+    void refresh() {
+        std::string g = lini_.get("game", "");
+        game_dir_ = g.empty() ? g_build / "dump" : fs::path(g);
+        fs::file_time_type newest{};
+        save_size_ = is_dir(g_userdata) ? dir_size(g_userdata, &newest) : 0;
+        save_when_ = save_size_ ? when(newest) : "";
+        backups_.clear();
+        std::error_code e;
+        for (auto& d : fs::directory_iterator(g_saves, e))
+            if (d.is_directory() && d.path().filename().string().rfind("backup_", 0) == 0) backups_.push_back(d.path());
+        std::sort(backups_.rbegin(), backups_.rend());                     // newest first (the names sort by date)
+        shaders_ = 0;
+        if (FILE* f = _wfopen((g_cache / "pairs.txt").wstring().c_str(), L"rb")) {
+            int c;
+            while ((c = fgetc(f)) != EOF) shaders_ += c == '\n';
+            fclose(f);
+        }
+        pad_name_.clear();
+        int n = 0;
+        if (SDL_JoystickID* ids = SDL_GetGamepads(&n)) {
+            if (n > 0) if (const char* nm = SDL_GetGamepadNameForID(ids[0])) pad_name_ = nm;
+            SDL_free(ids);
+        }
+        build_items();
+    }
+
+    std::string option_value(const Option& o) const {
+        std::string v = o.key == std::string("size") ? gfx_.get("width", "1280") + "x" + gfx_.get("height", "720") : gfx_.get(o.key, o.def);
+        for (const Choice& c : o.choices) if (!_stricmp(c.value, v.c_str())) return c.label;
+        return v;      // a value written by hand
+    }
+
+    void build_items() {
+        list_.clear();
+        switch (screen_) {
+        case Screen::kMain:
+            list_ = {{"PLAY", game_running() ? "Running" : ""},
+                     {"GAME", !exe_ok() ? "Missing" : game_ok() ? "Found" : lini_.get("game", "").empty() ? "Choose..." : "Wrong folder"},
+                     {"SETTINGS", ""},
+                     {"SAVE DATA", save_size_ ? "Saved " + save_when_ : "New island"},
+                     {"CONTROLS", pad_name_.empty() ? "Keyboard" : pad_name_},
+                     {"MORE", ""},
+                     {"QUIT", ""}};
+            break;
+        case Screen::kSettings:
+            for (const Option& o : options()) list_.push_back({o.label, option_value(o), true});
+            list_.push_back({"BACK", ""});
+            break;
+        case Screen::kSaves:
+            list_.push_back({"BACK UP NOW", ""});
+            for (size_t i = 0; i < backups_.size() && i < 4; ++i) {
+                fs::file_time_type t{};
+                dir_size(backups_[i], &t);
+                list_.push_back({"BACKUP " + std::to_string(i + 1), armed_ == int(list_.size()) ? "Press again" : when(t) + "  -  Restore"});
+            }
+            list_.push_back({"OPEN SAVE FOLDER", ""});
+            list_.push_back({"OPEN BACKUPS FOLDER", ""});
+            list_.push_back({"BACK", ""});
+            break;
+        case Screen::kControls:
+            list_ = {{"CONTROLLER", pad_name_.empty() ? "None connected" : pad_name_}, {"EDIT CONTROLLERS.INI", ""}, {"BACK", ""}};
+            break;
+        case Screen::kMore: {
+            char mb[32];
+            const long long cache = is_dir(g_cache) ? dir_size(g_cache, nullptr) : 0;
+            snprintf(mb, sizeof mb, "%.0f MB", cache / 1048576.0);
+            list_ = {{"OPEN LOGS FOLDER", ""}, {"EDIT GRAPHICS.INI", ""}, {"CLEAR SHADER CACHE", armed_ == 2 ? "Press again" : mb}, {"OPEN PORT FOLDER", ""}, {"BACK", ""}};
             break;
         }
-        default: {
-            ImVec2 a1(sx + r * cosf(a), sy + r * sinf(a)), a2(sx + r * cosf(a + 2.094f), sy + r * sinf(a + 2.094f)), a3(sx + r * cosf(a + 4.189f), sy + r * sinf(a + 4.189f));
-            dl->AddTriangle(a1, a2, a3, doodle, 5.0f);
         }
+        if (selected_ >= int(list_.size())) selected_ = int(list_.size()) - 1;
+    }
+
+    void go(Screen s) { screen_ = s; selected_ = 0; selection_y_ = 0; fade_ = 0; armed_ = -1; note_.clear(); build_items(); }
+    void move(int d) { const int n = int(list_.size()); selected_ = (selected_ + d + n) % n; if (armed_ >= 0) { armed_ = -1; build_items(); } }
+    void back() { if (screen_ != Screen::kMain) go(Screen::kMain); }
+
+    void change(int d) {
+        if (screen_ != Screen::kSettings || selected_ >= int(options().size())) return;
+        const Option& o = options()[selected_];
+        const std::string cur = o.key == std::string("size") ? gfx_.get("width", "1280") + "x" + gfx_.get("height", "720") : gfx_.get(o.key, o.def);
+        int i = 0;
+        const int n = int(o.choices.size());
+        while (i < n && _stricmp(o.choices[i].value, cur.c_str())) i++;
+        i = i == n ? 0 : (i + d + n) % n;
+        if (o.key == std::string("size")) {
+            const std::string v = o.choices[i].value;
+            gfx_.set("width", v.substr(0, v.find('x')));
+            gfx_.set("height", v.substr(v.find('x') + 1));
+        } else gfx_.set(o.key, o.choices[i].value);
+        build_items();
+    }
+
+    void activate() {
+        const int i = selected_;
+        switch (screen_) {
+        case Screen::kMain:
+            if (i == kPlay) play();
+            else if (i == kGame) choose_game();
+            else if (i == kSettings) go(Screen::kSettings);
+            else if (i == kSaves) go(Screen::kSaves);
+            else if (i == kControls) go(Screen::kControls);
+            else if (i == kMore) go(Screen::kMore);
+            else if (i == kQuit) quit_ = true;
+            break;
+        case Screen::kSettings:
+            if (i == int(list_.size()) - 1) back();
+            else change(1);
+            break;
+        case Screen::kSaves: {
+            const int nb = int(std::min<size_t>(backups_.size(), 4));
+            if (i == 0) { note_ = backup_now("") ? "Backup made." : "There is no save to back up yet."; note_ok_ = save_size_ > 0; refresh(); }
+            else if (i <= nb) {
+                if (armed_ != i) { armed_ = i; build_items(); break; }
+                armed_ = -1;
+                restore(backups_[i - 1]);
+            } else if (i == nb + 1) { fs::create_directories(g_userdata); open_path(g_userdata); }
+            else if (i == nb + 2) { fs::create_directories(g_saves); open_path(g_saves); }
+            else back();
+            break;
+        }
+        case Screen::kControls:
+            if (i == 1) edit_file(g_pads_ini);
+            else if (i == 2) back();
+            break;
+        case Screen::kMore:
+            if (i == 0) open_path(g_work);
+            else if (i == 1) edit_file(g_ini);
+            else if (i == 2) {
+                if (armed_ != 2) { armed_ = 2; build_items(); break; }
+                armed_ = -1;
+                note_ = recycle(g_cache) ? "Shader cache moved to the Recycle Bin." : "Nothing to clear.";
+                note_ok_ = true;
+                refresh();
+            } else if (i == 3) open_path(g_repo);
+            else back();
+            break;
         }
     }
-}
 
-/* a big rounded button drawn by hand: returns true when clicked */
-static bool fancy_button(const char *id, const char *label, ImVec2 size, ImU32 col, ImU32 col_hi, ImFont *font, bool enabled = true) {
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::PushID(id);
-    bool clicked = ImGui::InvisibleButton("b", size) && enabled;
-    bool hov = ImGui::IsItemHovered() && enabled, held = ImGui::IsItemActive() && enabled;
-    ImGui::PopID();
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    float r = size.y * 0.5f, lift = held ? 0.0f : hov ? -2.0f : 0.0f;
-    ImU32 c = !enabled ? IM_COL32(220, 200, 170, 255) : hov ? col_hi : col;
-    dl->AddRectFilled(ImVec2(pos.x, pos.y + 6), ImVec2(pos.x + size.x, pos.y + size.y + 6), IM_COL32(150, 70, 0, enabled ? 70 : 30), r);
-    dl->AddRectFilled(ImVec2(pos.x, pos.y + lift), ImVec2(pos.x + size.x, pos.y + size.y + lift), c, r);
-    dl->AddRectFilled(ImVec2(pos.x + r * 0.6f, pos.y + lift + 4), ImVec2(pos.x + size.x - r * 0.6f, pos.y + lift + size.y * 0.32f), IM_COL32(255, 255, 255, enabled ? 28 : 12), size.y * 0.16f);
-    ImGui::PushFont(font);
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2(pos.x + (size.x - ts.x) * 0.5f, pos.y + lift + (size.y - ts.y) * 0.5f), IM_COL32(255, 255, 255, enabled ? 255 : 200), label);
-    ImGui::PopFont();
-    return clicked;
-}
-
-static void card_begin(const char *id, ImVec2 size) {
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(ImVec2(p.x + 4, p.y + 8), ImVec2(p.x + size.x + 4, p.y + size.y + 8), IM_COL32(160, 90, 0, 50), 26);
-    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), C_CARD, 26);
-    ImGui::BeginChild(id, size, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::SetCursorPos(ImVec2(30, 26));
-    ImGui::BeginGroup();
-}
-static void card_end(void) { ImGui::EndGroup(); ImGui::EndChild(); }
-static void heading(const char *text, const char *sub) {
-    ImGui::PushFont(g_font_head); ImGui::TextUnformatted(text); ImGui::PopFont();
-    if (sub) { ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_SOFT)); ImGui::PushFont(g_font_small); ImGui::TextWrapped("%s", sub); ImGui::PopFont(); ImGui::PopStyleColor(); }
-    ImGui::Dummy(ImVec2(0, 4));
-}
-static void label_col(const char *text, float w = 230) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(text); ImGui::SameLine(w); }
-static void hint(const char *text) { ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_SOFT)); ImGui::PushFont(g_font_small); ImGui::TextWrapped("%s", text); ImGui::PopFont(); ImGui::PopStyleColor(); }
-static void status_chip(bool ok, const char *text) {
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float h = ImGui::GetTextLineHeight() + 10;
-    ImVec2 ts = ImGui::CalcTextSize(text);
-    dl->AddRectFilled(p, ImVec2(p.x + ts.x + 46, p.y + h), ok ? IM_COL32(210, 245, 190, 255) : IM_COL32(255, 210, 190, 255), h * 0.5f);
-    dl->AddCircleFilled(ImVec2(p.x + 18, p.y + h * 0.5f), 7, ok ? IM_COL32(70, 170, 60, 255) : IM_COL32(220, 80, 40, 255));
-    dl->AddText(ImVec2(p.x + 34, p.y + 5), C_INK, text);
-    ImGui::Dummy(ImVec2(ts.x + 46, h));
-}
-
-/* combo over a list of (value, label) pairs stored in the ini */
-static void ini_combo(const char *key, const char *def, const char *const *values, const char *const *labels, int n, float width = 300) {
-    const char *cur = ini_get(key, def);
-    int sel = 0;
-    for (int i = 0; i < n; i++) if (!_stricmp(cur, values[i])) sel = i;
-    ImGui::SetNextItemWidth(width);
-    ImGui::PushID(key);
-    if (ImGui::BeginCombo("##c", labels[sel])) {
-        for (int i = 0; i < n; i++) if (ImGui::Selectable(labels[i], i == sel)) ini_set(key, values[i]);
-        ImGui::EndCombo();
+    bool backup_now(const std::string& tag) {
+        if (!is_dir(g_userdata)) return false;
+        time_t now = time(nullptr);
+        tm lt;
+        localtime_s(&lt, &now);
+        char name[64];
+        strftime(name, sizeof name, "backup_%Y%m%d_%H%M%S", &lt);
+        return copy_contents(g_userdata, g_saves / (std::string(name) + (tag.empty() ? "" : "_" + tag)));
     }
-    ImGui::PopID();
-}
-static void ini_toggle(const char *key, const char *def) {
-    bool on = !_stricmp(ini_get(key, def), "on");
-    ImGui::PushID(key);
-    if (ImGui::Checkbox("##t", &on)) ini_set(key, on ? "on" : "off");
-    ImGui::PopID();
-}
-
-/* ------------------------------------------------------------------ pages */
-enum { P_PLAY, P_DISPLAY, P_AUDIO, P_CONTROLS, P_SAVES, P_TOOLS, P_ABOUT, P_COUNT };
-static const char *const k_pages[P_COUNT] = {"Play", "Display", "Audio", "Controls", "Saves", "Tools", "About"};
-
-static void page_play(SDL_Window *win, ImVec2 avail) {
-    card_begin("play", avail);
-    ImGui::PushFont(g_font_title); ImGui::TextUnformatted("Welcome back!"); ImGui::PopFont();
-    hint("Your island is waiting. The game opens in its own window; this launcher comes back when you close it.");
-    ImGui::Dummy(ImVec2(0, 10));
-    bool exe_ok = file_exists(g_exe), files_ok = file_exists(g_elf) && dir_exists(g_romfs);
-    status_chip(exe_ok, exe_ok ? "Game built and ready" : "Game not built (run scripts\\dev_build.sh)");
-    status_chip(files_ok, files_ok ? "Game files found (build\\dump)" : "Game files missing: build\\dump\\exefs and romfs");
-    status_chip(true, g_save_info);
-    ImGui::Dummy(ImVec2(0, 16));
-    float t = (float)ImGui::GetTime(), pulse = 0.5f + 0.5f * sinf(t * 2.5f);
-    ImVec2 bp = ImGui::GetCursorScreenPos();
-    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(bp.x - 6 * pulse, bp.y - 6 * pulse), ImVec2(bp.x + 320 + 6 * pulse, bp.y + 84 + 6 * pulse), IM_COL32(255, 160, 40, (int)(60 * pulse)), 48);
-    if (fancy_button("play", g_running ? "Playing..." : "Play", ImVec2(320, 84), C_ORANGE, C_ORANGE_HI, g_font_title, exe_ok && files_ok && !g_running)) game_start(win);
-    ImGui::Dummy(ImVec2(0, 14));
-    if (g_last_result[0]) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g_last_ok ? ImVec4(0.25f, 0.45f, 0.15f, 1) : ImVec4(0.7f, 0.2f, 0.1f, 1));
-        ImGui::TextWrapped("%s", g_last_result);
-        ImGui::PopStyleColor();
-        if (g_log[0] && ImGui::Button("Open the log")) ShellExecuteA(NULL, "open", g_log, NULL, NULL, SW_SHOWNORMAL);
+    void restore(const fs::path& from) {
+        bool ok = !is_dir(g_userdata) || backup_now("before_restore");      // the current save first: nothing is lost
+        if (ok) { recycle(g_userdata); ok = copy_contents(from, g_userdata); }
+        note_ = ok ? "Save restored. Your previous save is in the backups." : "The restore failed: your previous save is in the backups.";
+        note_ok_ = ok;
+        refresh();
     }
-    ImGui::Dummy(ImVec2(0, 10));
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::PushFont(g_font_small);
-    label_col("Window", 150);
-    static const char *const wv[] = {"windowed", "borderless", "fullscreen"}, *const wl[] = {"Window", "Borderless", "Fullscreen"};
-    ini_combo("window", "windowed", wv, wl, 3, 220);
-    hint("F11 switches between a window and fullscreen while you play. F1 opens the in-game settings.");
-    ImGui::PopFont();
-    card_end();
-}
 
-static void page_display(ImVec2 avail) {
-    card_begin("display", avail);
-    heading("Display", "How the game's picture reaches your screen. Changes apply the next time the game starts.");
-    static const char *const wv[] = {"windowed", "borderless", "fullscreen"}, *const wl[] = {"Window", "Borderless window", "Fullscreen (borderless, on top)"};
-    label_col("Window mode"); ini_combo("window", "windowed", wv, wl, 3);
-    label_col("Window size");
-    {
-        static const int sizes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
-        char cur[64]; snprintf(cur, sizeof cur, "%s x %s", ini_get("width", "1280"), ini_get("height", "720"));
-        ImGui::SetNextItemWidth(300);
-        if (ImGui::BeginCombo("##size", cur)) {
-            for (int i = 0; i < 5; i++) {
-                char l[32]; snprintf(l, sizeof l, "%d x %d", sizes[i][0], sizes[i][1]);
-                if (ImGui::Selectable(l, !strcmp(l, cur))) { char w[16], h[16]; snprintf(w, sizeof w, "%d", sizes[i][0]); snprintf(h, sizeof h, "%d", sizes[i][1]); ini_set("width", w); ini_set("height", h); }
+    void choose_game(bool then_play = false) {
+        play_after_dialog_ = then_play;
+        const std::string def = game_dir_.string();
+        SDL_ShowOpenFolderDialog(
+            [](void* self, const char* const* list, int) {
+                auto* l = static_cast<Launcher*>(self);
+                std::lock_guard<std::mutex> lock(l->dialog_mutex_);
+                l->dialog_result_ = list && list[0] ? list[0] : "";
+                l->dialog_done_ = true;
+            },
+            this, window_, def.c_str(), false);
+    }
+
+    void play() {
+        if (game_running()) return;
+        launch_error_.clear();
+        if (!exe_ok()) { launch_error_ = "the game is not built (tomodachi_native.exe is missing)"; return; }
+        if (!game_ok()) { choose_game(true); return; }
+        if (!CopyFileW(g_exe.wstring().c_str(), g_play_exe.wstring().c_str(), FALSE) && !is_file(g_play_exe)) { launch_error_ = "could not copy the game's exe"; return; }
+        // the environment of scripts\play.ps1
+        SetEnvironmentVariableW(L"SSBU_ROMFS", (game_dir_ / "romfs").wstring().c_str());
+        SetEnvironmentVariableA("SSBU_ERROR_DIALOG", "0");
+        if (!GetEnvironmentVariableA("SSBU_RENDERER", nullptr, 0)) SetEnvironmentVariableA("SSBU_RENDERER", "gl");
+        SetEnvironmentVariableA("SSBU_OS_CONSOLE_CORES", "1");
+        SetEnvironmentVariableA("SSBU_KEYBOARD_PLAYER", "1");
+        SetEnvironmentVariableA("SSBU_SHOW", "1");
+        time_t now = time(nullptr);
+        tm lt;
+        localtime_s(&lt, &now);
+        char name[64];
+        strftime(name, sizeof name, "play_%Y%m%d_%H%M%S", &lt);
+        SetEnvironmentVariableW(L"SSBU_REC", (g_work / (std::string(name) + ".rec")).wstring().c_str());      // player 1's input, for replaying a bug
+        log_ = g_work / (std::string(name) + ".log");
+        SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+        HANDLE log = CreateFileW(log_.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        if (log != INVALID_HANDLE_VALUE) { si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = log; si.hStdError = log; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); }
+        std::wstring cmd = L"\"" + g_play_exe.wstring() + L"\" \"" + (game_dir_ / "exefs" / "main.elf").wstring() + L"\"";
+        const BOOL ok = CreateProcessW(g_play_exe.wstring().c_str(), cmd.data(), nullptr, nullptr, log != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW, nullptr, g_work.wstring().c_str(), &si, &game_);
+        if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+        if (!ok) { game_ = {}; launch_error_ = "Windows error " + std::to_string(GetLastError()); return; }
+        started_ = SDL_GetTicks();
+        exit_code_ = 0;
+        SDL_HideWindow(window_);
+    }
+
+    std::string fit(const std::string& text, float px, float width) {
+        if (width <= 0 || font_.width(r_, text, px) <= width) return text;
+        std::string t = text;
+        while (t.size() > 4 && font_.width(r_, t + "...", px) > width) t.pop_back();
+        return t + "...";
+    }
+
+    int item_at(float x, float y) const {
+        const float H = layout_.h;
+        if (x < layout_.left_chevron - H * 0.03f || x > layout_.right_chevron + H * 0.03f) return -1;
+        for (size_t i = 0; i < list_.size(); ++i) {
+            const float iy = layout_.item_y(float(i));
+            if (y > iy - H * layout_.step * 0.75f && y < iy + H * layout_.step * 0.25f) return int(i);
+        }
+        return -1;
+    }
+
+    void draw_background() {
+        const float W = layout_.w, H = layout_.h;
+        if (background_.texture) {      // covering the window, drifting slowly
+            const float zoom = 1.08f + 0.02f * std::sin(time_ * 0.07f);
+            const float scale = std::max(W / background_.width, H / background_.height) * zoom;
+            const float bw = background_.width * scale, bh = background_.height * scale;
+            const float dx = (W - bw) / 2 + std::sin(time_ * 0.05f) * W * 0.012f, dy = (H - bh) / 2;
+            SDL_SetTextureColorModFloat(background_.texture, 0.86f, 0.86f, 0.90f);
+            paint_.image(background_, {dx, dy, bw, bh});
+        } else {
+            paint_.rect(0, 0, W, H, {0.10f, 0.42f, 0.70f}, {0.20f, 0.60f, 0.80f}, {0.10f, 0.30f, 0.20f}, {0.05f, 0.18f, 0.32f});
+        }
+        // dark from the left and the bottom, where the menu is
+        const Color black{0, 0, 0, 0.84f}, clear{0, 0, 0, 0};
+        paint_.rect(0, 0, W * 0.30f, H, black, {0, 0, 0, 0.58f}, {0, 0, 0, 0.58f}, black);
+        paint_.rect(W * 0.30f, 0, W * 0.38f, H, {0, 0, 0, 0.58f}, clear, clear, {0, 0, 0, 0.58f});
+        paint_.rect(0, H * 0.62f, W, H * 0.38f, clear, clear, {0, 0, 0, 0.70f}, {0, 0, 0, 0.70f});
+        paint_.rect(0, 0, W, H * 0.16f, {0, 0, 0, 0.30f}, {0, 0, 0, 0.30f}, clear, clear);
+    }
+
+    void draw_line(float x, float y, const std::string& text, float px, Color c) {      // with bullets for 0x7f
+        size_t start = 0;
+        for (size_t i = 0; i <= text.size(); ++i) {
+            if (i < text.size() && text[i] != '\x7f') continue;
+            x += font_.draw(r_, x, y, text.substr(start, i - start), px, c);
+            if (i < text.size()) {
+                const float rr = px * 0.09f;
+                paint_.round_rect(x + px * 0.1f - rr, y - px * 0.3f - rr, rr * 2, rr * 2, rr, c);
+                x += px * 0.2f;
             }
-            ImGui::EndCombo();
+            start = i + 1;
         }
     }
-    hint("In a window the picture keeps its 16:9 shape; other shapes get bars.");
-    static const char *const rv[] = {"1.0", "1.5", "2.0", "3.0"}, *const rl[] = {"1080p (the console's)", "1620p", "2160p (4K)", "3240p"};
-    label_col("Internal resolution"); ini_combo("resolution_scale", "1.0", rv, rl, 4);
-    hint("The game's 3D picture is drawn at this size and fitted to the window. 4K needs a recent graphics card.");
-    static const char *const fv[] = {"30", "60"}, *const fl[] = {"30 fps (as the console)", "60 fps"};
-    label_col("Frame rate"); ini_combo("frame_rate", "60", fv, fl, 2);
-    hint("At 60 fps the game keeps its normal speed. A scene your PC cannot hold at 60 drops to 30 for a while instead of stuttering.");
-    static const char *const sv[] = {"off", "auto", "21:9", "32:9"}, *const sl[] = {"Off (16:9, as the console)", "Fit the monitor", "21:9 ultrawide", "32:9 super ultrawide"};
-    label_col("Widescreen"); ini_combo("widescreen", "off", sv, sl, 4);
-    hint("Wider than 16:9: the island shows more at the sides; menus and text stay 16:9 in the middle.");
-    static const char *const vv[] = {"auto", "display", "clock", "off"}, *const vl[] = {"Automatic", "Follow the display (smoothest)", "Own 60 Hz clock", "Off (lowest latency, may tear)"};
-    label_col("Vertical sync"); ini_combo("vsync", "auto", vv, vl, 4);
-    static const char *const lv[] = {"normal", "low", "lowest"}, *const ll[] = {"Normal", "Low", "Lowest"};
-    label_col("Input latency"); ini_combo("latency", "normal", lv, ll, 3);
-    label_col("Frame-time overlay"); ini_toggle("frame_time_overlay", "off");
-    label_col("Statistics overlay"); ini_toggle("stats_overlay", "off");
-    label_col("In-game settings menu (F1)"); ini_toggle("menu", "on");
-    ImGui::Dummy(ImVec2(0, 6));
-    hint("Renderer: OpenGL (this port's renderer for Tomodachi Life).");
-    card_end();
-}
 
-static void page_audio(ImVec2 avail) {
-    card_begin("audio", avail);
-    heading("Audio", "Sound comes from the game's own mix, with its reverbs and delays.");
-    const char *v = ini_get("volume", "auto");
-    bool automatic = !_stricmp(v, "auto");
-    int vol = automatic ? 100 : atoi(v);
-    label_col("Use the system volume");
-    if (ImGui::Checkbox("##auto", &automatic)) ini_set("volume", automatic ? "auto" : "100");
-    if (!automatic) {
-        label_col("Volume");
-        ImGui::SetNextItemWidth(300);
-        if (ImGui::SliderInt("##vol", &vol, 0, 100, "%d %%")) { char b[16]; snprintf(b, sizeof b, "%d", vol); ini_set("volume", b); }
-    }
-    static const char *const lv[] = {"auto", "en", "fr", "de", "es", "it", "nl", "ja"}, *const ll[] = {"Automatic", "English", "Francais", "Deutsch", "Espanol", "Italiano", "Nederlands", "Japanese"};
-    label_col("Language"); ini_combo("language", "auto", lv, ll, 8);
-    hint("Automatic follows the Windows display language.");
-    card_end();
-}
-
-static void page_controls(ImVec2 avail) {
-    card_begin("controls", avail);
-    heading("Controls", "Plug in a controller at any time. The keyboard always works for player 1.");
-    int n = 0;
-    SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    if (n == 0) status_chip(false, "No controller connected: the keyboard is used");
-    for (int i = 0; i < n; i++) { const char *name = SDL_GetGamepadNameForID(ids[i]); status_chip(true, name ? name : "Controller"); }
-    if (ids) SDL_free(ids);
-    ImGui::Dummy(ImVec2(0, 8));
-    ImGui::PushFont(g_font_head); ImGui::TextUnformatted("Keyboard (defaults)"); ImGui::PopFont();
-    static const char *const keys[][2] = {                   /* nnpad_sdl.c g_kb_default */
-        {"A / confirm", "Z"}, {"B / back", "X"}, {"X / menu", "C"}, {"Y / residents", "V"}, {"Left stick", "Arrow keys"}, {"Right stick (camera)", "T F G H"},
-        {"D-pad", "I J K L"}, {"L / R", "Q / E"}, {"ZL / ZR", "A / S"}, {"+ / -", "Enter / Backspace"}, {"Fullscreen", "F11"}, {"Settings", "F1"}};
-    if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_SizingFixedFit)) {
-        for (int i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) { ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(keys[i][0]); ImGui::TableNextColumn(); ImGui::TextColored(ImVec4(0.85f, 0.4f, 0.05f, 1), "%s", keys[i][1]); }
-        ImGui::EndTable();
-    }
-    ImGui::Dummy(ImVec2(0, 6));
-    if (ImGui::Button("Edit controllers.ini")) ShellExecuteA(NULL, "open", "notepad.exe", g_pads_ini, NULL, SW_SHOWNORMAL);
-    card_end();
-}
-
-static void page_saves(ImVec2 avail) {
-    card_begin("saves", avail);
-    heading("Saves", "Your island lives in build\\userdata. Backups go to build\\saves and can be restored at any time.");
-    status_chip(true, g_save_info);
-    ImGui::Dummy(ImVec2(0, 4));
-    if (fancy_button("backup", "Back up now", ImVec2(220, 50), C_ORANGE, C_ORANGE_HI, g_font_body, !g_running)) toast(backup_now(NULL) ? "Backup made." : "The backup failed.");
-    ImGui::SameLine(0, 16);
-    if (ImGui::Button("Open the save folder")) { CreateDirectoryA(g_userdata, NULL); open_in_explorer(g_userdata); }
-    ImGui::SameLine();
-    if (ImGui::Button("Open the backups")) { CreateDirectoryA(g_saves, NULL); open_in_explorer(g_saves); }
-    ImGui::Dummy(ImVec2(0, 6));
-    ImGui::PushFont(g_font_head); ImGui::TextUnformatted("Backups"); ImGui::PopFont();
-    static int pending = -1;
-    if (g_nbackups == 0) hint("No backups yet.");
-    ImGui::BeginChild("blist", ImVec2(avail.x - 60, ImGui::GetContentRegionAvail().y - 26), 0);
-    for (int i = 0; i < g_nbackups; i++) {
-        ImGui::PushID(i);
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(g_backups[i] + 7);
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 250);
-        if (ImGui::Button("Restore") && !g_running) pending = i;
-        ImGui::SameLine();
-        if (ImGui::Button("Delete")) { char p[MAX_PATH]; path_join(p, g_saves, g_backups[i]); toast(shell_recycle(p) ? "Backup moved to the Recycle Bin." : "Could not delete it."); saves_scan(); }
-        ImGui::PopID();
-    }
-    ImGui::EndChild();
-    if (pending >= 0) ImGui::OpenPopup("Restore?");
-    if (ImGui::BeginPopupModal("Restore?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Dummy(ImVec2(0, 4));
-        ImGui::Text("Restore %s?", pending >= 0 ? g_backups[pending] + 7 : "");
-        hint("Your current save is backed up first, so nothing is lost.");
-        if (ImGui::Button("Restore", ImVec2(140, 0))) {
-            char src[MAX_PATH]; path_join(src, g_saves, g_backups[pending]);
-            int ok = !dir_exists(g_userdata) || backup_now("before_restore");
-            if (ok) {
-                char tmp[MAX_PATH]; snprintf(tmp, MAX_PATH, "%s", g_userdata);
-                shell_recycle(tmp);
-                ok = shell_copy(src, g_userdata);
+    void draw_status() {
+        const float H = layout_.h, x = layout_.text_x, y = H * 0.875f, px = H * 0.033f;
+        const float icon = px * 0.75f, ix = x - icon * 1.55f;
+        std::string line, detail;
+        Color c = kGood;
+        if (screen_ != Screen::kMain) {
+            if (!note_.empty()) { line = note_; c = note_ok_ ? kGood : kBad; }
+            if (screen_ == Screen::kSettings) detail = "Saved to graphics.ini as you change it. The game reads it when it starts.";
+            if (screen_ == Screen::kSaves) {
+                if (line.empty()) line = save_size_ ? "Your island, saved " + save_when_ + "." : "No save yet: the game starts a new island.";
+                detail = "Backups go to build\\saves. Restoring backs up your current save first.";
             }
-            toast(ok ? "Save restored." : "The restore failed: your previous save is in the backups.");
-            saves_scan(); pending = -1; ImGui::CloseCurrentPopup();
+            if (screen_ == Screen::kControls) {
+                if (line.empty()) line = pad_name_.empty() ? "Plug in a controller at any time." : "Controller ready.";
+                detail = "The keyboard always works for player 1.";
+            }
+            if (screen_ == Screen::kMore) detail = (g_repo / "build").string();
+            if (!line.empty()) font_.draw(r_, x, y, fit(line, px, layout_.w * 0.6f), px, c);
+            if (!detail.empty()) draw_line(x, y + H * 0.048f, fit(detail, px * 0.8f, layout_.w * 0.62f), px * 0.8f, kDim);
+            return;
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(140, 0))) { pending = -1; ImGui::CloseCurrentPopup(); }
-        ImGui::EndPopup();
+        if (game_running()) {
+            paint_.spinner(ix + icon / 2, y - px * 0.33f, icon * 0.5f, H * 0.0035f, time_, kGood);
+            line = "Tomodachi Life is running...";
+        } else if (!launch_error_.empty()) {
+            c = kBad; paint_.cross(ix, y - px * 0.7f, icon * 0.8f, H * 0.0035f, c);
+            line = "The game did not start: " + launch_error_ + ".";
+        } else if (exit_code_ != 0) {
+            c = kBad; paint_.cross(ix, y - px * 0.7f, icon * 0.8f, H * 0.0035f, c);
+            char b[160];
+            snprintf(b, sizeof b, "The game closed with an error (0x%08lX). Details: %s", (unsigned long)exit_code_, log_.filename().string().c_str());
+            line = b;
+        } else if (ready()) {
+            paint_.check(ix, y - px * 0.78f, icon, H * 0.0035f, c);
+            line = session_min_ >= 0 ? "Game ready. Last session: " + std::to_string(session_min_) + " min." : "Game ready.";
+        } else {
+            c = kBad; paint_.cross(ix, y - px * 0.7f, icon * 0.8f, H * 0.0035f, c);
+            line = !exe_ok() ? "The game is not built yet (tomodachi_native.exe)." : lini_.get("game", "").empty() ? "Choose the game folder." : "That folder is not Tomodachi Life (exefs\\main.elf and romfs\\).";
+        }
+        font_.draw(r_, x, y, fit(line, px, layout_.w * 0.6f), px, c);
+        if (selected_ == kGame) detail = game_dir_.string();
+        else if (ready()) detail = std::string("Nintendo Switch \x7f Living the Dream \x7f ") + (save_size_ ? "Island saved " + save_when_ : std::string("New island")) +
+                                   " \x7f " + (gfx_.get("resolution_scale", "1.0") == "2.0" ? "4K" : gfx_.get("resolution_scale", "1.0") == "1.0" ? "1080p" : gfx_.get("resolution_scale", "1.0") + "x");
+        else detail = "Needs your own dump of the game: exefs\\ and romfs\\ in one folder";
+        draw_line(x, y + H * 0.048f, fit(detail, px * 0.8f, layout_.w * 0.62f), px * 0.8f, kDim);
     }
-    card_end();
-}
 
-static void page_tools(ImVec2 avail) {
-    card_begin("tools", avail);
-    heading("Tools", "Housekeeping for the port.");
-    FILETIME ft = {0, 0};
-    long long cache = dir_exists(g_cache) ? dir_size(g_cache, &ft) : 0;
-    char l[128]; snprintf(l, sizeof l, "Shader cache: %.1f MB", cache / 1048576.0);
-    status_chip(true, l);
-    hint("Compiled shaders are kept so the game does not stutter the next time it meets them. Clearing it is only useful after a driver problem.");
-    if (ImGui::Button("Clear the shader cache") && !g_running) toast(shell_recycle(g_cache) ? "Shader cache moved to the Recycle Bin." : "Nothing to clear.");
-    ImGui::Dummy(ImVec2(0, 8));
-    if (ImGui::Button("Open the logs folder")) open_in_explorer(g_work);
-    ImGui::SameLine();
-    if (ImGui::Button("Open the config folder")) { char p[MAX_PATH]; path_join(p, g_build, "config"); open_in_explorer(p); }
-    ImGui::SameLine();
-    if (ImGui::Button("Open the port's folder")) open_in_explorer(g_repo);
-    ImGui::Dummy(ImVec2(0, 8));
-    if (ImGui::Button("Edit graphics.ini")) { if (g_ini_dirty) ini_save(); ShellExecuteA(NULL, "open", "notepad.exe", g_ini, NULL, SW_SHOWNORMAL); }
-    ImGui::SameLine();
-    if (ImGui::Button("Reload settings")) { ini_load(); toast("Settings reloaded from graphics.ini."); }
-    card_end();
-}
+    void draw_keys() {      // CONTROLS: the keyboard's keys, on a card at the right
+        const float W = layout_.w, H = layout_.h, px = H * 0.027f, row = H * 0.044f;
+        const int n = int(sizeof k_keys / sizeof k_keys[0]);
+        const float cw = std::min(W * 0.36f, H * 0.66f), ch = row * (n + 1.2f), cx = W * 0.93f - cw, cy = H * 0.17f;      // below the toast
+        paint_.round_rect(cx, cy, cw, ch, H * 0.012f, {kGold.r, kGold.g, kGold.b, 0.70f * fade_});
+        paint_.round_rect(cx + 1.5f, cy + 1.5f, cw - 3, ch - 3, H * 0.011f, {0.04f, 0.035f, 0.03f, 0.86f * fade_});
+        font_.draw(r_, cx + H * 0.03f, cy + row * 0.95f, "KEYBOARD", px * 1.05f, {kGold.r, kGold.g, kGold.b, fade_});
+        for (int i = 0; i < n; ++i) {
+            const float y = cy + row * (i + 2.0f) - row * 0.2f;
+            font_.draw(r_, cx + H * 0.03f, y, k_keys[i][0], px, {kDim.r, kDim.g, kDim.b, fade_}, false);
+            font_.draw(r_, cx + cw - H * 0.03f - font_.width(r_, k_keys[i][1], px), y, k_keys[i][1], px, {1, 1, 1, fade_}, false);
+        }
+    }
 
-static void page_about(ImVec2 avail) {
-    card_begin("about", avail);
-    heading("About", NULL);
-    ImGui::TextWrapped("Tomodachi Life: Living the Dream, running natively on Windows through a static recompilation of the Nintendo Switch game.");
-    ImGui::Dummy(ImVec2(0, 6));
-    hint("You need your own copy of the game: its files go in build\\dump (exefs and romfs). Nothing of the game is included.");
-    ImGui::Dummy(ImVec2(0, 6));
-    ImGui::Text("Launcher version %s", LAUNCHER_VERSION);
-    ImGui::Text("Folder: %s", g_repo);
-    ImGui::Dummy(ImVec2(0, 6));
-    hint("Built with SDL3 and Dear ImGui. Tomodachi Life is a trademark of Nintendo; this project is not affiliated with Nintendo.");
-    card_end();
-}
+    void draw_toast() {
+        const float W = layout_.w, H = layout_.h, px = H * 0.027f;      // top right: the status lines own the bottom left
+        const std::string text = shaders_ > 0 ? std::to_string(shaders_) + " shaders ready" : "Shaders compile the first time you play";
+        const float tw = font_.width(r_, text, px);
+        const float bh = H * 0.068f, bw = tw + H * 0.11f, bx = W - bw - H * 0.03f, by = H * 0.03f;
+        paint_.round_rect(bx, by, bw, bh, H * 0.008f, {kGold.r, kGold.g, kGold.b, 0.75f});
+        paint_.round_rect(bx + 1.5f, by + 1.5f, bw - 3, bh - 3, H * 0.007f, {0.04f, 0.035f, 0.03f, 0.88f});
+        const float icon = px * 0.8f, ix = bx + H * 0.03f, cy = by + bh / 2;
+        if (shaders_ > 0) paint_.check(ix, cy - icon / 2, icon, H * 0.0032f, kGood);
+        else paint_.spinner(ix + icon / 2, cy, icon / 2, H * 0.003f, time_, kWhite);
+        font_.draw(r_, ix + H * 0.045f, cy + px * 0.36f, text, px, kWhite, false);
+    }
 
-/* ------------------------------------------------------------------ the window icon: a smiling yellow face, drawn here */
-static void set_icon(SDL_Window *win) {
+    SDL_Window* window_;
+    SDL_Renderer* r_;
+    Painter paint_;
+    Font font_;
+    Image logo_, background_;
+    Ini gfx_, lini_;
+    fs::path game_dir_, log_;
+    std::vector<fs::path> backups_;
+    long long save_size_ = 0;
+    std::string save_when_, pad_name_, launch_error_, note_;
+    bool note_ok_ = true;
+    int shaders_ = 0, armed_ = -1, session_min_ = -1;
+    Screen screen_ = Screen::kMain;
+    std::vector<Item> list_;
+    int selected_ = 0;
+    float selection_y_ = 0, fade_ = 0, time_ = 0, stick_x_ = 0, stick_y_ = 0, held_x_ = 0, held_y_ = 0;
+    bool mouse_moved_ = false, quit_ = false, play_after_dialog_ = false;
+    PROCESS_INFORMATION game_{};
+    DWORD exit_code_ = 0;
+    Uint64 started_ = 0;
+    std::mutex dialog_mutex_;
+    std::string dialog_result_;
+    bool dialog_done_ = false;
+};
+
+/* the window icon: the game's logo, else a smiling yellow face drawn here */
+void set_icon(SDL_Window* win) {
+    int w = 0, h = 0, n = 0;
+    FILE* f = _wfopen((g_work / "title-logo.png").wstring().c_str(), L"rb");
+    stbi_uc* px = f ? stbi_load_from_file(f, &w, &h, &n, 4) : nullptr;
+    if (f) fclose(f);
+    if (px) {
+        if (SDL_Surface* s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, px, w * 4)) { SDL_SetWindowIcon(win, s); SDL_DestroySurface(s); }
+        stbi_image_free(px);
+        return;
+    }
     const int S = 64;
-    SDL_Surface *s = SDL_CreateSurface(S, S, SDL_PIXELFORMAT_RGBA32);
+    SDL_Surface* s = SDL_CreateSurface(S, S, SDL_PIXELFORMAT_RGBA32);
     if (!s) return;
-    Uint32 *px = (Uint32 *)s->pixels;
+    Uint32* p = (Uint32*)s->pixels;
     for (int y = 0; y < S; y++)
         for (int x = 0; x < S; x++) {
-            float dx = x - S / 2 + 0.5f, dy = y - S / 2 + 0.5f, d = sqrtf(dx * dx + dy * dy);
+            const float dx = x - S / 2 + 0.5f, dy = y - S / 2 + 0.5f, d = std::sqrt(dx * dx + dy * dy);
             Uint8 r = 0, g = 0, b = 0, a = 0;
             if (d < S / 2 - 1) { r = 255; g = 200; b = 40; a = 255; }
             if (d >= S / 2 - 4 && d < S / 2 - 1) { r = 240; g = 120; b = 20; }
-            float ex = fabsf(dx) - 9, ey = dy + 7;
-            if (ex * ex + ey * ey < 14) { r = 60; g = 40; b = 20; }
-            float m = sqrtf(dx * dx + (dy - 2) * (dy - 2));
-            if (dy > 4 && m > 13 && m < 17) { r = 60; g = 40; b = 20; }
-            px[y * S + x] = (Uint32)r | (Uint32)g << 8 | (Uint32)b << 16 | (Uint32)a << 24;
+            const float ex = std::fabs(dx) - 9, ey = dy + 7, m = std::sqrt(dx * dx + (dy - 2) * (dy - 2));
+            if (ex * ex + ey * ey < 14 || (dy > 4 && m > 13 && m < 17)) { r = 60; g = 40; b = 20; }
+            p[y * S + x] = Uint32(r) | Uint32(g) << 8 | Uint32(b) << 16 | Uint32(a) << 24;
         }
     SDL_SetWindowIcon(win, s);
     SDL_DestroySurface(s);
 }
 
-int main(int argc, char **argv) {
-    /* --shot <file.bmp> [page]: draw one page off screen into a picture and exit (a check of the look without a window) */
-    const char *shot = NULL; int shot_page = 0, frame = 0;
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--shot")) { shot = argv[i + 1]; if (i + 2 < argc) shot_page = atoi(argv[i + 2]); }
+} // namespace
+
+int main(int argc, char** argv) {
+    const char* shot = nullptr;
+    std::string shot_screen;
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--shot")) { shot = argv[i + 1]; if (i + 2 < argc) shot_screen = argv[i + 2]; }
     paths_init();
-    ini_load();
-    saves_scan();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
-    SDL_Window *win = SDL_CreateWindow("Tomodachi Life - Launcher", 1180, 740, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (!win) return 1;
-    SDL_SetWindowMinimumSize(win, 980, 640);
-    set_icon(win);
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
-    if (!ren) return 1;
-    SDL_SetRenderVSync(ren, 1);
-    SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    SDL_Texture *shot_tex = NULL;
-    if (shot) { int w, h; SDL_GetWindowSizeInPixels(win, &w, &h); shot_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h); }
-    else SDL_ShowWindow(win);
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = NULL;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-    style_init();
-    fonts_init();
-    ImGui_ImplSDL3_InitForSDLRenderer(win, ren);
-    ImGui_ImplSDLRenderer3_Init(ren);
-    int page = shot ? shot_page % P_COUNT : P_PLAY;
-    bool done = false;
-    while (!done) {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            ImGui_ImplSDL3_ProcessEvent(&e);
-            if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(win))) done = true;
-        }
-        game_poll(win);
-        if (!shot && g_running || !shot && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) { SDL_Delay(50); continue; }
-        ImGui_ImplSDLRenderer3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-        ImVec2 size = io.DisplaySize;
-        draw_background(ImGui::GetBackgroundDrawList(), size, (float)ImGui::GetTime());
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(size);
-        ImGui::Begin("root", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        /* sidebar */
-        const float side = 250, pad = 28;
-        ImGui::SetCursorPos(ImVec2(pad, pad));
-        ImGui::BeginGroup();
-        ImGui::PushFont(g_font_title); ImGui::TextColored(ImVec4(0.42f, 0.22f, 0.02f, 1), "Tomodachi"); ImGui::PopFont();
-        ImGui::PushFont(g_font_head); ImGui::TextColored(ImVec4(0.55f, 0.30f, 0.05f, 1), "Life"); ImGui::PopFont();
-        ImGui::PushFont(g_font_small); ImGui::TextColored(ImVec4(0.55f, 0.36f, 0.10f, 1), "Living the Dream  -  PC"); ImGui::PopFont();
-        ImGui::Dummy(ImVec2(0, 18));
-        for (int i = 0; i < P_COUNT; i++) {
-            bool sel = i == page;
-            if (fancy_button(k_pages[i], k_pages[i], ImVec2(side - pad - 10, 48), sel ? C_ORANGE : IM_COL32(255, 236, 180, 255), sel ? C_ORANGE_HI : IM_COL32(255, 245, 210, 255), g_font_body)) page = i;
-            if (!sel) {                                      /* dark label on the light buttons */
-                ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-                ImVec2 ts = ImGui::CalcTextSize(k_pages[i]);
-                ImGui::GetWindowDrawList()->AddRectFilled(mn, mx, IM_COL32(255, 240, 195, 255), (mx.y - mn.y) * 0.5f);
-                ImGui::GetWindowDrawList()->AddText(ImVec2(mn.x + (mx.x - mn.x - ts.x) * 0.5f, mn.y + (mx.y - mn.y - ts.y) * 0.5f), C_INK, k_pages[i]);
+    SDL_Window* window = SDL_CreateWindow("Tomodachi Life", 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (shot ? SDL_WINDOW_HIDDEN : 0));
+    SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+    if (!renderer) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Tomodachi Life", SDL_GetError(), nullptr); return 1; }
+    SDL_SetRenderVSync(renderer, 1);
+    SDL_SetWindowMinimumSize(window, 960, 540);
+    set_icon(window);
+    {
+        Launcher launcher(window, renderer);
+        SDL_Texture* target = shot ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, 1600, 900) : nullptr;
+        if (shot) launcher.open_screen(shot_screen);
+        Uint64 last = SDL_GetTicksNS(), started = last;
+        while (launcher.running()) {
+            SDL_Event e;
+            if (launcher.game_running() ? SDL_WaitEventTimeout(&e, 250) : SDL_PollEvent(&e)) {      // while the game runs: only wait for it
+                do launcher.event(e);
+                while (SDL_PollEvent(&e));
             }
+            const Uint64 now = SDL_GetTicksNS();
+            launcher.update(std::min(0.1f, (now - last) / 1e9f));
+            last = now;
+            if (launcher.game_running()) continue;
+            if (target) SDL_SetRenderTarget(renderer, target);
+            launcher.draw(target);
+            if (target && now - started > 1200000000ull) {      // the fade-in is over: save and stop
+                SDL_Surface* px = SDL_RenderReadPixels(renderer, nullptr);
+                const bool ok = px && SDL_SaveBMP(px, shot);
+                if (px) SDL_DestroySurface(px);
+                printf("%s %s\n", ok ? "saved" : "could not save", shot);
+                break;
+            }
+            SDL_RenderPresent(renderer);
         }
-        ImGui::EndGroup();
-        if (g_ini_dirty) {                                   /* unsaved settings: save button at the bottom of the sidebar */
-            ImGui::SetCursorPos(ImVec2(pad, size.y - pad - 56));
-            if (fancy_button("save", "Save settings", ImVec2(side - pad - 10, 52), IM_COL32(80, 170, 70, 255), IM_COL32(100, 190, 90, 255), g_font_body))
-                toast(ini_save() ? "Settings saved." : "Could not write graphics.ini.");
-        }
-        /* page */
-        ImGui::SetCursorPos(ImVec2(side + 10, pad));
-        ImVec2 avail(size.x - side - 10 - pad, size.y - 2 * pad);
-        switch (page) {
-        case P_PLAY: page_play(win, avail); break;
-        case P_DISPLAY: page_display(avail); break;
-        case P_AUDIO: page_audio(avail); break;
-        case P_CONTROLS: page_controls(avail); break;
-        case P_SAVES: page_saves(avail); break;
-        case P_TOOLS: page_tools(avail); break;
-        default: page_about(avail); break;
-        }
-        if (g_toast[0] && ImGui::GetTime() < g_toast_until) {   /* the toast */
-            ImDrawList *dl = ImGui::GetForegroundDrawList();
-            ImVec2 ts = ImGui::CalcTextSize(g_toast);
-            ImVec2 p((size.x - ts.x) * 0.5f, size.y - 70);
-            dl->AddRectFilled(ImVec2(p.x - 22, p.y - 12), ImVec2(p.x + ts.x + 22, p.y + ts.y + 12), IM_COL32(60, 40, 20, 230), 20);
-            dl->AddText(p, IM_COL32(255, 248, 228, 255), g_toast);
-        }
-        ImGui::End();
-        ImGui::Render();
-        SDL_SetRenderDrawColor(ren, 255, 200, 60, 255);
-        if (shot_tex) SDL_SetRenderTarget(ren, shot_tex);
-        SDL_RenderClear(ren);
-        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
-        if (shot_tex && ++frame == 4) {                     /* a few frames: fonts and layout settle */
-            SDL_Surface *px = SDL_RenderReadPixels(ren, NULL);
-            int ok = px && SDL_SaveBMP(px, shot);
-            if (px) SDL_DestroySurface(px);
-            printf("%s %s\n", ok ? "saved" : "could not save", shot);
-            done = true;
-        }
-        SDL_RenderPresent(ren);
     }
-    if (g_ini_dirty) ini_save();
-    ImGui_ImplSDLRenderer3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
-    ImGui::DestroyContext();
-    SDL_DestroyRenderer(ren);
-    SDL_DestroyWindow(win);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
 }
