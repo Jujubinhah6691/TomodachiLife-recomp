@@ -380,13 +380,49 @@ static int has_family_name(const FontData *f, const WCHAR *face) {
     return 0;
 }
 
+/* A font whose family name another loaded font already has (NinDev-TCNumber twice: same family, subfamily and weight, only
+ * the typographic subfamily differs) cannot be selected in GDI by name: GDI gave the other one and this one's glyphs were
+ * blank (the digits of the shop receipt). GDI gets a copy whose family, full and PostScript names end in another
+ * character (same length, so the table stays valid; its checksum is fixed), and the face is selected by that name. */
+static const uint8_t *gdi_unique_copy(FontData *f) {
+    if (!strchr(f->name, '~') || !f->nametab) return f->data;
+    uint8_t *d = malloc(f->size);
+    if (!d) return f->data;
+    memcpy(d, f->data, f->size);
+    uint8_t *nt = d + (f->nametab - f->data);
+    WCHAR tag = (WCHAR)('A' + (f - g_fontdata) % 26);
+    uint32_t cnt = be16(nt + 2), so = be16(nt + 4);
+    for (uint32_t i = 0; i < cnt && 6 + 12 * (i + 1) <= f->name_len; i++) {
+        const uint8_t *rec = nt + 6 + 12 * i;
+        uint32_t pid = be16(rec), nid = be16(rec + 6), len = be16(rec + 8), off = so + be16(rec + 10);
+        if ((nid != 1 && nid != 4 && nid != 6 && nid != 16) || off + len > f->name_len || len < 2) continue;
+        if (pid == 3 || pid == 0) { nt[off + len - 2] = 0; nt[off + len - 1] = (uint8_t)tag; }      /* UTF-16 big endian */
+        else if (pid == 1) nt[off + len - 1] = (uint8_t)tag;
+    }
+    const uint8_t *dir = d + (f->dir - f->data);
+    for (uint32_t i = 0, n = be16(dir + 4); i < n; i++) {             /* the name table's checksum in the table directory */
+        uint8_t *e = (uint8_t *)dir + 12 + 16 * i;
+        if (memcmp(e, "name", 4)) continue;
+        uint32_t sum = 0, len = be32(e + 12);
+        for (uint32_t k = 0; k < len; k += 4) { uint32_t w = 0; for (int b = 0; b < 4; b++) w = w << 8 | (k + (uint32_t)b < len ? nt[k + (uint32_t)b] : 0); sum += w; }
+        e[4] = (uint8_t)(sum >> 24); e[5] = (uint8_t)(sum >> 16); e[6] = (uint8_t)(sum >> 8); e[7] = (uint8_t)sum;
+    }
+    size_t fl = wcslen(f->face);
+    if (fl) f->face[fl - 1] = tag;
+    return d;                                                        /* kept: GDI may read it while the font is installed */
+}
+
 /* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
 static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
     if (f->gdi) return f->gdi > 0;
     DWORD installed = 0;
     f->gdi = -1;
-    if (!f->face[0] || !AddFontMemResourceEx(f->data, f->size, NULL, &installed)) { printf("nn::fontll: font \"%s\" REJECTED BY GDI: its glyphs will be blank\n", f->name); return 0; }
-    f->hfont = CreateFontW(-f->upem, 0, 0, 0, FW_DONTCARE, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, f->face);
+    const uint8_t *gdata = gdi_unique_copy(f);
+    if (!f->face[0] || !AddFontMemResourceEx((void *)gdata, f->size, NULL, &installed)) { printf("nn::fontll: font \"%s\" REJECTED BY GDI: its glyphs will be blank\n", f->name); return 0; }
+    /* the font's own weight and slant: two fonts of one family name (NinDev-TCNumber, regular and bold) are told apart by them;
+     * with FW_DONTCARE GDI gave the bold one for both and the regular one's digits (the shop receipt) were blank */
+    int weight = f->os2 ? (int)be16(f->os2 + 4) : FW_DONTCARE, italic = f->os2 ? (be16(f->os2 + 62) & 1) : (be16(f->head + 44) >> 1) & 1;
+    f->hfont = CreateFontW(-f->upem, 0, 0, 0, weight, (DWORD)italic, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, f->face);
     if (!f->hfont) return 0;
     SelectObject(g_dc, f->hfont);
     WCHAR got[LF_FACESIZE];

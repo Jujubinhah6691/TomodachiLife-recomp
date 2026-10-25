@@ -621,6 +621,27 @@ void host_import(Ctx *c, int sym) {
             printf("%c", 10);
         }
     }
+    {   /* TOMO_FMTLOG=1 (diagnosis): each distinct format given to the printf family once, with the text it made */
+        static int on = -1; if (on < 0) on = getenv("TOMO_FMTLOG") != NULL;
+        const char *nm = on ? dyn_syms[sym].name : NULL;
+        int fa = !nm ? -1 : !strcmp(nm, "sprintf") ? 1 : (!strcmp(nm, "snprintf") || !strcmp(nm, "vsnprintf") || strstr(nm, "SNPrintf")) ? 2 : -1;
+        if (fa >= 0) {
+            static char seen[400][48]; static int nseen; static SRWLOCK lk = SRWLOCK_INIT;
+            uint64_t buf = c->x[0], f = c->x[fa];
+            char fmt[48]; snprintf(fmt, sizeof fmt, "%s", f ? (const char *)(uintptr_t)f : "");
+            host_import_real(c, sym);
+            AcquireSRWLockExclusive(&lk);
+            int k = 0; while (k < nseen && strcmp(seen[k], fmt)) k++;
+            static long long from = -2; if (from == -2) from = getenv("TOMO_FMTLOG_FROM") ? atoll(getenv("TOMO_FMTLOG_FROM")) : -1;   /* every call from that frame on */
+            long long display_frame_count(void);
+            if ((k == nseen && nseen < 400) || (from >= 0 && display_frame_count() >= from)) {
+                if (k == nseen && nseen < 400) strcpy(seen[nseen++], fmt);
+                printf("fmtlog: frame %lld %s \"%s\" -> \"%.40s\" (from %llx)\n", display_frame_count(), nm, fmt, buf ? (const char *)(uintptr_t)buf : "", (unsigned long long)c->x[30] - 4);
+            }
+            ReleaseSRWLockExclusive(&lk);
+            return;
+        }
+    }
     if (sym != g_watch_sym) { host_import_real(c, sym); return; }
     extern long long nvn_front_frame_next(void);
     static long long cur_frame, n, tks, max_tk, n_all; static char max_txt[72]; static uint64_t max_ra, ras[64]; static int nras; static uint64_t max_x1;
