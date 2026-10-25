@@ -600,12 +600,14 @@ void host_import(Ctx *c, int sym) {
         }
     }
     {   /* TOMO_IMPORT_CALLERS=<part of an import's name> (diagnosis): each distinct caller of it once, with x0 / s0 */
-        static int want = -2; static uint64_t seen[256]; static volatile LONG nseen;
-        if (want == -2) { const char *e = getenv("TOMO_IMPORT_CALLERS"); want = -1; if (e && *e) for (int i = 0; i < (int)dyn_sym_count; i++) if (strstr(dyn_syms[i].name, e)) { want = i; break; } }
-        if (sym == want) {
+        static int want[16], nwant = -1; static uint64_t seen[256]; static volatile LONG nseen;      /* every import whose name contains the text */
+        if (nwant < 0) { const char *e = getenv("TOMO_IMPORT_CALLERS"); nwant = 0; if (e && *e) for (int i = 0; i < (int)dyn_sym_count && nwant < 16; i++) if (strstr(dyn_syms[i].name, e)) want[nwant++] = i; }
+        int hit = 0;
+        for (int i = 0; i < nwant; i++) hit |= sym == want[i];
+        if (hit) {
             int k = 0, n = (int)nseen;
-            while (k < n && seen[k] != c->x[30]) k++;
-            if (k == n && n < 256) { seen[InterlockedIncrement(&nseen) - 1] = c->x[30]; printf("importcaller: %s from %llx x0 %llx s0 %f\n", dyn_syms[sym].name, (unsigned long long)c->x[30] - 4, (unsigned long long)c->x[0], c->v[0].f[0]); }
+            while (k < n && seen[k] != (c->x[30] ^ (uint64_t)sym << 48)) k++;
+            if (k == n && n < 256) { seen[InterlockedIncrement(&nseen) - 1] = c->x[30] ^ (uint64_t)sym << 48; printf("importcaller: %s from %llx x0 %llx s0 %f\n", dyn_syms[sym].name, (unsigned long long)c->x[30] - 4, (unsigned long long)c->x[0], c->v[0].f[0]); }
         }
     }
     {   /* TOMO_RA_CHAIN=<return address>[,...] (diagnosis): an import called from there prints the guest frame chain (who

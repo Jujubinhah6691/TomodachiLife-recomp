@@ -5121,6 +5121,9 @@ static void exec(const Cmd *m, int depth) {
         else if (t->rw && d == 1) rs_get(t, level, r[0], r[1], r[3], r[4], f.format, f.type, (GLsizei)bytes, P(a[3]));      /* resolution scale */
         else glGetTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, f.format, f.type, (GLsizei)bytes, P(a[3]));
         glPixelStorei(0x0D02, 0); glPixelStorei(0x806C, 0);
+        static int copylog = -1; if (copylog < 0) copylog = getenv("TOMO_COPYLOG") != NULL;      /* TOMO_COPYLOG=1: every copy to a buffer, any frame */
+        if (drawlog_now() || copylog) printf("copy to buffer: frame %lld texture %dx%d format 0x%x (gl %u%s) region %d,%d %dx%d level %d -> %llx, %zu bytes: %08x %08x%c", (long long)g_st.frames + 1, t->b.width, t->b.height, t->b.format,
+                                  t->o.gl, t->rw ? ", scaled" : "", r[0], r[1], r[3], r[4], level, (unsigned long long)a[3], bytes, rd32(a[3]), bytes >= 8 ? rd32(a[3] + 4) : 0, 10);
         ww_note(a[3], bytes);
         g_st.copies++;
         break;
@@ -7558,6 +7561,10 @@ static void tex_read_texels(Ctx *c) {                   /* (texture, view, regio
     memcpy(j.region, P(A2), 24);
     if (strstr(hostfn_current_name(), "Strided")) { j.row_stride = (int64_t)A4; j.image_stride = (int64_t)A5; }
     gl_run(g_rb->read_texels, &j);
+    {   static int copylog = -1; if (copylog < 0) copylog = getenv("TOMO_COPYLOG") != NULL;
+        if (copylog) printf("read texels: texture %dx%d format 0x%x region %d,%d %dx%d from %llx: %08x %08x\n", j.tex->b.width, j.tex->b.height, j.tex->b.format,
+                            j.region[0], j.region[1], j.region[3], j.region[4], (unsigned long long)c->x[30] - 4, rd32(A3), rd32(A3 + 4));
+    }
 }
 static void tex_invalidate_texels(Ctx *c) {             /* (texture, view, region) */
     ReadJob j;
@@ -7992,6 +7999,47 @@ void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
     ReleaseSRWLockShared(&g_tex_range_lock);
 }
 
+/* nvnMemoryPoolInvalidateMappedRange / nvnBufferInvalidateMappedRange(object, offset, size): the CPU is about to read what the GPU
+ * wrote there. Pool memory is host memory, but what was rendered into textures stored there lives in GL: it is written back
+ * into the pool (as InvalidateTexels does), and storage buffers the GPU wrote go back too. The cursor's GPU pick reads its
+ * result this way: as a no-op, nothing on the island map was ever under the cursor (A over a building did nothing). */
+typedef struct { uint64_t addr, size; } InvalJob;
+static void job_invalidate(void *arg) {
+    InvalJob *j = arg;
+    uint64_t end = j->addr + j->size;
+    int n = 0;
+    if (g_rbp_n) rb_land(1);
+    if (g_cbuf_live) cbuf_flush_if(j->addr, j->size);
+    for (Tex *t = g_all_tex; t; t = t->all_next) {
+        if (t->dead || !t->mem || !t->gpu_written || t->b.packaged || !t->o.gl) continue;
+        uint64_t a = (uint64_t)(uintptr_t)t->mem;
+        if (a >= end || a + t->storage <= j->addr) continue;
+        ReadJob r;
+        memset(&r, 0, sizeof r);
+        r.tex = t; r.to_pool = 1;
+        job_read_texels(&r);
+        n++;
+    }
+    static int log = -1; if (log < 0) log = getenv("TOMO_COPYLOG") != NULL;
+    if (log) printf("invalidate: %llx+%llu, %d texture(s) written back%c", (unsigned long long)j->addr, (unsigned long long)j->size, n, 10);
+}
+static void obj_invalidate_range(Ctx *c) {
+    uint64_t nvn_obj_memory(uint64_t obj), m = A0 ? nvn_obj_memory(A0) : 0;
+    if (!m || !A2) return;
+    InvalJob j = {m + A1, A2};
+    int hit = 0;                                     /* only a range with a rendered texture needs the render thread (buffers land at the batch end) */
+    uint64_t end = tex_range_end(j.addr, j.size);
+    AcquireSRWLockShared(&g_tex_range_lock);
+    if (g_tex_range_fallback) hit = 1;
+    else {
+        size_t lo = 0, hi = g_tex_range_count;
+        while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (g_tex_ranges[mid].prefix_end <= j.addr) lo = mid + 1; else hi = mid; }
+        for (size_t i = lo; i < g_tex_range_count && g_tex_ranges[i].begin < end && !hit; i++)
+            hit = g_tex_ranges[i].end > j.addr && g_tex_ranges[i].tex->gpu_written;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
+    if (hit) gl_run(job_invalidate, &j);
+}
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {
     {"nvnDeviceSetWindowOriginMode", dev_origin_mode}, {"nvnDeviceSetDepthMode", dev_depth_mode}, {"nvnDeviceGetTextureHandle", dev_texture_handle},
     {"nvnDeviceGetTexelFetchHandle", dev_texel_fetch_handle}, {"nvnDeviceGetImageHandle", dev_image_handle},
@@ -8147,8 +8195,8 @@ static const struct { const char *name; ImportFn fn; } k_nvn[] = {
     {"nvnCommandBufferSetShaderScratchMemory", n_nop}, {"nvnSetExternalDebuggerEnabledNVX", n_nop}, {"nvnDeviceSetIntermediateShaderCache", n_nop}, {"nvnDeviceWalkDebugDatabase", n_nop},
     {"nvnCommandBufferSetTiledCacheAction", n_nop}, {"nvnCommandBufferSetTiledCacheTileSize", n_nop}, {"nvnCommandBufferSaveZCullData", n_nop},
     {"nvnCommandBufferRestoreZCullData", n_nop}, {"nvnCommandBufferSetStencilCullCriteria", n_nop}, {"nvnCommandBufferResolveDepthBuffer", n_nop},
-    {"nvnCommandBufferSetColorReductionEnable", n_nop}, {"nvnCommandBufferSetColorReductionThresholds", n_nop}, {"nvnBufferInvalidateMappedRange", n_nop},
-    {"nvnMemoryPoolInvalidateMappedRange", n_nop}, {"nvnDeviceRegisterFastClearColor", n_true}, {"nvnDeviceRegisterFastClearColori", n_true},
+    {"nvnCommandBufferSetColorReductionEnable", n_nop}, {"nvnCommandBufferSetColorReductionThresholds", n_nop}, {"nvnBufferInvalidateMappedRange", obj_invalidate_range},
+    {"nvnMemoryPoolInvalidateMappedRange", obj_invalidate_range}, {"nvnDeviceRegisterFastClearColor", n_true}, {"nvnDeviceRegisterFastClearColori", n_true},
     {"nvnDeviceRegisterFastClearColorui", n_true}, {"nvnDeviceRegisterFastClearDepth", n_true}, {"nvnTextureBuilderGetZCullStorageSize", n_zero},
     {"nvnTextureGetZCullStorageSize", n_zero},
 };
