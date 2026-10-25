@@ -1150,13 +1150,15 @@ static void note_miss(FontData *f, uint32_t code) {
     int k = 0;
     for (; k < f->miss_count && f->miss_codes[k] != code; k++) {}
     if (k == f->miss_count && f->miss_count < (int)(sizeof f->miss_codes / sizeof f->miss_codes[0])) { f->miss_codes[f->miss_count++] = code; fresh = f->miss_count; }
-    {   static uint32_t pua[64]; static int npua;        /* button icons (private use area) are always named: the list above fills with text */
+    {   /* button icons (private use area) the system icon font lacks are always named (the list above fills with text): the
+         * game asks it after its own fonts, so such an icon is drawn as the game's orange "?" */
+        static uint32_t pua[64]; static int npua;
         int j = 0;
         for (; j < npua && pua[j] != code; j++) {}
-        if (!fresh && code >= 0xe000 && code <= 0xf8ff && j == npua && npua < 64) { pua[npua++] = code; fresh = -1; }
+        if (!fresh && f->shared && code >= 0xe000 && code <= 0xf8ff && j == npua && npua < 64) { pua[npua++] = code; fresh = -1; }
     }
     LeaveCriticalSection(&g_lock);
-    if (fresh < 0) printf("nn::fontll: font \"%s\" has no glyph for U+%04X (a button icon; misses so far %ld)\n", f->name, (unsigned)code, (long)n);
+    if (fresh < 0) printf("nn::fontll: system font \"%s\" has no glyph for U+%04X (a button icon, drawn as \"?\"; misses so far %ld)\n", f->name, (unsigned)code, (long)n);
     else if (fresh) printf("nn::fontll: font \"%s\" has no glyph for U+%04X (distinct miss %d, misses so far %ld)\n", f->name, (unsigned)code, fresh, (long)n);
     else if ((n & (n - 1)) == 0 && n >= 64) printf("nn::fontll: font \"%s\": %ld glyph checks missed so far, %ld glyph maps made, %ld of them the U+25A1 box\n",
                                                    f->name, (long)n, (long)f->drawn, (long)f->alt_drawn);
