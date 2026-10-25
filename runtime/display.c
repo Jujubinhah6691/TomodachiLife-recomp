@@ -764,6 +764,7 @@ static void frame_queued(void) {
     LONG64 n = InterlockedIncrement64(&g_frames);
     second_frames++;
     adapt_frame(now);
+    { void display_l1_trace_frame(long long n); display_l1_trace_frame(n); }
     {   /* session 14: the game's thread on the performance cores (set once), and where it is seen at each present */
         static DWORD tid;
         if (tid != GetCurrentThreadId()) { tid = GetCurrentThreadId(); display_perf_thread(); }
@@ -859,6 +860,16 @@ static volatile LONG g_l1_trace_left, g_l1_trace_done;
 static LONG64 g_l1_trace_t0;
 int display_l1_trace(void) { return g_l1_trace_left > 0; }
 double display_l1_ms(void) { LARGE_INTEGER n; QueryPerformanceCounter(&n); return (double)(n.QuadPart - g_l1_trace_t0) * 1000.0 / (double)g_freq.QuadPart; }
+/* TEST ONLY, SSBU_L1_TRACE=<presented frame> (any game, either renderer): the l1-trace timeline (every event / condition
+ * wait and signal of the game's threads, with the thread and the caller) for 7 frames from that frame; any other value:
+ * from a fight's button press (display_l1_poll). Called at each present (frame_queued). */
+void display_l1_trace_frame(long long n) {
+    static long long at = -2;
+    if (at == -2) { const char *e = getenv("SSBU_L1_TRACE"); at = e && atoll(e) > 1 ? atoll(e) : -1; }
+    if (at < 0) return;
+    if (n == at && !g_l1_trace_done) { LARGE_INTEGER now; QueryPerformanceCounter(&now); g_l1_trace_done = 1; g_l1_trace_t0 = now.QuadPart; InterlockedExchange(&g_l1_trace_left, 7); }
+    else if (g_l1_trace_left > 0) { printf("l1-trace: %+8.2f PRESENT (frames left %ld)%c", display_l1_ms(), (long)g_l1_trace_left, 10); InterlockedDecrement(&g_l1_trace_left); }
+}
 void display_l1_poll(uint64_t buttons, long long fight_ticks, long long poll) {
     static uint64_t prev;
     LARGE_INTEGER now;

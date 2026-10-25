@@ -165,7 +165,7 @@ static DWORD_PTR g_cc_core[3];
 static int console_cores(void) {
     if (g_cc < 0) {
         int n = 0, on = 0;
-        if (getenv("SSBU_OS_CONSOLE_CORES")) {
+        if (getenv("SSBU_OS_CONSOLE_CORES") && strcmp(getenv("SSBU_OS_CONSOLE_CORES"), "0")) {      /* "0": off */
             DWORD_PTR proc = 0, sys = 0;
             GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
             {   /* Hybrid CPUs: three performance cores, one hardware thread each, from the top. "Every second processor from the
@@ -199,6 +199,12 @@ static int console_cores(void) {
             for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0 && n < 3; b--)      /* from the top, every second processor: not two hardware threads of one core */
                 if (proc >> b & 1) { g_cc_core[n++] = (DWORD_PTR)1 << b; b--; }
             on = n == 3;
+            /* The process one class above normal: the three processors are the game's, and the other programs' threads (a
+             * browser, another game) took them for whole time slices: the island at frame_rate = 60 came out at 52-54 fps with
+             * frames of 30-40 ms among them, 60.0 with this (2026-10-25). Only these three are affected: nothing else of ours is
+             * pinned there. TOMO_CC_PRIOCLASS=0: normal, as before. */
+            if (on && !(getenv("TOMO_CC_PRIOCLASS") && !strcmp(getenv("TOMO_CC_PRIOCLASS"), "0")))
+                SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
             printf("nn::os: console core model %s (SSBU_OS_CONSOLE_CORES): host processor masks %llx %llx %llx for cores 0 1 2\n", on ? "ON" : "NOT possible (fewer than 3 usable processors)",
                    (unsigned long long)g_cc_core[0], (unsigned long long)g_cc_core[1], (unsigned long long)g_cc_core[2]);
         }

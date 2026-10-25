@@ -445,8 +445,8 @@ static void page_display(ImVec2 avail) {
     label_col("Internal resolution"); ini_combo("resolution_scale", "1.0", rv, rl, 4);
     hint("The game's 3D picture is drawn at this size and fitted to the window. 4K needs a recent graphics card.");
     static const char *const fv[] = {"30", "60"}, *const fl[] = {"30 fps (as the console)", "60 fps"};
-    label_col("Frame rate"); ini_combo("frame_rate", "30", fv, fl, 2);
-    hint("At 60 fps the game keeps its normal speed; busy scenes may not hold 60 on every PC yet.");
+    label_col("Frame rate"); ini_combo("frame_rate", "60", fv, fl, 2);
+    hint("At 60 fps the game keeps its normal speed. A scene your PC cannot hold at 60 drops to 30 for a while instead of stuttering.");
     static const char *const sv[] = {"off", "auto", "21:9", "32:9"}, *const sl[] = {"Off (16:9, as the console)", "Fit the monitor", "21:9 ultrawide", "32:9 super ultrawide"};
     label_col("Widescreen"); ini_combo("widescreen", "off", sv, sl, 4);
     hint("Wider than 16:9: the island shows more at the sides; menus and text stay 16:9 in the middle.");

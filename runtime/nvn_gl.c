@@ -920,6 +920,39 @@ void nvn_ww_region(uint64_t base, uint64_t size, int add) {      /* nnsdk.c: mem
     else if (!add && i < g_wwl_n) { g_wwl_base[i] = g_wwl_base[--g_wwl_n]; g_wwl_size[i] = g_wwl_size[g_wwl_n]; }
     ReleaseSRWLockExclusive(&g_wwl_lock);
 }
+/* The scan asks only for the 2 MB chunks that hold a range the arena keeps (arena_put marks them): the regions are the
+ * game's whole heap, 4.5 GB on the island, and GetWriteWatch over it cost 3.2 ms per batch, three batches a frame, on the
+ * render thread (nearly 10 ms of an 18 ms frame at frame_rate = 60). A chunk asked for the first time may report writes
+ * from long ago: its kept ranges are streamed again once. TOMO_WW_FULL=1: the whole regions, as before. */
+#define WW_CHUNK_SHIFT 21
+static uint64_t *g_wwc, g_wwc_n, g_wwc_cap;       /* the chunks (address >> WW_CHUNK_SHIFT), sorted when g_wwc_sorted */
+static int g_wwc_sorted = 1;
+static struct { uint64_t chunk; } g_wwc_set[1 << 14];      /* membership (open addressing; 0 = empty) */
+static void ww_chunk_mark(uint64_t addr, uint64_t size) {
+    for (uint64_t ch = addr >> WW_CHUNK_SHIFT, last = (addr + size - 1) >> WW_CHUNK_SHIFT; ch <= last; ch++) {
+        unsigned h = (unsigned)((ch * 0x9E3779B97F4A7C15ULL) >> 50);
+        for (;; h = (h + 1) & ((1u << 14) - 1)) {
+            if (g_wwc_set[h].chunk == ch) break;
+            if (g_wwc_set[h].chunk) continue;
+            if (g_wwc_n >= (1u << 13)) return;     /* (16 GB of chunks: the full scan below takes over) */
+            g_wwc_set[h].chunk = ch;
+            if (g_wwc_n == g_wwc_cap) { g_wwc_cap = g_wwc_cap ? g_wwc_cap * 2 : 256; g_wwc = realloc(g_wwc, g_wwc_cap * sizeof *g_wwc); }
+            g_wwc[g_wwc_n++] = ch; g_wwc_sorted = 0;
+            break;
+        }
+    }
+}
+static int u64_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static int ww_ask(uint64_t base, uint64_t size, void **pages, uint64_t *stamp, LONG64 *wpages) {      /* 0: the list overflowed */
+    ULONG_PTR count = 1 << 18;
+    DWORD gran = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)base, (SIZE_T)size, pages, &count, &gran)) return 1;
+    if (count == (ULONG_PTR)1 << 18) { g_ww_floor = ++g_ww_stamp; return 0; }      /* more than the list holds: everything counts as written */
+    if (count && !*stamp) *stamp = ++g_ww_stamp;
+    *wpages += (LONG64)count;
+    for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = *stamp;
+    return 1;
+}
 static void ww_scan_regions(void) {
     static void *pages[1 << 18];
     ww_newest(NULL, 0);                          /* (the table) */
@@ -929,13 +962,30 @@ static void ww_scan_regions(void) {
     memcpy(g_wwr_base, g_wwl_base, sizeof g_wwr_base); memcpy(g_wwr_size, g_wwl_size, sizeof g_wwr_size);
     ReleaseSRWLockShared(&g_wwl_lock);
     uint64_t stamp = 0;
-    for (int r = 0; r < g_wwr_n; r++) {
-        ULONG_PTR count = 1 << 18;
-        DWORD gran = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)g_wwr_base[r], (SIZE_T)g_wwr_size[r], pages, &count, &gran)) continue;
-        if (count == (ULONG_PTR)1 << 18) { g_ww_floor = ++g_ww_stamp; continue; }      /* more than the list holds: everything counts as written */
-        if (count && !stamp) stamp = ++g_ww_stamp;
-        for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
+    static int wwlog = -1, full = -1; static LONG64 wt, wn, wpages, wcalls;
+    if (wwlog < 0) { wwlog = getenv("TOMO_WWLOG") != NULL; full = getenv("TOMO_WW_FULL") != NULL; }      /* TEST ONLY: the scan's cost; the old full scan */
+    LONG64 w0 = wwlog ? pf_now() : 0;
+    if (full || g_wwc_n >= (1u << 13)) {
+        for (int r = 0; r < g_wwr_n; r++) { ww_ask(g_wwr_base[r], g_wwr_size[r], pages, &stamp, &wpages); wcalls++; }
+    } else {
+        if (!g_wwc_sorted) { qsort(g_wwc, (size_t)g_wwc_n, sizeof *g_wwc, u64_cmp); g_wwc_sorted = 1; }
+        for (uint64_t i = 0; i < g_wwc_n;) {      /* runs of chunks less than 64 MB apart, cut to each region: a call costs about
+                                                   * 60 us whatever its size (its reset), 64 MB more about 0.04 ms */
+            uint64_t j = i + 1;
+            while (j < g_wwc_n && g_wwc[j] - g_wwc[j - 1] <= (64u << 20 >> WW_CHUNK_SHIFT)) j++;
+            uint64_t a = g_wwc[i] << WW_CHUNK_SHIFT, b = (g_wwc[j - 1] + 1) << WW_CHUNK_SHIFT;
+            for (int r = 0; r < g_wwr_n; r++) {
+                uint64_t lo = a > g_wwr_base[r] ? a : g_wwr_base[r], hi = b < g_wwr_base[r] + g_wwr_size[r] ? b : g_wwr_base[r] + g_wwr_size[r];
+                if (lo < hi) { ww_ask(lo, hi - lo, pages, &stamp, &wpages); wcalls++; }
+            }
+            i = j;
+        }
+    }
+    if (wwlog && (wt += pf_now() - w0, ++wn % 300 == 0)) {
+        uint64_t total = 0; for (int r = 0; r < g_wwr_n; r++) total += g_wwr_size[r];
+        printf("wwlog: %d regions, %.1f MB watched, %llu chunks of 2 MB asked for; %.3f ms, %.1f calls and %.0f written pages per scan (last 300)%c", g_wwr_n, (double)total / 1048576.0,
+               (unsigned long long)g_wwc_n, (double)wt / 1e4 / 300.0, (double)wcalls / 300.0, (double)wpages / 300.0, 10);
+        wt = 0; wpages = 0; wcalls = 0;
     }
     if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; }
 }
@@ -1608,6 +1658,7 @@ static size_t arena_put(uint64_t addr, uint64_t size) {
     static int keep = -1; if (keep < 0) keep = !(getenv("TOMO_ARENA_KEEP") && getenv("TOMO_ARENA_KEEP")[0] == '0');
     unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19, pick = 8192;
     uint64_t now = keep ? ww_range_stamp(addr, size) : 0;
+    if (now) ww_chunk_mark(addr, size);             /* its pages are asked for at every batch from now on (ww_scan_regions) */
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
         if (g_acache[i].addr == addr && g_acache[i].size == size && g_acache[i].arena == g_arena_serial) {
@@ -7226,7 +7277,15 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
     if (j.shot_fight && drawtag_env()) InterlockedExchange(&g_drawtag_next, j.shot_fight + 1);      /* round 17 (SSBU_DRAWTAG): the next submission is the next fight frame's */
     display_before_present();
     { void display_present_plan(int vulkan); display_present_plan(g_vk); }      /* session 14: the tick this frame is shown at, decided before the present (display.c) */
-    gl_run(g_rb->present, &j);
+    /* OpenGL: the present is queued like the submission before it (NVN's present is a queue operation too). The game's
+     * render thread used to stand here while ours replayed the whole frame (8-11 ms on the island), so the frame's busy
+     * time was the game's work plus our replay: 14-19 ms, and frame_rate = 60 fell back to 30. Now the replay runs during
+     * the wait for the next refresh. The game stays at most a frame ahead: its next frame starts with a SyncWait, which
+     * runs after everything queued before it. TOMO_SYNC_PRESENT=1: the present waits, as before. */
+    static int sync_present = -1;
+    if (sync_present < 0) sync_present = getenv("TOMO_SYNC_PRESENT") != NULL;
+    if (!g_vk && gl_async_on() && !sync_present && !j.shot_fight) gl_post(g_rb->present, &j, sizeof j);
+    else gl_run(g_rb->present, &j);
     display_pace();
 }
 

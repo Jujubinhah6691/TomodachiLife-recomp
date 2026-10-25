@@ -22,7 +22,7 @@ static int g_gfx_menu = 1, g_gfx_volume = -1;      /* U1: menu = on (default) | 
 static char g_gfx_language[16];                      /* U1: language = auto ("") | a code */
 int gfx_menu(void) { gfx_options(); return g_gfx_menu; }
 static int g_gfx_stats;                              /* U1: stats_overlay = off | on */
-static int g_gfx_fps = 30;                           /* frame_rate = 30 | 60 */
+static int g_gfx_fps = 60;                           /* frame_rate = 30 | 60 (default 60 since 2026-10-25: holds on the island) */
 int gfx_frame_rate(void) { gfx_options(); return g_gfx_fps; }
 static float g_gfx_wide;                             /* widescreen = off 0 | auto -1 | an aspect ratio (21:9 -> 2.333) */
 float gfx_widescreen(void) { gfx_options(); return g_gfx_wide; }
@@ -130,8 +130,9 @@ static const char *const k_default_ini =
 "\r\n"
 "; frame_rate = 30 | 60\r\n"
 ";   30: as on the console. 60: the game is presented at 60 frames per second; its logic counts the display's\r\n"
-";   refreshes, so it keeps its speed. TOMO_INTERVAL=<refreshes per frame> wins.\r\n"
-"frame_rate = 30\r\n"
+";   refreshes, so it keeps its speed; a scene the PC cannot hold at 60 drops to 30 for a while instead of stuttering.\r\n"
+";   TOMO_INTERVAL=<refreshes per frame> wins.\r\n"
+"frame_rate = 60\r\n"
 "\r\n"
 "; widescreen = off | auto | 21:9 | 32:9 | <width:height>\r\n"
 ";   Wider than 16:9 (OpenGL): the 3D picture shows more at the sides, menus and text stay 16:9 in the middle.\r\n"
