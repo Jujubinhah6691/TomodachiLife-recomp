@@ -2063,11 +2063,11 @@ static GLuint pw_load(int stage, uint64_t th, size_t tl, const char *src) {
     while (glGetError()) {}
     return q;
 }
-static char *pw_translate(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size, uint32_t *in_attr) {
+static char *pw_translate(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size, uint32_t *in_attr, uint32_t int_attrs) {
     MxIn in;
     MxOut out;
     memset(&in, 0, sizeof in);
-    in.stage = stage; in.code = code; in.code_len = code_len;
+    in.stage = stage; in.code = code; in.code_len = code_len; in.int_attrs = int_attrs;
     if (cdata_size) { in.cdata = cdata; in.cdata_size = cdata_size; }
     in.binding_base = (unsigned)stage * 20; in.ssbo_base = 40 + (unsigned)stage * 16; in.ubo = ubo_on(); in.ubo_base = (unsigned)stage * 18;
     in.fragdebug = getenv("SSBU_FRAGDEBUG") != NULL; in.screen_scale = in.stage == 1 && rs_on(); in.wide = wide_k() != 1.0f ? 1 + g_wide_camera : 0;
@@ -2104,8 +2104,13 @@ static void pw_progs_load(void) {                  /* render thread, start, only
     LeaveCriticalSection(&g_shw_lock);
     fclose(f);
 }
+static void shp_variant(const ShJob *j, uint32_t int_attrs);
+static void shp_finish_check(void);
+static int shp_warmed(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask, int add);
+static volatile LONG64 g_shp_total, g_shp_done, g_shp_t0;      /* shader preparation (below shd_workers_start) */
 /* Worker: one pair job. stage 2 = named by the two text hashes (data: vh, fh, vl, fl); stage 3 = the machine code of a
- * program's vertex stage (code_len, cdata_size) and fragment stage (key[0], key[1]; 0 = none: depth-only). */
+ * program's vertex stage (code_len, cdata_size) and fragment stage (key[0], key[1]; 0 = none: depth-only); stage 4 = the
+ * same for a variation of the shader store (shader preparation), key[2] = the vertex stage's integer inputs. */
 static void pw_job(ShJob *j, GLuint pipe, GLuint empty_fs) {
     uint64_t vh = 0, fh = 0;
     uint32_t vl = 0, fl = 0, mask = 0;             /* mask: the vertex arrays that are enabled for the warm draw */
@@ -2113,14 +2118,16 @@ static void pw_job(ShJob *j, GLuint pipe, GLuint empty_fs) {
     if (j->stage == 2) { memcpy(&vh, j->data, 8); memcpy(&fh, j->data + 8, 8); memcpy(&vl, j->data + 16, 4); memcpy(&fl, j->data + 20, 4); memcpy(&mask, j->data + 24, 4); }
     else {
         const uint8_t *vc = j->data, *vd = vc + j->code_len, *fc = vd + j->cdata_size, *fd = fc + j->key[0];
-        vt = pw_translate(0, vc, j->code_len, vd, j->cdata_size, &mask);      /* a program handed over: every input the vertex stage reads comes from an array */
+        vt = pw_translate(0, vc, j->code_len, vd, j->cdata_size, &mask, j->stage == 4 ? j->key[2] : 0);      /* a program handed over: every input the vertex stage reads comes from an array */
         mask &= 0xffff;
-        if (j->key[0]) ft = pw_translate(1, fc, (int)j->key[0], fd, j->key[1], NULL);
+        if (j->key[0]) ft = pw_translate(1, fc, (int)j->key[0], fd, j->key[1], NULL, 0);
+        if (j->stage == 4 && !j->key[2] && (mask >> 6 & 1)) shp_variant(j, 0x40);      /* attribute 6 as integers too (skinning's bone indices) */
         if (!vt || (j->key[0] && !ft)) { free(vt); free(ft); InterlockedIncrement64(&g_pw_missing); return; }
         vl = (uint32_t)strlen(vt); vh = sh_hash(0x9E3779B97F4A7C15ULL ^ 0, vt, vl);
         if (ft) { fl = (uint32_t)strlen(ft); fh = sh_hash(0x9E3779B97F4A7C15ULL ^ 1, ft, fl); }
     }
     if (pw_seen(vh, vl, fh, fl, mask)) { free(vt); free(ft); InterlockedIncrement64(&g_pw_dup); pw_prog_known(j); return; }
+    if (j->stage == 4 && shp_warmed(vh, vl, fh, fl, mask, 0)) { free(vt); free(ft); return; }      /* a preparation before this one did it */
     if (mask & 0x10000) {                          /* a compute program: one work group with no buffer and no image bound (reads give 0, writes go nowhere) */
         GLuint cs = pw_load(5, vh, vl, NULL);
         if (cs) {
@@ -2157,6 +2164,7 @@ static void pw_job(ShJob *j, GLuint pipe, GLuint empty_fs) {
         if (g_fdlog) printf("fd-warm: %016llx %x %016llx %x mask %x kind %d %.1f ms frame %lld%c", (unsigned long long)vh, vl, (unsigned long long)fh, fl, mask, j->stage, (double)dt * 1000.0 / (double)freq, (long long)g_st.frames, 10);
         glUseProgramStages(pipe, 1, 0);
         glUseProgramStages(pipe, 2, 0);
+        if (j->stage == 4) shp_warmed(vh, vl, fh, fl, mask, 1);
         if (j->stage == 3 && !getenv("SSBU_NO_PAIR_LIST")) {          /* into <cache>/pairs.txt (same line format as prec_note) */
             char path[260];
             snprintf(path, sizeof path, "%s/pairs.txt", g_shd_dir);
@@ -2274,7 +2282,11 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         if (j) { g_shw_head = j->next; if (!g_shw_head) g_shw_tail = NULL; }
         LeaveCriticalSection(&g_shw_lock);
         if (!j) continue;
-        if (j->stage >= 2) { pw_job(j, pw_pipe, pw_empty); InterlockedIncrement64(&g_shw_done); free(j); continue; }
+        if (j->stage >= 2) {
+            pw_job(j, pw_pipe, pw_empty);
+            if (j->stage == 4) { InterlockedIncrement64(&g_shp_done); shp_finish_check(); }
+            InterlockedIncrement64(&g_shw_done); free(j); continue;
+        }
         MxIn in;
         MxOut out;
         memset(&in, 0, sizeof in);
@@ -2314,6 +2326,202 @@ static void shd_workers_start(void) {
     if (!getenv("SSBU_NO_SHADER_VARIANTS")) shv_load();
     g_shw_sem = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL);
     for (int i = 0; i < g_shw_n; i++) { DWORD tid = 0; CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, &tid)); if (i < 8) g_shw_tid[i] = tid; }
+}
+/* ---- Shader preparation (2026-10-25): every shader of the game compiled before the title
+ * scripts/shader_store.py takes every "BNSH" container out of the game files into ..\cache\shader_store (460 containers,
+ * 14,676 variations, 6,049 distinct vertex / fragment stages: the 3D shader archive, effects, layouts, the exe's own). At
+ * start, while the loading screen says "preparing shaders" (boot.c waits for the workers), every variation's vertex and
+ * fragment stage is translated, compiled when its binary is not in the cache, and the pair gets the driver's first-draw
+ * work (pw_job, stage 4): nothing is compiled while the game runs. A vertex stage that reads attribute 6 is also made with
+ * that input as integers (skinned models' bone indices: the only integer key variants.txt ever recorded for a vertex
+ * stage). Measured on the RTX 3060: a stage compile 81 ms, a cold pair 6 ms; the first preparation takes minutes, once.
+ * Done once per store, shader-text settings (resolution scale, widescreen), driver and exe (name, size, time): the key of
+ * the last complete one is in <cache>/prepared_<exe>.txt; a start with the same key queues nothing. TOMO_SHADER_PREP=0 = off,
+ * TOMO_SHADER_STORE=<dir> = another store. Compute stages are left out (their text depends on the images bound). */
+static volatile LONG g_shp_queueing, g_shp_marked;
+static uint64_t g_shp_key;
+static char g_shp_mark[320];
+/* The pairs earlier preparations had the driver do its first-draw work for, by this exe name (the driver keeps that work
+ * in a cache of its own per exe name): <cache>/warmed_<exe>.txt, "<vs hash> <vs length> <fs hash> <fs length> <mask>".
+ * A preparation after an update then warms only pairs whose text changed (all 8,243 again: 46 s, measured). */
+static uint64_t g_shp_wset[1 << 17];
+static char g_shp_wpath[320];
+static volatile LONG64 g_shp_skipped;
+static int shp_wput(uint64_t k, int add) {          /* g_shw_lock held: 1 when k was in the set */
+    unsigned s = (unsigned)(k >> 20) & ((1u << 17) - 1);
+    for (int probe = 0; probe < 1024; probe++, s = (s + 1) & ((1u << 17) - 1)) {
+        if (g_shp_wset[s] == k) return 1;
+        if (!g_shp_wset[s]) { if (add) g_shp_wset[s] = k; return 0; }
+    }
+    return 0;
+}
+static uint64_t shp_wkey(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask) { uint64_t w[3] = {vh ^ vl, fh ^ fl, mask}; return sh_hash(0x57524d44ULL, w, sizeof w) | 1; }
+static int shp_warmed(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask, int add) {      /* worker */
+    uint64_t k = shp_wkey(vh, vl, fh, fl, mask);
+    EnterCriticalSection(&g_shw_lock);
+    int found = shp_wput(k, add);
+    if (add && !found && g_shp_wpath[0]) {
+        FILE *f = fopen(g_shp_wpath, "a");
+        if (f) { fprintf(f, "%016llx %x %016llx %x %x\n", (unsigned long long)vh, vl, (unsigned long long)fh, fl, mask); fclose(f); }
+    }
+    LeaveCriticalSection(&g_shw_lock);
+    if (add || !found) return found;
+    char path[320];                                /* and both binaries are still in the cache */
+    shd_path(path, sizeof path, vh, vl);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 0;
+    if (fl) { shd_path(path, sizeof path, fh, fl); if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 0; }
+    InterlockedIncrement64(&g_shp_skipped);
+    return 1;
+}
+static char *shp_read(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = len > 0 ? malloc((size_t)len + 1) : NULL;
+    if (b && fread(b, 1, (size_t)len, f) == (size_t)len) { b[len] = 0; *n = (size_t)len; } else { free(b); b = NULL; }
+    fclose(f);
+    return b;
+}
+static void shp_finish_check(void) {                /* any thread: the last job of a preparation writes its key */
+    if (g_shp_queueing || !g_shp_total || g_shp_done < g_shp_total || InterlockedExchange(&g_shp_marked, 1)) return;
+    FILE *f = fopen(g_shp_mark, "w");
+    if (f) { fprintf(f, "%016llx\n", (unsigned long long)g_shp_key); fclose(f); }
+    LARGE_INTEGER q; QueryPerformanceFrequency(&q);
+    printf("nvn_gl: shader preparation done: %lld variations in %.1f s (%lld stages compiled, %lld cold pairs, %lld warmed before, %lld not translated)%c", (long long)g_shp_total,
+           (double)(pf_now() - g_shp_t0) / (double)q.QuadPart, (long long)g_pw_compiled, (long long)g_pw_cold_n, (long long)g_shp_skipped, (long long)g_pw_missing, 10);
+    fflush(stdout);
+}
+static void shp_variant(const ShJob *j, uint32_t int_attrs) {      /* worker: the same variation once more with other vertex inputs */
+    size_t n = (size_t)j->code_len + j->cdata_size + j->key[0] + j->key[1];
+    ShJob *v = malloc(sizeof *v + n);
+    memcpy(v, j, sizeof *v + n);
+    v->key[2] = int_attrs;
+    InterlockedIncrement64(&g_shp_total);
+    pw_enqueue(v);
+}
+static int shp_stage(const uint8_t *c, size_t size, uint64_t control, uint64_t data, const uint8_t **code, int *len, const uint8_t **cd, uint32_t *cds) {
+    static const int8_t stage_of_type[16] = {-1, 0, 3, 4, 2, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    uint32_t v;
+    if (control + 0x760 > size || data + 0x40 > size) return -1;
+    memcpy(&v, c + control, 4); if (v != 0x98761234u) return -1;
+    memcpy(&v, c + data, 4); if (v != 0x12345678u) return -1;
+    memcpy(&v, c + control + 0x714, 4); if (v == 5) return -1;      /* compute */
+    memcpy(&v, c + data + 0x30, 4);
+    int s = stage_of_type[(v >> 10) & 15];
+    uint32_t ctl[8];
+    memcpy(ctl, c + control + 0x6f0, 32);
+    if (s < 0 || s > 1 || !ctl[2] || ctl[2] > (4u << 20) || data + 0x30 + ctl[2] > size) return -1;
+    *code = c + data + 0x30; *len = (int)ctl[2]; *cd = NULL; *cds = 0;
+    if (ctl[3] && ctl[4] && data + ctl[4] + ctl[3] <= size) { *cd = c + data + ctl[4]; *cds = ctl[3]; }
+    return s;
+}
+static void shp_queue(void) {                      /* render thread, start (prec_load), before the start-up queueing is declared over */
+    const char *e = getenv("TOMO_SHADER_PREP"), *dir = getenv("TOMO_SHADER_STORE");
+    char path[320], exe[MAX_PATH] = "";
+    size_t n = 0;
+    if ((e && e[0] == '0') || !pw_mode() || g_shd_mode <= 0 || !g_shw_n || g_shw_ctx_failed) return;
+    if (!dir || !dir[0]) dir = "../cache/shader_store";
+    snprintf(path, sizeof path, "%s/store.txt", dir);
+    char *txt = shp_read(path, &n);
+    if (!txt) { printf("nvn_gl: shader preparation: no store at %s (scripts/shader_store.py makes it): shaders are compiled when first needed%c", dir, 10); return; }
+    {   WIN32_FILE_ATTRIBUTE_DATA fa;
+        char key[512];
+        GetModuleFileNameA(NULL, exe, sizeof exe);
+        memset(&fa, 0, sizeof fa);
+        GetFileAttributesExA(exe, GetFileExInfoStandard, &fa);
+        const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
+        int kl = snprintf(key, sizeof key, "%s %lu %lu %lu %d %d %d %016llx", base, fa.nFileSizeLow, fa.ftLastWriteTime.dwLowDateTime, fa.ftLastWriteTime.dwHighDateTime,
+                          ubo_on(), rs_on(), wide_k() != 1.0f ? 1 + g_wide_camera : 0, (unsigned long long)g_shd_drv);
+        g_shp_key = sh_hash(sh_hash(0x5348505245ULL, txt, n), key, (size_t)kl);
+        snprintf(g_shp_mark, sizeof g_shp_mark, "%s/prepared_%s.txt", g_shd_dir, base);
+        snprintf(g_shp_wpath, sizeof g_shp_wpath, "%s/warmed_%s.txt", g_shd_dir, base);
+    }
+    {   size_t ml = 0;
+        char *m = shp_read(g_shp_mark, &ml);
+        unsigned long long k = 0;
+        int same = m && sscanf(m, "%llx", &k) == 1 && k == g_shp_key;
+        free(m);
+        if (same) { printf("nvn_gl: shader preparation: every shader of the store was made ready before (%s)%c", g_shp_mark, 10); free(txt); return; }
+    }
+    {   size_t wl = 0;                             /* the pairs warmed by earlier preparations */
+        char *w = shp_read(g_shp_wpath, &wl);
+        int nw = 0;
+        EnterCriticalSection(&g_shw_lock);
+        for (char *l = w; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+            unsigned long long vh, fh; unsigned vl, fl, mask;
+            if (sscanf(l, "%llx %x %llx %x %x", &vh, &vl, &fh, &fl, &mask) == 5) nw += !shp_wput(shp_wkey(vh, vl, fh, fl, mask), 1);
+        }
+        LeaveCriticalSection(&g_shw_lock);
+        free(w);
+        if (nw) printf("nvn_gl: shader preparation: %d pairs were warmed before (%s)%c", nw, g_shp_wpath, 10);
+    }
+    static uint64_t seen[1 << 15];
+    int ncont = 0, nvar = 0, ndup = 0;
+    g_shp_t0 = pf_now();
+    InterlockedExchange(&g_shp_queueing, 1);
+    for (char *line = txt, *next; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        char name[40];
+        if (sscanf(line, "%32s", name) != 1) continue;
+        snprintf(path, sizeof path, "%s/%s.bnsh", dir, name);
+        size_t size = 0;
+        uint8_t *c = (uint8_t *)shp_read(path, &size);
+        if (!c) continue;
+        uint32_t w;
+        uint64_t blk, vars;
+        memcpy(&w, c + 0x14, 4); blk = w >> 16;
+        if (size < 0x60 || blk + 0x28 > size || memcmp(c + blk, "grsc", 4)) { free(c); continue; }
+        int cnt;
+        memcpy(&cnt, c + blk + 0x1C, 4); memcpy(&vars, c + blk + 0x20, 8);
+        if (cnt <= 0 || vars + (uint64_t)cnt * 0x40 > size) { free(c); continue; }
+        ncont++;
+        for (int vi = 0; vi < cnt; vi++) {
+            uint64_t prog;
+            memcpy(&prog, c + vars + (uint64_t)vi * 0x40 + 0x10, 8);      /* the binary program (file offsets: not relocated) */
+            if (!prog || prog + 0x70 > size) continue;
+            const uint8_t *code[2] = {NULL, NULL}, *cd[2] = {NULL, NULL};
+            int len[2] = {0, 0};
+            uint32_t cds[2] = {0, 0};
+            for (int sl = 0; sl < 6; sl++) {
+                uint64_t sc, control, data;
+                memcpy(&sc, c + prog + 8 + (uint64_t)sl * 8, 8);
+                if (!sc || sc + 0x20 > size) continue;
+                memcpy(&control, c + sc + 8, 8); memcpy(&data, c + sc + 16, 8);
+                const uint8_t *k; const uint8_t *kd; int kl; uint32_t kds;
+                int s = shp_stage(c, size, control, data, &k, &kl, &kd, &kds);
+                if (s >= 0) { code[s] = k; len[s] = kl; cd[s] = kd; cds[s] = kds; }
+            }
+            if (!code[0]) continue;
+            size_t need = (size_t)len[0] + cds[0] + (size_t)len[1] + cds[1];
+            ShJob *j = calloc(1, sizeof *j + need);
+            uint8_t *d = j->data;
+            j->stage = 4; j->code_len = len[0]; j->cdata_size = cds[0]; j->key[0] = (uint32_t)len[1]; j->key[1] = cds[1];
+            memcpy(d, code[0], (size_t)len[0]); d += len[0];
+            if (cds[0]) { memcpy(d, cd[0], cds[0]); d += cds[0]; }
+            if (len[1]) { memcpy(d, code[1], (size_t)len[1]); d += len[1]; if (cds[1]) memcpy(d, cd[1], cds[1]); }
+            uint64_t h = sh_hash(0x5348505ULL ^ (uint64_t)len[0] ^ ((uint64_t)len[1] << 32), j->data, need) | 1;
+            unsigned slot = (unsigned)(h >> 20) & ((1u << 15) - 1);
+            int dup = 0;
+            for (int probe = 0; probe < 256; probe++, slot = (slot + 1) & ((1u << 15) - 1)) { if (seen[slot] == h) { dup = 1; break; } if (!seen[slot]) { seen[slot] = h; break; } }
+            if (dup) { free(j); ndup++; continue; }
+            nvar++;
+            InterlockedIncrement64(&g_shp_total);
+            pw_enqueue(j);
+        }
+        free(c);
+    }
+    free(txt);
+    if (nvar) {                                    /* while the loading screen waits, more workers than in play */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        int want = (int)si.dwNumberOfProcessors - 2;
+        if (want > 12) want = 12;
+        for (; g_shw_n < want; g_shw_n++) { DWORD tid = 0; CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, &tid)); if (g_shw_n < 8) g_shw_tid[g_shw_n] = tid; }
+    }
+    printf("nvn_gl: shader preparation: %d variations of %d containers queued (%d repeated), %d workers%c", nvar, ncont, ndup, g_shw_n, 10);
+    InterlockedExchange(&g_shp_queueing, 0);
+    shp_finish_check();
 }
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
@@ -2543,6 +2751,7 @@ static void prec_load(void) {                      /* render thread, once (shd_i
     char path[260], line[200];
     if (g_prec_off < 0) g_prec_off = getenv("SSBU_NO_PAIR_LIST") != NULL || g_shd_mode <= 0;
     if (g_prec_off) return;
+    shp_queue();
     snprintf(path, sizeof path, "%s/pairs.txt", g_shd_dir);
     FILE *f = fopen(path, "r");
     if (!f) { printf("nvn_gl: no pair list at %s (first run here, or the exe was not started from build/work)%c", path, 10); InterlockedExchange(&g_pw_listed_done, 1); return; }

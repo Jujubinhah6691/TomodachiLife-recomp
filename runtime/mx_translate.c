@@ -554,10 +554,11 @@ static void op_tld4s(Mx *e, uint64_t i) {
     tex_store_pair(e, 15, MXB(i, 0, 8), MXB(i, 28, 8), MXB(i, 55, 1), is_int);    /* precision bit: 1 = F16 here */
 }
 
-static void op_tmml(Mx *e, uint64_t i) {
+static void op_tmml(Mx *e, uint64_t i, int bindless) {      /* TMML.B: the texture handle in Rb, as TEX.B (4 fragment stages of the game's store) */
     unsigned t = MXB(i, 28, 3), c = MXB(i, 8, 8), mask = MXB(i, 31, 4), r = MXB(i, 0, 8);
-    int unit = tex_unit(e, i);
-    if (unit < 0) return;
+    int unit = -1;
+    if (bindless && e->in->target == 1) { fail(e, "TMML.B", "bindless texture handle in a register (Vulkan)"); return; }
+    if (!bindless && (unit = tex_unit(e, i)) < 0) return;
     if (e->in->stage != MX_FRAGMENT) { fail(e, "TMML", "LOD query outside a fragment shader"); return; }
     const char *coords;
     switch (t) {
@@ -569,7 +570,7 @@ static void op_tmml(Mx *e, uint64_t i) {
     case 7: coords = S(e, "vec3(%s, %s, %s)", FR(e, c + 1), FR(e, c + 2), FR(e, c + 3)); break;
     default: fail(e, "TMML", "type %u", t); return;
     }
-    emit(e, "vec2 q = textureQueryLod(%s, %s);", SMP(e, unit, k_tex_base[t], 0), coords);
+    emit(e, "vec2 q = textureQueryLod(%s, %s);", bindless ? SMPB(e, X(e, MXB(i, 20, 8)), k_tex_base[t], 0) : SMP(e, unit, k_tex_base[t], 0), coords);
     for (unsigned k = 0; k < 4; k++) {
         if (!(mask >> k & 1)) continue;
         if (r != 255) emit(e, " %s = %s;", D(e, r), k < 2 ? S(e, "uint(int(q[%u] * 256.0))", k) : "0u");      /* fixed point 8.8 */
@@ -1315,7 +1316,8 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     case MXOP_TLDS: op_tlds(e, i); break;
     case MXOP_TLD4: op_tld4(e, i); break;
     case MXOP_TLD4S: op_tld4s(e, i); break;
-    case MXOP_TMML: op_tmml(e, i); break;
+    case MXOP_TMML: op_tmml(e, i, 0); break;
+    case MXOP_TMML_b: op_tmml(e, i, 1); break;
     case MXOP_TXD: op_txd(e, i); break;
     case MXOP_TXQ: op_txq(e, i); break;
 
