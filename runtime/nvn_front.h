@@ -47,6 +47,7 @@ typedef struct Tex {
     TexObj o;
     VNode *views;
     struct Tex *scratch;                   /* nvn_gl.c feedback guard: a copy sampled while this texture is a render target */
+    struct Tex *crop; uint32_t crop_gen;   /* nvn_gl.c tex_crop: the centred 16:9 part of a widened texture, as of rt_gen crop_gen */
     void *vk;                              /* the Vulkan back end's record of this texture (nvn_vk_draw.c: VTex), NULL until first used */
     uint8_t *packaged_copy;                /* PR #41: owned until the initial upload consumes packaged texels */
     long long ahead_seen;                  /* session 8 (nvn_vk_draw.c tex_ahead): 1 + the frame the render thread first saw this record; -1 = looked at, not taken */

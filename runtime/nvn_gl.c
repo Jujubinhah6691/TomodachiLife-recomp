@@ -22,7 +22,7 @@
  * Debug aids (environment): SSBU_SHOT=<n> / SSBU_SHOT_EVERY=<k> save presented frames as frame_<n>.bmp (in SSBU_SHOT_DIR if set, from frame SSBU_SHOT_FROM on, up to SSBU_SHOT_TO);
  * SSBU_RTDUMP=<n> saves every colour target at frame n (SSBU_RTDUMP_ALPHA=1: also its alpha as _a.bmp); SSBU_DRAWSHOT=<n> the target after each draw
  * (with SSBU_DRAWSHOT_CLEAR, cleared before each); SSBU_DRAWLOG=<n> prints state, uniforms and textures of
- * every draw of frame n and writes the textures as tex_*.rgba; SSBU_SHADERDUMP=<dir> writes shader text,
+ * every draw of frame n (with SSBU_DRAWLOG_TEX=1 also the textures as tex_*.rgba); SSBU_SHADERDUMP=<dir> writes shader text,
  * machine code and generated GLSL; SSBU_NOSCISSOR, SSBU_SKIPDRAW=<i>, SSBU_FRAGDEBUG (magenta fragments),
  * SSBU_GLDEBUG (driver messages, error check after every command); SSBU_NOCOMPUTE skips every compute dispatch (fighters then
  * stay in their bind pose); SSBU_DRAWLOG_MINDISP=<n> makes SSBU_DRAWLOG count frames with at least n dispatches (the draw log
@@ -751,13 +751,14 @@ static int tex_take_spare(Tex *t) {
     }
     return 1;
 }
+static int g_realize_narrow;                          /* tex_crop: the game's shape at the resolution scale, not widened */
 static void tex_realize(Tex *t) {
     static int nlog, nbad;
     Fmt f;
     TexBuilder *b = &t->b;
     t->rw = t->rh = 0;
     if (rs_class(b)) {
-        t->rw = (int)((float)b->width * rs_factor() * wide_k() + 0.5f); t->rh = (int)((float)b->height * rs_factor() + 0.5f);
+        t->rw = (int)((float)b->width * rs_factor() * (g_realize_narrow ? 1.0f : wide_k()) + 0.5f); t->rh = (int)((float)b->height * rs_factor() + 0.5f);
         if (t->rw < 1) t->rw = 1; if (t->rh < 1) t->rh = 1;
     }
     if (tex_take_spare(t)) return;
@@ -1214,6 +1215,10 @@ static int rtlog_match(const Tex *t) {         /* TEST ONLY, TOMO_RTLOG=<w>x<h>[
 static void tex_free_gl(Tex *t) {
     alias_handoff(t);
     if (t->frz_snap) { glDeleteTextures(1, &t->frz_snap); t->frz_snap = 0; }
+    if (t->crop) {
+        for (VNode *n = t->crop->views, *next; n; n = next) { next = n->next; texobj_free(&n->o, 1); free(n); }
+        texobj_free(&t->crop->o, 0); free(t->crop); t->crop = NULL;
+    }
     {   unsigned i = g_freed_n % 16; int nv = 0;
         for (VNode *n = t->views; n; n = n->next) nv++;
         g_freed[i].gl = t->o.gl; g_freed[i].target = t->b.target; g_freed[i].format = t->b.format; g_freed[i].w = t->b.width; g_freed[i].h = t->b.height; g_freed[i].d = t->b.depth;
@@ -3020,9 +3025,57 @@ static void view_copies_refresh(void) {               /* the copies standing for
             t->vc_gen = t->rt_gen + 1;
         }
 }
+/* Widescreen: a draw into a target that is not screen-shaped reads a widened texture (the picture) in the game's own 16:9
+ * coordinates: the layouts capture the picture behind a pane (a 160x1080 strip at each side of the food list, the 480x890
+ * list) and blend it back at the pane's soft edges. Over the whole width those captures took the wrong part of the picture
+ * (bands of the room's far corner over the menu at 21:9, 2026-10-25): such a draw samples the centred 16:9 part instead.
+ * Screen-shaped targets (blur and bloom chains, 480x272 and down) keep the whole width: what they make goes back wide. */
+static Tex *tex_crop(Tex *t) {
+    Fmt f;
+    if (!gl_has(glCopyImageSubData, "glCopyImageSubData") || t->b.target != 1 || t->b.samples > 1 || !t->o.gl) return NULL;
+    if (!fmt_get(t->b.format, &f) || f.kind != 0) return NULL;      /* the picture only: depth is read by 3D passes, in the wide view */
+    if (!t->crop) {
+        Tex *c = calloc(1, sizeof *c);
+        if (!c) return NULL;
+        c->b = t->b;
+        g_realize_narrow = 1; tex_realize(c); g_realize_narrow = 0;
+        c->gpu_written = 1; c->uploaded = 1;
+        t->crop = c; t->crop_gen = t->rt_gen + 1;
+    }
+    Tex *c = t->crop;
+    if (t->crop_gen != t->rt_gen) {
+        for (int l = 0; l < t->glevels && l < c->glevels; l++) {
+            int w = lvl(tw(c), l), h = lvl(th(c), l);
+            glCopyImageSubData(t->o.gl, GL_TEXTURE_2D, l, (lvl(tw(t), l) - w) / 2, 0, 0, c->o.gl, GL_TEXTURE_2D, l, 0, 0, 0, w, h, 1);
+        }
+        t->crop_gen = t->rt_gen; c->rt_gen++;            /* its own view copies (a reinterpreted format) refresh too */
+    }
+    return c;
+}
+static int widened(const Tex *t) { return t->rw && (float)t->rw * (float)t->b.height != (float)t->rh * (float)t->b.width; }
+static void wide_crop_guard(void) {
+    Tex *rt = S.color0;
+    if (wide_k() == 1.0f || !g_wide_camera || !rt || widened(rt) || fabsf((float)rt->b.width * 9.0f / ((float)rt->b.height * 16.0f) - 1.0f) < 0.02f) return;
+    for (int s = 0; s < 5; s++)
+        for (uint32_t m = units_sampled(s), u = 0; m && u < 32; m >>= 1, u++) {
+            Tex *t, *c;
+            View v;
+            SamplerParams p;
+            if (!(m & 1) || !(t = unit_tex(s, u)) || t->dead || !widened(t)) continue;
+            int hs = handle_lookup(S.tpool, S.spool, S.nvn_tex[s][u], &t, &v, &p);
+            if (!t || t->dead || !(c = tex_crop(t))) continue;
+            uint32_t dims[4] = {0, 0, 0, 0};
+            int isint = 0;
+            g_fb_saved[s][u] = S.gl_tex[s][4 + u];
+            S.gl_tex[s][4 + u] = handle_make(c, v, p, hs, S.nvn_tex[s][u], dims, &isint);
+            for (VNode *n = c->views; n; n = n->next) if (n->is_copy && n->copy_gen != c->rt_gen) view_copy_fill(c, n);
+            g_fb_mask[s] |= 1u << u; S.tex_dirty[s] = 1; g_fb_active = 1;
+        }
+}
 static void feedback_guard(void) {
     view_copies_refresh();
     feedback_restore();
+    wide_crop_guard();
     if (!S.have_fbo) return;
     if (!feedback_copy_mode()) {                 /* GL's own rule for a draw that samples its render target: a texture barrier before it */
         static int said;
@@ -3046,7 +3099,7 @@ static void feedback_guard(void) {
             Tex *t;
             View v;
             SamplerParams p;
-            if (!nh) continue;
+            if (!nh || (g_fb_mask[s] >> u & 1)) continue;      /* already swapped (wide_crop_guard) */
             int hs = handle_lookup(S.tpool, S.spool, nh, &t, &v, &p);
             if (!t || t->dead) continue;
             int hit = t == S.depth_tex;
@@ -3836,16 +3889,17 @@ static int draw_prepare(void) {
                             Tex *t = bl_has(w[k]) && S.tpool && tid < (uint32_t)S.tpool->count ? S.tpool->e[tid].tex : NULL;
                             if (t) printf("      handle %x: target %d format 0x%x %dx%dx%d levels %d gl %u uploaded %d rendered %d dead %d view set 0x%x format 0x%x target 0x%x\n", w[k], t->b.target, t->b.format,
                                           t->b.width, t->b.height, t->b.depth, t->b.levels, t->o.gl, t->uploaded, t->gpu_written, t->dead, S.tpool->e[tid].view.set, S.tpool->e[tid].view.format, S.tpool->e[tid].view.target);
-                            if (t && t->o.gl && t->b.target == 1 && t->b.width <= 4096) {
+                            int sw = t && t->rw ? t->rw : t ? t->b.width : 0, sh = t && t->rw ? t->rh : t ? t->b.height : 0;      /* storage size (scaled) */
+                            if (t && t->o.gl && t->b.target == 1 && sw <= 4096) {
                                 char path[64];
-                                uint8_t *px = malloc((size_t)t->b.width * t->b.height * 4);
+                                uint8_t *px = malloc((size_t)sw * sh * 4);
                                 glBindTexture(GL_TEXTURE_2D, t->o.gl);
                                 glPixelStorei(GL_PACK_ALIGNMENT, 1);
                                 glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
                                 while (glGetError()) {}
-                                snprintf(path, sizeof path, "tex_%04x_%dx%d.rgba", tid, t->b.width, t->b.height);
+                                snprintf(path, sizeof path, "tex_%04x_%dx%d.rgba", tid, sw, sh);
                                 FILE *fp = fopen(path, "wb");
-                                if (fp) { fwrite(px, 1, (size_t)t->b.width * t->b.height * 4, fp); fclose(fp); }
+                                if (fp) { fwrite(px, 1, (size_t)sw * sh * 4, fp); fclose(fp); }
                                 free(px);
                             }
                         }
@@ -3919,17 +3973,19 @@ static int draw_prepare(void) {
                         printf("      sampler 0x%x: min %d mag %d wrap %d %d %d lod %g..%g border %g %g %g %g (kind %d) compare %d func %d reduction %d aniso %g\n", sid, sp->min, sp->mag, sp->ws, sp->wt, sp->wr, sp->lodmin, sp->lodmax, sp->border[0], sp->border[1], sp->border[2], sp->border[3], sp->border_kind, sp->cmode, sp->cfunc, sp->reduction, sp->aniso);
                     }
                 }
-                if (tid < sizeof seen && !seen[tid] && t->o.gl && t->b.target == 1 && t->b.samples <= 1 && t->b.width <= 4096) {
+                static int dumptex = -1; if (dumptex < 0) dumptex = getenv("SSBU_DRAWLOG_TEX") != NULL;      /* SSBU_DRAWLOG_TEX=1: each sampled texture as tex_<id>_<w>x<h>.rgba (~1 GB a frame) */
+                int sw = t->rw ? t->rw : t->b.width, sh = t->rw ? t->rh : t->b.height;      /* the storage: wider than the game's size when scaled */
+                if (dumptex && tid < sizeof seen && !seen[tid] && t->o.gl && t->b.target == 1 && t->b.samples <= 1 && sw <= 4096) {
                     char path[64];
-                    uint8_t *px = malloc((size_t)t->b.width * t->b.height * 4);
+                    uint8_t *px = malloc((size_t)sw * sh * 4);
                     seen[tid] = 1;
                     glBindTexture(GL_TEXTURE_2D, t->o.gl);
                     glPixelStorei(GL_PACK_ALIGNMENT, 1);
                     glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
                     while (glGetError()) {}
-                    snprintf(path, sizeof path, "tex_%04x_%dx%d.rgba", tid, t->b.width, t->b.height);
+                    snprintf(path, sizeof path, "tex_%04x_%dx%d.rgba", tid, sw, sh);
                     FILE *fp = fopen(path, "wb");
-                    if (fp) { fwrite(px, 1, (size_t)t->b.width * t->b.height * 4, fp); fclose(fp); }
+                    if (fp) { fwrite(px, 1, (size_t)sw * sh * 4, fp); fclose(fp); }
                     free(px);
                 }
             }
@@ -5091,6 +5147,8 @@ static void exec(const Cmd *m, int depth) {
         memcpy(&dv, blob + 48, sizeof dv); copy_region(blob + 72, dr);
         if (a[6] & 4) { dr[0] += dr[3]; dr[3] = -dr[3]; }      /* NVN_COPY_FLAGS_MIRROR_X / MIRROR_Y */
         if (a[6] & 8) { dr[1] += dr[4]; dr[4] = -dr[4]; }
+        if (drawlog_now()) printf("copy texture: %dx%d gl %u%s region %d,%d %dx%d -> %dx%d gl %u%s region %d,%d %dx%d\n", s->b.width, s->b.height, s->o.gl, s->rw ? " (scaled)" : "", sr[0], sr[1], sr[3], sr[4],
+                                  d->b.width, d->b.height, d->o.gl, d->rw ? " (scaled)" : "", dr[0], dr[1], dr[3], dr[4]);
         { LONG64 pf0 = pf_now(); blit_tex(s, &sv, sr, d, &dv, dr, (int)(a[6] & 1)); pf_add(PF_COPY, pf0); }
         break;
     }
