@@ -566,6 +566,7 @@ private:
         SetEnvironmentVariableA("SSBU_OS_CONSOLE_CORES", "1");
         SetEnvironmentVariableA("SSBU_KEYBOARD_PLAYER", "1");
         SetEnvironmentVariableA("SSBU_SHOW", "1");
+        if (!GetEnvironmentVariableA("SSBU_HITCH", nullptr, 0)) SetEnvironmentVariableA("SSBU_HITCH", "300");      // the play log names what held any frame over 300 ms
         time_t now = time(nullptr);
         tm lt;
         localtime_s(&lt, &now);
@@ -774,7 +775,13 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--shot")) { shot = argv[i + 1]; if (i + 2 < argc) shot_screen = argv[i + 2]; }
     paths_init();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
-    SDL_Window* window = SDL_CreateWindow("Tomodachi Life", 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (shot ? SDL_WINDOW_HIDDEN : 0));
+    int ww = 1600, wh = 900;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0) {      // 70 % of the screen: 1600x900 was small on a 4K one
+        ww = usable.w * 7 / 10; wh = ww * 9 / 16;
+        if (wh > usable.h * 8 / 10) { wh = usable.h * 8 / 10; ww = wh * 16 / 9; }
+    }
+    SDL_Window* window = SDL_CreateWindow("Tomodachi Life", ww, wh, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (shot ? SDL_WINDOW_HIDDEN : 0));
     SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
     if (!renderer) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Tomodachi Life", SDL_GetError(), nullptr); return 1; }
     SDL_SetRenderVSync(renderer, 1);
