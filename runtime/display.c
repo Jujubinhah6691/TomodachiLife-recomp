@@ -325,6 +325,20 @@ static void sizing_keep_aspect(HWND h, WPARAM edge, RECT *r) {
         if (edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT) r->top = r->bottom - ch - fh; else r->bottom = r->top + ch + fh;
     }
 }
+/* The process is per-monitor DPI aware (window_thread): window sizes are real pixels. A windowed size from graphics.ini or
+ * the settings menu means what it meant before (Windows scaled it): times the DPI scale, kept inside the monitor's work area. */
+static void windowed_px(HMONITOR mon, int *cw, int *ch) {
+    HDC dc = GetDC(NULL);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(NULL, dc);
+    if (dpi > 96) { *cw = MulDiv(*cw, dpi, 96); *ch = MulDiv(*ch, dpi, 96); }
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoA(mon, &mi)) return;
+    int ww = (mi.rcWork.right - mi.rcWork.left) * 9 / 10, wh = (mi.rcWork.bottom - mi.rcWork.top) * 9 / 10;
+    if (*cw > ww) { *ch = MulDiv(*ch, ww, *cw); *cw = ww; }
+    if (*ch > wh) { *cw = MulDiv(*cw, wh, *ch); *ch = wh; }
+}
 static int g_full;                                    /* F11 state: 1 = borderless over the monitor */
 static volatile LONG g_topmost;                       /* U1: window = fullscreen (borderless and topmost) */
 static WINDOWPLACEMENT g_windowed;
@@ -345,7 +359,9 @@ static void toggle_fullscreen(HWND h) {
         if (g_have_windowed) SetWindowPlacement(h, &g_windowed);
         else {                                        /* started borderless / fullscreen: the configured client size, centred */
             const GfxOptions *go = gfx_options();
-            RECT r = {0, 0, go->width, (int)(go->width / win_aspect() + 0.5)};
+            int cw = go->width, ch = (int)(go->width / win_aspect() + 0.5);
+            windowed_px(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &cw, &ch);
+            RECT r = {0, 0, cw, ch};
             MONITORINFO mi;
             memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
             GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
@@ -369,6 +385,7 @@ static void window_mode_set(HWND h, int mode) {
 }
 static void window_size_set(HWND h, int cw, int ch) {
     if (g_full) { g_have_windowed = 0; printf("display: window size %dx%d kept for the windowed mode (settings menu)\n", cw, ch); fflush(stdout); return; }
+    windowed_px(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &cw, &ch);
     RECT r = {0, 0, cw, ch}, cur;
     AdjustWindowRectEx(&r, (DWORD)GetWindowLongPtrA(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrA(h, GWL_EXSTYLE));
     GetWindowRect(h, &cur);
@@ -406,6 +423,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 1;
     }
     if (m == WM_SIZING && !g_full) { sizing_keep_aspect(h, w, (RECT *)l); return TRUE; }
+    if (m == 0x02E0 /* WM_DPICHANGED */ && !g_full) {      /* moved to a monitor of another scale: the size Windows proposes */
+        const RECT *r = (const RECT *)l;
+        SetWindowPos(h, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        return 0;
+    }
     if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) { toggle_fullscreen(h); return 0; }      /* bit 30: auto-repeat of a held key */
     if (m == WM_APP + 0x51) { window_mode_set(h, (int)w); return 0; }                                 /* U1: the settings menu (menu.cpp) */
     if (m == WM_APP + 0x52) { window_size_set(h, (int)w, (int)l); return 0; }
@@ -428,6 +450,12 @@ static char g_title[96];
 
 static DWORD WINAPI window_thread(LPVOID arg) {
     (void)arg;
+    {   /* Per-monitor DPI aware before the first window. Unaware, a 4K monitor at 300 % looked 1280x720 to us: the borderless
+         * window got that client size and the 4K picture reached the screen shrunk to 1280x720 and blown up 3x (blocky). */
+        typedef BOOL (WINAPI *SetCtx)(HANDLE);
+        SetCtx set = (SetCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
+        if (!set || !set((HANDLE)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */)) SetProcessDPIAware();
+    }
     WNDCLASSA wc;
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
@@ -457,6 +485,9 @@ static DWORD WINAPI window_thread(LPVOID arg) {
         POINT origin = {0, 0};
         memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
         if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) { cw = mi.rcMonitor.right - mi.rcMonitor.left; ch = mi.rcMonitor.bottom - mi.rcMonitor.top; px = mi.rcMonitor.left; py = mi.rcMonitor.top; }
+    } else {
+        POINT origin = {0, 0};
+        windowed_px(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &cw, &ch);
     }
     RECT r = {0, 0, cw, ch};
     AdjustWindowRect(&r, style, FALSE);
