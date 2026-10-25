@@ -707,8 +707,9 @@ static void adapt_frame(LARGE_INTEGER now) {
     ema = ema ? ema * 0.85 + ms * 0.15 : ms;
     if (g_interval == 1) {
         /* also: presents a refresh late (the render thread or the GPU, which the busy time does not see): 40-50 fps on a
-         * 60 Hz display judders; 6 late ones in a second -> 30 */
-        missed += gap > 25.0; if (++window >= 60) { if (missed >= 6) over = 60; window = missed = 0; }
+         * 60 Hz display judders; 6 late ones in a second -> 30. A stall of 50 ms or more is not counted: 30 fps would not
+         * have hidden it (the island's autosave: 2 s of 60-100 ms frames, then 20 s at 30 for nothing, 2026-10-25). */
+        missed += gap > 25.0 && gap < 50.0; if (++window >= 60) { if (missed >= 6) over = 60; window = missed = 0; }
         over = ema > 15.5 || over >= 60 ? over + 1 : 0;
         if (over >= 60) { window = missed = 0; InterlockedExchange(&g_interval, 2); over = at30 = 0; static int n; if (n++ < 20) printf("display: frame_rate 60: frames take %.1f ms: 30 fps for now%c", ema, 10); }
     } else if (g_interval == 2) {

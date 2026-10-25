@@ -4983,7 +4983,16 @@ static void exec(const Cmd *m, int depth) {
     case OP_DEPTHRANGES:
         for (int i = 0; i < (int)a[1] && (int)a[0] + i < 16; i++) { float v[2]; memcpy(v, blob + i * 8, 8); glDepthRangeIndexed((GLuint)a[0] + (GLuint)i, v[0], v[1]); }
         break;
-    case OP_TARGETS: g_fs_rt++; set_targets((int)a[0], (const TargetRef *)blob, (const TargetRef *)blob + 8); if (S.ms_ext & 8) apply_multisample(); break;
+    case OP_TARGETS: {
+        /* At a render target switch, once 300 draws went by since the last flush: the GPU starts on the frame while we replay
+         * the rest of it. Without, the driver held the frame until the game's flush at its end, so the GPU's time came after
+         * our replay's: 4K at frame_rate = 60 ran at 57 fps (12 ms of GPU after 8 ms of replay), 60.0 with this.
+         * TOMO_RT_FLUSH=<draws>: another spacing, 0 = none. */
+        static int every = -1; static LONG64 last;
+        if (every < 0) every = getenv("TOMO_RT_FLUSH") ? atoi(getenv("TOMO_RT_FLUSH")) : 300;
+        if (every > 0 && g_st.draws - last >= every) { glFlush(); last = g_st.draws; }
+        g_fs_rt++; set_targets((int)a[0], (const TargetRef *)blob, (const TargetRef *)blob + 8); if (S.ms_ext & 8) apply_multisample(); break;
+    }
     case OP_STENCIL_REF: case OP_STENCIL_VMASK: case OP_STENCIL_MASK: {
         int *dst = m->op == OP_STENCIL_REF ? S.sref : m->op == OP_STENCIL_VMASK ? S.svmask : S.swmask;
         if (a[0] & 1) dst[0] = (int)a[1];
