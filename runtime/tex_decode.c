@@ -1071,14 +1071,11 @@ int tex_decode_block_rgba8(int nf, const uint8_t *blk, uint8_t *out, int pitch) 
     return -1;
 }
 
-int tex_decode_rgba8(int nf, const void *src, int w, int h, uint8_t *dst) {
-    const TexFormat *f = tex_format(nf);
-    int bx, by, wb, hb, pitch = w * 4;
+static void decode_rows(int nf, const TexFormat *f, const void *src, int w, int h, uint8_t *dst, int by0, int by1) {
+    int wb = (w + f->bw - 1) / f->bw, pitch = w * 4;
     uint8_t tmp[12 * 12 * 4];
-    if (!f || !f->codec) return -1;
-    wb = (w + f->bw - 1) / f->bw; hb = (h + f->bh - 1) / f->bh;
-    for (by = 0; by < hb; by++)
-        for (bx = 0; bx < wb; bx++) {
+    for (int by = by0; by < by1; by++)
+        for (int bx = 0; bx < wb; bx++) {
             const uint8_t *blk = (const uint8_t *)src + ((size_t)by * wb + bx) * f->bpb;
             int x0 = bx * f->bw, y0 = by * f->bh;
             if (x0 + f->bw <= w && y0 + f->bh <= h) tex_decode_block_rgba8(nf, blk, dst + (size_t)y0 * pitch + x0 * 4, pitch);
@@ -1088,6 +1085,46 @@ int tex_decode_rgba8(int nf, const void *src, int w, int h, uint8_t *dst) {
                 for (y = 0; y < ch; y++) memcpy(dst + (size_t)(y0 + y) * pitch + x0 * 4, tmp + y * f->bw * 4, (size_t)cw * 4);
             }
         }
+}
+#ifdef _WIN32
+#include <windows.h>
+/* A large image is decoded by the system thread pool in bands of 16 block rows: an ASTC 2048x2048 took 100+ ms on the
+ * render thread alone (hitches whenever the island streamed textures in). Each band writes its own rows only. */
+typedef struct { int nf; const TexFormat *f; const void *src; int w, h, hb; uint8_t *dst; volatile LONG next; } Bands;
+static void CALLBACK decode_band(PTP_CALLBACK_INSTANCE inst, void *arg, PTP_WORK work) {
+    Bands *b = arg;
+    (void)inst; (void)work;
+    for (LONG i; (i = InterlockedIncrement(&b->next) - 1) * 16 < b->hb;)
+        decode_rows(b->nf, b->f, b->src, b->w, b->h, b->dst, (int)i * 16, (int)i * 16 + 16 < b->hb ? (int)i * 16 + 16 : b->hb);
+}
+static int decode_parallel(int nf, const TexFormat *f, const void *src, int w, int h, uint8_t *dst, int wb, int hb) {
+    static int off = -1;
+    if (off < 0) off = getenv("TOMO_DECODE_THREADS") && !strcmp(getenv("TOMO_DECODE_THREADS"), "0");
+    if (off || (long long)wb * hb < 8192 || hb < 32) return 0;
+    Bands b = {nf, f, src, w, h, hb, dst, 0};
+    PTP_WORK work = CreateThreadpoolWork(decode_band, &b, NULL);
+    if (!work) return 0;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors - 1, bands = (hb + 15) / 16;
+    if (n > bands - 1) n = bands - 1;
+    if (n > 7) n = 7;
+    for (int i = 0; i < n; i++) SubmitThreadpoolWork(work);
+    decode_band(NULL, &b, work);                   /* this thread takes bands too */
+    WaitForThreadpoolWorkCallbacks(work, FALSE);
+    CloseThreadpoolWork(work);
+    return 1;
+}
+#endif
+int tex_decode_rgba8(int nf, const void *src, int w, int h, uint8_t *dst) {
+    const TexFormat *f = tex_format(nf);
+    int wb, hb;
+    if (!f || !f->codec) return -1;
+    wb = (w + f->bw - 1) / f->bw; hb = (h + f->bh - 1) / f->bh;
+#ifdef _WIN32
+    if (!decode_parallel(nf, f, src, w, h, dst, wb, hb))
+#endif
+        decode_rows(nf, f, src, w, h, dst, 0, hb);
     {   /* TEST ONLY, TOMO_ASTC_DUMP=<dir>: the blocks of the first 400 ASTC images decoded and the result (tools: compare with a reference decoder) */
         static int n;
         const char *dir = f->codec == TEX_CODEC_ASTC ? getenv("TOMO_ASTC_DUMP") : NULL, *only = getenv("TOMO_ASTC_DUMP_FMT");      /* _FMT=<hex>: that format only */
