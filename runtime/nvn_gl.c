@@ -6644,7 +6644,16 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
         Fmt f0;
         const TexFormat *tf0 = tex_format(t->b.format);
         int compressed = (fmt_get(t->b.format, &f0) && f0.kind == 4) || (tf0 && tf0->sw_decode);
-        if (t->b.pool && (nvn_pool_flags_of(t->b.pool) & 1) && !t->b.packaged && !compressed) t->gpu_written = 1;
+        uint64_t pf = t->b.pool ? nvn_pool_flags_of(t->b.pool) : 0;
+        if ((pf & 1) && !t->b.packaged && !compressed) t->gpu_written = 1;
+        /* Not a COMPRESSIBLE pool (render targets live in those) and its memory already holds texels: a texture loaded from a
+         * file (the X menu's fluid mask XMenuIn24^d, the layouts' White8_00^d: R8 in pools 0x21). Measured 2026-10-25 on the
+         * island: all 47 such textures held data, every render target zeros. Marked rendered, they stayed empty. */
+        if (t->gpu_written && !(pf & 0x80) && t->mem && t->limit) {
+            size_t n = t->data_size < 65536 ? t->data_size : 65536;
+            if (t->mem + n > t->limit) n = 0;
+            for (size_t i = 0; i < n; i++) if (t->mem[i]) { t->gpu_written = 0; break; }
+        }
     }
     if (!tex_capture_packaged(t)) {                /* PR #41, changed: no copy = the old behaviour (the game's own storage is read) */
         static int said;
