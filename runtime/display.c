@@ -219,6 +219,13 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
         if (st != 0) { if (++fails == 20) { printf("display: the vblank wait fails (status 0x%lx): display lock off%c", (unsigned long)st, 10); InterlockedExchange(&g_vb_state, -1); return 0; } Sleep(50); prev = 0; continue; }
         fails = 0;
         LONGLONG dt = prev ? now.QuadPart - prev : 0;
+        /* A second return for the same vblank is not a refresh (2026-10-25, the OpenGL swap interval 1: two returns 0.04 -
+         * 0.07 ms apart): counted, it measured a 60 Hz monitor as 120 Hz and each one was a tick (the game ran at 42 fps). */
+        if (prev && dt < (g_vb_period > 0 ? (LONGLONG)(g_vb_period * 0.25) : g_freq.QuadPart / 500)) {
+            static LONG said;
+            if (!InterlockedExchange(&said, 1)) { printf("display: a vblank event %.3f ms after the one before is ignored (and every such one)%c", (double)dt * 1000.0 / (double)g_freq.QuadPart, 10); }
+            continue;
+        }
         prev = now.QuadPart;
         LONG64 steps = 1;
         if (g_vb_state == 1) {                                         /* the first 24 intervals: their median is the refresh period */

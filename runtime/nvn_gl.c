@@ -6456,7 +6456,14 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     printf("nvn_gl: %s | %s | OpenGL %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
     if (missing) { printf("nvn_gl: %d required OpenGL functions are missing; this backend needs an NVIDIA driver\n", missing); fflush(stdout); ExitProcess(5); }
     BOOL (WINAPI *swap_interval)(int) = (void *)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval) swap_interval(0);
+    {   /* 2026-10-25: the flip waits for the vertical blank unless vsync = off. With interval 0 the frame clock's present (half
+         * a refresh after a vblank, display.c) flipped at once: unseen while Windows composed the window, a tear across the
+         * picture once the window covered the monitor at its real size (DPI aware: flipped directly). TOMO_SWAP_INTERVAL wins. */
+        const char *e = getenv("TOMO_SWAP_INTERVAL");
+        int si = e ? atoi(e) : gfx_options()->present == 2 ? 0 : 1;
+        if (swap_interval) swap_interval(si);
+        printf("nvn_gl: swap interval %d (%s)\n", si, e ? "TOMO_SWAP_INTERVAL" : si ? "the flip waits for the vertical blank: no tearing" : "vsync = off: tearing allowed");
+    }
     g_debug = getenv("SSBU_GLDEBUG") != NULL;
     g_dbg_noscissor = getenv("SSBU_NOSCISSOR") != NULL;
     g_dbg_flipface = getenv("SSBU_FLIPFACE") != NULL;
