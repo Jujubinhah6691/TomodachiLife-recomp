@@ -2339,6 +2339,7 @@ static void shd_workers_start(void) {
  * the last complete one is in <cache>/prepared_<exe>.txt; a start with the same key queues nothing. TOMO_SHADER_PREP=0 = off,
  * TOMO_SHADER_STORE=<dir> = another store. Compute stages are left out (their text depends on the images bound). */
 static volatile LONG g_shp_queueing, g_shp_marked;
+static int g_shp_store;                            /* the store is read: its preparation covers every pair (prec_load warms none at start) */
 static uint64_t g_shp_key;
 static char g_shp_mark[320];
 /* The pairs earlier preparations had the driver do its first-draw work for, by this exe name (the driver keeps that work
@@ -2424,6 +2425,7 @@ static void shp_queue(void) {                      /* render thread, start (prec
     snprintf(path, sizeof path, "%s/store.txt", dir);
     char *txt = shp_read(path, &n);
     if (!txt) { printf("nvn_gl: shader preparation: no store at %s (scripts/shader_store.py makes it): shaders are compiled when first needed%c", dir, 10); return; }
+    g_shp_store = 1;
     {   WIN32_FILE_ATTRIBUTE_DATA fa;
         char key[512];
         GetModuleFileNameA(NULL, exe, sizeof exe);
@@ -2731,21 +2733,101 @@ static void prec_note_compute(uint64_t h, size_t len) {
     FILE *f = fopen(path, "a");
     if (f) { fprintf(f, "%016llx %x %016llx %x %x\n", (unsigned long long)h, (unsigned)len, 0ull, 0u, 0x10000u); fclose(f); g_prec_added++; }
 }
-/* Render thread, start: the stage program of a listed pair is loaded from its binary now, not at its first draw. */
-static LONG64 g_pre_n, g_pre_ticks;
-static void prec_preload(int stage, uint64_t h, uint32_t len) {
-    static int off = -1;
-    if (off < 0) { const char *e = getenv("SSBU_PAIR_PRELOAD"); off = (e && !strcmp(e, "0")) || g_shc_off > 0 || getenv("SSBU_NO_SHADERCACHE") != NULL; }
-    if (off || !len) return;
-    for (ShSrc *e = g_shs[h & 4095]; e; e = e->next) if (e->h == h && e->len == len) return;
+/* The stage programs of the listed pairs, loaded from their binaries before their first draw. Until 2026-10-25 the render
+ * thread did that before the game started: 5.5 s of the start, 13 s while the workers warmed pairs, and with the files out
+ * of Windows' cache the reading alone took 26 s (4,645 small files; measured: 0.35 s of reading and 3 s of glProgramBinary
+ * when cached, the driver serializes glProgramBinary across contexts). Now a reader thread reads them in the list's order
+ * (the order they were first drawn) at background I/O priority, and the render thread makes the programs whenever it has
+ * no job, a couple of ms at a time (render_loop -> pre_idle); a stage drawn before its turn is loaded by that draw, as
+ * before. SSBU_PAIR_PRELOAD=0 = none. */
+typedef struct PreBuf { struct PreBuf *next; uint64_t h; uint32_t len, fmt, size; uint8_t data[1]; } PreBuf;
+typedef struct { uint64_t h; uint32_t len; } PreItem;
+static PreItem *g_pre_items;
+static int g_pre_count, g_pre_cap, g_pre_said;
+static PreBuf *g_pre_head, *g_pre_tail;
+static CRITICAL_SECTION g_pre_lock;
+static volatile LONG64 g_pre_bytes;
+static volatile LONG g_pre_reading;
+static LONG64 g_pre_n, g_pre_ticks, g_pre_t0;
+static void pre_add(int stage, uint64_t h, uint32_t len) {      /* render thread, prec_load: each binary once (pairs share stages) */
+    static uint64_t seen[1 << 15];
+    uint64_t k = (h ^ len) | 1;
+    unsigned s = (unsigned)(k >> 20) & ((1u << 15) - 1);
+    (void)stage;
+    if (!len) return;
+    for (int probe = 0; probe < 1024; probe++, s = (s + 1) & ((1u << 15) - 1)) { if (seen[s] == k) return; if (!seen[s]) { seen[s] = k; break; } }
+    if (g_pre_count == g_pre_cap) { g_pre_cap = g_pre_cap ? g_pre_cap * 2 : 8192; g_pre_items = realloc(g_pre_items, (size_t)g_pre_cap * sizeof *g_pre_items); }
+    g_pre_items[g_pre_count].h = h; g_pre_items[g_pre_count++].len = len;
+}
+static DWORD WINAPI pre_reader(LPVOID arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);      /* the game's own loading reads first */
+    for (int i = 0; i < g_pre_count; i++) {
+        char path[320];
+        uint32_t head[2] = {0, 0};
+        PreBuf *b = NULL;
+        while (g_pre_bytes > (64 << 20)) Sleep(2);
+        shd_path(path, sizeof path, g_pre_items[i].h, g_pre_items[i].len);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        if (fread(head, 4, 2, f) == 2 && head[1] > 0 && head[1] < (64u << 20) && (b = malloc(sizeof *b + head[1])) && fread(b->data, 1, head[1], f) == head[1]) {
+            b->next = NULL; b->h = g_pre_items[i].h; b->len = g_pre_items[i].len; b->fmt = head[0]; b->size = head[1];
+            InterlockedAdd64(&g_pre_bytes, head[1]);
+            EnterCriticalSection(&g_pre_lock);
+            if (g_pre_tail) g_pre_tail->next = b; else g_pre_head = b;
+            g_pre_tail = b;
+            LeaveCriticalSection(&g_pre_lock);
+        } else free(b);
+        fclose(f);
+    }
+    InterlockedExchange(&g_pre_reading, 0);
+    return 0;
+}
+static int pre_pending(void) { return g_pre_reading || g_pre_head; }
+static void pre_idle(void) {                       /* render thread, no job queued: programs from the binaries read, ~2 ms */
+    static LONG64 freq;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
     LONG64 t0 = pf_now();
-    GLuint q = pw_load(stage, h, len, NULL);
+    while (pf_now() - t0 < freq / 500 && !g_job_head) {
+        EnterCriticalSection(&g_pre_lock);
+        PreBuf *b = g_pre_head;
+        if (b) { g_pre_head = b->next; if (!g_pre_head) g_pre_tail = NULL; }
+        LeaveCriticalSection(&g_pre_lock);
+        if (!b) break;
+        InterlockedAdd64(&g_pre_bytes, -(LONG64)b->size);
+        int have = 0;
+        for (ShSrc *e = g_shs[b->h & 4095]; e && !have; e = e->next) have = e->h == b->h && e->len == b->len;
+        if (!have) {
+            GLint ok = 0;
+            GLuint q = glCreateProgram();
+            glProgramParameteri(q, 0x8258 /* PROGRAM_SEPARABLE */, 1);
+            glProgramBinary(q, b->fmt, b->data, (GLsizei)b->size);
+            glGetProgramiv(q, 0x8B82, &ok);
+            while (glGetError()) {}
+            if (ok) {
+                ShSrc *e = calloc(1, sizeof *e);
+                e->h = b->h; e->len = b->len; e->prog = q; e->next = g_shs[b->h & 4095]; g_shs[b->h & 4095] = e;
+                if (q < 65536) g_prog_src[q] = e;
+                g_pre_n++; g_shd_loaded++;
+            } else glDeleteProgram(q);
+        }
+        free(b);
+    }
     g_pre_ticks += pf_now() - t0;
-    if (!q) return;
-    ShSrc *e = calloc(1, sizeof *e);
-    e->h = h; e->len = len; e->prog = q; e->next = g_shs[h & 4095]; g_shs[h & 4095] = e;
-    if (q < 65536) g_prog_src[q] = e;
-    g_pre_n++; g_shd_loaded++;
+    if (!pre_pending() && !g_pre_said) {
+        g_pre_said = 1;
+        printf("nvn_gl: %lld stage binaries of the pair list loaded in the render thread's idle time (%.0f ms of it), the last %.1f s after the start%c", (long long)g_pre_n,
+               (double)g_pre_ticks * 1000.0 / (double)freq, (double)(pf_now() - g_pre_t0) / (double)freq, 10);
+    }
+}
+static void pre_start(void) {                      /* render thread, end of prec_load */
+    const char *e = getenv("SSBU_PAIR_PRELOAD");
+    if (!g_pre_count || (e && !strcmp(e, "0")) || g_shc_off > 0 || getenv("SSBU_NO_SHADERCACHE")) return;
+    InitializeCriticalSection(&g_pre_lock);
+    g_pre_t0 = pf_now();
+    InterlockedExchange(&g_pre_reading, 1);
+    HANDLE t = CreateThread(NULL, 0, pre_reader, NULL, 0, NULL);
+    if (t) CloseHandle(t); else InterlockedExchange(&g_pre_reading, 0);
 }
 static void prec_load(void) {                      /* render thread, once (shd_init) */
     char path[260], line[200];
@@ -2759,14 +2841,18 @@ static void prec_load(void) {                      /* render thread, once (shd_i
         unsigned long long vh, fh; unsigned vl, fl, mask;
         if (sscanf(line, "%llx %x %llx %x %x", &vh, &vl, &fh, &fl, &mask) == 5 && !prec_has(vh, vl, fh, fl, mask, 1)) {
             g_prec_loaded++;
-            pw_queue_named(vh, vl, fh, fl, mask);
-            if (!(mask & 0x10000)) { prec_preload(0, vh, vl); prec_preload(1, fh, fl); }
+            /* With the shader store in use its preparation had the driver do every pair's work, which the driver keeps on
+             * disk: warming the listed pairs again at each start (14 s of driver time, the start waited for it) changed
+             * nothing measurable in play (first draws: 2 over 4 ms instead of 1, 17 ms in all; 2026-10-25). */
+            if (!g_shp_store) pw_queue_named(vh, vl, fh, fl, mask);
+            if (!(mask & 0x10000)) { pre_add(0, vh, vl); pre_add(1, fh, fl); }
         }
     }
     fclose(f);
     pw_progs_load();
     { LARGE_INTEGER q; QueryPerformanceFrequency(&q); printf("nvn_gl: %lld programs known by their machine code (progs.txt)%c", (long long)g_pw_progs_known, 10); }
-    { LARGE_INTEGER q; QueryPerformanceFrequency(&q); printf("nvn_gl: %lld listed shader pairs queued for the workers; %lld stage binaries loaded ahead in %.0f ms%c", (long long)g_prec_loaded, (long long)g_pre_n, (double)g_pre_ticks * 1000.0 / (double)q.QuadPart, 10); }
+    printf("nvn_gl: %lld listed shader pairs%s; %d stage binaries to load while the game starts%c", (long long)g_prec_loaded, g_shp_store ? " (not warmed again: the shader store's preparation did that)" : " queued for the workers", g_pre_count, 10);
+    pre_start();
     InterlockedExchange(&g_pw_listed_done, 1);
 }
 static int stage_glsl(Prog *p, int s, const uint32_t *key) {
@@ -6303,7 +6389,11 @@ static void job_write_texels(void *arg) {
 /* The render thread's job loop (both back ends). */
 static void render_loop(void) {
     for (;;) {
-        if (WaitForSingleObject(g_job_event, g_rbp_n ? 1 : INFINITE) == WAIT_TIMEOUT) { if (g_rb->idle) g_rb->idle(); continue; }     /* read-backs pending: look again in 1 ms */
+        if (WaitForSingleObject(g_job_event, g_rbp_n || pre_pending() ? 1 : INFINITE) == WAIT_TIMEOUT) {      /* read-backs or binaries pending: look again in 1 ms */
+            if (g_rb->idle) g_rb->idle();
+            if (pre_pending()) pre_idle();
+            continue;
+        }
         for (;;) {
             EnterCriticalSection(&g_job_lock);
             Job *j = g_job_head;
