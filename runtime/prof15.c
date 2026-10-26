@@ -53,10 +53,11 @@ static int p15_fight_on(void) {
     if (!p15_read(inst, &mgr, 8) || !mgr || !p15_read(mgr, &impl, 8) || !impl || !p15_read(impl + 0xd2, &go, 1)) return 0;
     return go != 0;
 }
+/* CPU cycles of the thread (2026-10-25: GetThreadTimes is the scheduler's tick accounting, which misses threads that run
+ * in bursts shorter than a tick: it showed the busy render thread at 0.2 ms a frame and the picker chose no thread) */
 static ULONGLONG p15_cpu(HANDLE h) {
-    FILETIME c, e, k, u;
-    if (!GetThreadTimes(h, &c, &e, &k, &u)) return 0;
-    return (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime);
+    ULONG64 q = 0;
+    return QueryThreadCycleTime(h, &q) ? q : 0;
 }
 static void p15_modules(void) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
@@ -155,9 +156,19 @@ static void p15_pick_threads(void) {
     CloseHandle(snap);
     Sleep(1000);
     for (int i = 0; i < n; i++) all[i].cpu = p15_cpu(all[i].h) - all[i].cpu;
-    for (int t = 0; t < P15_THREADS; t++) {
+    {   /* SSBU_PROF15_NAMES=<name>[,<name>...]: these guest threads are sampled whatever they did in that second (a thread
+         * that works in bursts, as the Mii voice synthesis, is idle when the busiest are chosen) */
+        const char *want = getenv("SSBU_PROF15_NAMES");
+        for (int i = 0; want && i < n && g_p15_nthr < P15_THREADS; i++) {
+            const char *nm = guest_thread_name_of(all[i].tid);
+            if (!all[i].h || !nm || !nm[0] || !strstr(want, nm)) continue;
+            g_p15_thr[g_p15_nthr].tid = all[i].tid; g_p15_thr[g_p15_nthr].h = all[i].h; g_p15_nthr++;
+            all[i].h = NULL;
+        }
+    }
+    for (int t = g_p15_nthr; t < P15_THREADS; t++) {
         int best = -1;
-        for (int i = 0; i < n; i++) if (all[i].h && all[i].cpu > 20000 && (best < 0 || all[i].cpu > all[best].cpu)) best = i;   /* over 2 ms in the second */
+        for (int i = 0; i < n; i++) if (all[i].h && all[i].cpu > 20000000 && (best < 0 || all[i].cpu > all[best].cpu)) best = i;   /* over 20 million cycles in the second */
         if (best < 0) break;
         g_p15_thr[g_p15_nthr].tid = all[best].tid; g_p15_thr[g_p15_nthr].h = all[best].h; g_p15_nthr++;
         all[best].h = NULL;
@@ -200,8 +211,8 @@ static DWORD WINAPI p15_thread(LPVOID arg) {
     fprintf(fo, "[p15] window %.2f s, %u rounds, %d threads, fight flag at the end: %d, frames %lld\n", secs, rounds, g_p15_nthr, p15_fight_on(), (long long)(g_prof15_frame - frame0));
     for (int i = 0; i < g_p15_nthr; i++) {
         const char *name = guest_thread_name_of(g_p15_thr[i].tid);
-        fprintf(fo, "[p15] T %d tid %lu cpu_ms %.1f samples %u name %s\n", i, (unsigned long)g_p15_thr[i].tid,
-                (double)(g_p15_thr[i].cpu1 - g_p15_thr[i].cpu0) / 10000.0, g_p15_thr[i].samples, name ? name : "host");
+        fprintf(fo, "[p15] T %d tid %lu cpu_mcycles %.1f samples %u name %s\n", i, (unsigned long)g_p15_thr[i].tid,
+                (double)(g_p15_thr[i].cpu1 - g_p15_thr[i].cpu0) / 1e6, g_p15_thr[i].samples, name ? name : "host");
     }
     for (int j = 0; j < P15_TAB; j++) {
         P15Fn *e = &g_p15_fn[j];
@@ -225,9 +236,56 @@ static DWORD WINAPI p15_thread(LPVOID arg) {
     fflush(stdout);
     return 0;
 }
+/* SSBU_BURSTS=<guest thread name> (test only): the thread's work in bursts, from its CPU cycles read every millisecond: a
+ * burst ends after 5 ms without cycles. Each burst over 5 ms: its wall time and cycles ("burst:" lines), a summary at the
+ * end of every 60 s. Made to time the Mii voice synthesis, which the main thread waits for. */
+static DWORD WINAPI burst_thread(LPVOID arg) {
+    const char *want = arg;
+    HANDLE h = NULL;
+    while (!h) {
+        Sleep(500);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        for (BOOL ok = Thread32First(snap, &te); ok && !h; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            const char *nm = guest_thread_name_of(te.th32ThreadID);
+            if (nm && !strcmp(nm, want)) h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        }
+        CloseHandle(snap);
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    LARGE_INTEGER f, t, start, last_busy;
+    QueryPerformanceFrequency(&f);
+    ULONG64 prev = 0, b0 = 0;
+    int in = 0, n = 0;
+    double sum_ms = 0, max_ms = 0, sum_mc = 0;
+    QueryPerformanceCounter(&t); LONGLONG period_end = t.QuadPart + 60 * f.QuadPart;
+    QueryThreadCycleTime(h, &prev);
+    for (;;) {
+        Sleep(1);
+        ULONG64 q = 0;
+        QueryThreadCycleTime(h, &q);
+        QueryPerformanceCounter(&t);
+        if (q - prev > 100000) { if (!in) { in = 1; start = t; b0 = prev; } last_busy = t; }
+        else if (in && t.QuadPart - last_busy.QuadPart > f.QuadPart / 200) {
+            double ms = (double)(last_busy.QuadPart - start.QuadPart) * 1000.0 / (double)f.QuadPart, mc = (double)(prev - b0) / 1e6;
+            in = 0;
+            if (ms > 5) { n++; sum_ms += ms; sum_mc += mc; if (ms > max_ms) max_ms = ms; printf("burst: %s %.1f ms, %.1f Mcycles\n", want, ms, mc); fflush(stdout); }
+        }
+        prev = q;
+        if (t.QuadPart > period_end) {
+            if (n) printf("burst: %s summary: %d bursts over 5 ms, average %.1f ms (%.1f Mcycles), longest %.1f ms\n", want, n, sum_ms / n, sum_mc / n, max_ms);
+            fflush(stdout);
+            n = 0; sum_ms = max_ms = sum_mc = 0; period_end = t.QuadPart + 60 * f.QuadPart;
+        }
+    }
+    return 0;
+}
 void prof15_start(void) {
-    const char *spec = getenv("SSBU_PROF15");
+    const char *spec = getenv("SSBU_PROF15"), *bursts = getenv("SSBU_BURSTS");
     if (spec && *spec) CloseHandle(CreateThread(NULL, 0, p15_thread, (LPVOID)spec, 0, NULL));
+    if (bursts && *bursts) CloseHandle(CreateThread(NULL, 0, burst_thread, (LPVOID)bursts, 0, NULL));
 }
 
 #endif
