@@ -102,7 +102,8 @@ static void ngc_check_words(Ctx *c) {
 
 /* ---- nn::swkbd::InlineKeyboard. The console draws its keyboard into an image the game shows and reports through
  * callbacks; here the text comes from the host's text prompt (nnapplet.c swkbd_prompt: a dialog, or SSBU_SWKBD=text:<..>)
- * and the image stays empty (transparent). Order the game relies on [0x710209b8d4, 0x710209b9f0]: Initialize, then the
+ * or, by default, from our own keyboard (osk.c) drawn into the image the game shows, the text handed over as it is typed
+ * (ik_ours_calc). Order the game relies on [0x710209b8d4, 0x710209b9f0]: Initialize, then the
  * callbacks are set; Calc runs only once the game wants the keyboard (+0x4b1) and FinishedInitialize (which sets +0x4b0
  * and calls Appear) must come from a Calc. Then ChangedString carries the text (UTF-16 at +0, two ints at +0x3f0 / +0x3f4
  * [0x710209dd6c]) and DecidedEnter / DecidedCancel close the keyboard (their argument is not read [0x710209bd18]).
@@ -119,7 +120,37 @@ static struct {
     HANDLE thread;
     wchar_t initial[512], text[512];
     int image_sent;
+    int ours, sent_len, sent_cur, dirty, decided_at;      /* our keyboard (osk.c) in the game's image, the text sent live */
 } g_ik;
+/* osk.c: the keyboard drawn into the game's keyboard image, the text handed over as it is typed */
+int osk_inline_open(const wchar_t *initial, int max_len);
+int osk_inline_step(wchar_t *text, int cap, int *len, int *cursor);
+void osk_inline_close(void);
+int osk_inline_image(uint8_t *dst, int w, int h, int pitch);
+int osk_key(UINT msg, WPARAM w);
+/* Ours unless a test answers the keyboard (SSBU_SWKBD, or a scripted run: nnapplet.c kbd_mode) or TOMO_IK=dialog asks for
+ * the desktop prompt. TOMO_IK_TEST=<text>: ours in a scripted run too, the text typed into it, then OK (test only). */
+static int ik_use_ours(void) {
+    const char *t = getenv("TOMO_IK");
+    if (getenv("TOMO_IK_TEST")) return 1;
+    if (t && !strcmp(t, "dialog")) return 0;
+    return !getenv("SSBU_SWKBD") && !getenv("SSBU_SEQ") && !getenv("SSBU_PRESS") && !getenv("SSBU_SCRIPT");
+}
+void nvn_front_shot_step(int step);                       /* nvn_gl.c: the next frame as step_<n>.bmp (SSBU_SHOT_STEPS) */
+static DWORD WINAPI ik_test_typist(void *p) {
+    const char *s = p;
+    int i = 0;
+    Sleep(1500);
+    nvn_front_shot_step(900);                             /* the keyboard just open */
+    for (; *s; s++, i++) { osk_key(WM_CHAR, (WPARAM)(unsigned char)*s); Sleep(150); if (i == 2) nvn_front_shot_step(901); }
+    Sleep(400);
+    nvn_front_shot_step(902);                             /* all typed */
+    Sleep(400);
+    osk_key(WM_CHAR, 13);
+    Sleep(1500);
+    nvn_front_shot_step(903);                             /* after OK */
+    return 0;
+}
 static uint8_t g_ik_arg[0x400] __attribute__((aligned(16)));
 static void ik_call(Ctx *c, uint64_t fn, uint64_t arg) {
     if (!fn) return;
@@ -142,7 +173,7 @@ static void swkbd_work_size(Ctx *c) { RET(0x1000); }
 static void swkbd_image_req(Ctx *c) { wr64(A1, (uint64_t)IK_W * IK_H * 4); wr64(A2, 0x1000); }
 static void swkbd_window_size(Ctx *c) { wr32(A1, IK_W); wr32(A2, IK_H); }
 static void ik_initialize(Ctx *c) { g_ik.initialized = 1; g_ik.init_reported = 0; RET(1); }
-static void ik_finalize(Ctx *c) { (void)c; g_ik.initialized = 0; g_ik.shown = 0; }
+static void ik_finalize(Ctx *c) { (void)c; if (g_ik.ours) osk_inline_close(); g_ik.initialized = 0; g_ik.shown = 0; }
 static void ik_set_init_cb(Ctx *c) { g_ik.cb_init = A1; }
 static void ik_set_finished_cb(Ctx *c) { g_ik.cb_finished = A1; }
 static void ik_set_changed_cb(Ctx *c) { g_ik.cb_changed = A1; }
@@ -171,14 +202,47 @@ static void ik_appear(Ctx *c) {                           /* AppearArg: +0x1c th
     if (getenv("TOMO_IKLOG") && !g_ik_snap_owner) { g_ik_snap_owner = c->x[19]; memcpy(g_ik_snap, (void *)(uintptr_t)c->x[19], sizeof g_ik_snap); }
     g_ik.shown = 1; g_ik.shown_frames = 0; g_ik.text_sent = 0;
     InterlockedExchange(&g_ik.answer, 0);
-    g_ik.thread = CreateThread(NULL, 0, ik_prompt_thread, NULL, 0, NULL);
-    printf("nn::swkbd: inline keyboard shown (at most %d characters, initial text \"%ls\")\n", g_ik.max_len, g_ik.initial);
+    g_ik.ours = ik_use_ours();
+    if (g_ik.ours) {
+        osk_inline_open(g_ik.initial, g_ik.max_len);
+        g_ik.image_sent = 0; g_ik.sent_len = -1; g_ik.sent_cur = -1; g_ik.dirty = 1; g_ik.decided_at = 0;
+        if (getenv("TOMO_IK_TEST")) CloseHandle(CreateThread(NULL, 0, ik_test_typist, (void *)getenv("TOMO_IK_TEST"), 0, NULL));
+    } else g_ik.thread = CreateThread(NULL, 0, ik_prompt_thread, NULL, 0, NULL);
+    printf("nn::swkbd: inline keyboard shown (at most %d characters, initial text \"%ls\", %s)\n", g_ik.max_len, g_ik.initial, g_ik.ours ? "our keyboard in the game's image" : "text prompt");
 }
 static void ik_disappear(Ctx *c) {
     (void)c;
     if (g_ik.shown) { printf("nn::swkbd: inline keyboard: Disappear\n"); g_ik.closed_frames = 30; }
+    if (g_ik.ours) osk_inline_close();
     g_ik.shown = 0;
     InterlockedExchange(&g_ik.answer, 0);
+}
+/* ours, once a Calc: the text to the game whenever it changed (ChangedString: UTF-16 at +0, then length and cursor at
+ * +0x3f0..+0x3fc), OK / cancel decided 10 frames after the last text (as the prompt's answer was) */
+static void ik_text_send(Ctx *c, const wchar_t *text, int n, int cur) {
+    uint64_t arg = (uint64_t)(uintptr_t)g_ik_arg;
+    memset(g_ik_arg, 0, sizeof g_ik_arg);
+    for (int i = 0; i < n && i < 0x1f7; i++) wr16(arg + (uint64_t)i * 2, (uint16_t)text[i]);
+    wr32(arg + 0x3f0, (uint32_t)n);
+    for (int k = 1; k < 4; k++) wr32(arg + 0x3f0 + (uint64_t)k * 4, (uint32_t)cur);
+    ik_call(c, g_ik.cb_changed, arg);
+    g_ik.sent_len = n; g_ik.sent_cur = cur; g_ik.text_sent = g_ik.shown_frames;
+}
+static void ik_ours_calc(Ctx *c) {
+    wchar_t text[512];
+    int n = 0, cur = 0, r = osk_inline_step(text, 512, &n, &cur);
+    if (r == 1) g_ik.dirty = 1;
+    if (r >= 2 && !g_ik.decided_at) { g_ik.decided_at = r; g_ik.dirty = 1; wcsncpy(g_ik.text, text, 511); g_ik.text[511] = 0; }
+    if (g_ik.shown_frames < 10) return;                    /* the game makes its text box first */
+    if (g_ik.dirty) { g_ik.dirty = 0; if (n != g_ik.sent_len || cur != g_ik.sent_cur || g_ik.decided_at) ik_text_send(c, text, n, cur); }
+    if (g_ik.decided_at && g_ik.shown_frames >= g_ik.text_sent + 10) {
+        int ok = g_ik.decided_at == 2;
+        osk_inline_close();
+        g_ik.shown = 0; g_ik.closed_frames = 30; g_ik.decided_at = 0;
+        g_ik_decided_at = GetTickCount64();
+        printf("nn::swkbd: inline keyboard: %s \"%ls\"\n", ok ? "decided" : "cancelled", ok ? g_ik.text : L"");
+        if (ok) ik_call(c, g_ik.cb_enter, (uint64_t)(uintptr_t)g_ik_arg); else ik_call(c, g_ik.cb_cancel, 0);
+    }
 }
 /* TOMO_IKLOG=1 (diagnosis): the game's keyboard owner (x19 at Calc [0x7100359e8c]) printed when it changes, from Calc and
  * from a watcher thread once a second (Calc stops being called when the keyboard layer hides) */
@@ -228,8 +292,9 @@ static void ik_calc(Ctx *c) {
     if (!g_ik.init_reported) { g_ik.init_reported = 1; ik_call(c, g_ik.cb_init, 0); }
     LONG a = g_ik.answer;
     if (g_ik.shown) g_ik.shown_frames++;
+    if (g_ik.shown && g_ik.ours) ik_ours_calc(c);
     /* the text some frames after Appear (the game makes its text box then), the decision some frames after the text */
-    if (g_ik.shown && a == 1 && !g_ik.text_sent && g_ik.shown_frames >= 10) {
+    if (g_ik.shown && !g_ik.ours && a == 1 && !g_ik.text_sent && g_ik.shown_frames >= 10) {
         uint64_t arg = (uint64_t)(uintptr_t)g_ik_arg;
         int n = 0;
         memset(g_ik_arg, 0, sizeof g_ik_arg);
@@ -239,7 +304,7 @@ static void ik_calc(Ctx *c) {
         ik_call(c, g_ik.cb_changed, arg);
         g_ik.text_sent = g_ik.shown_frames;
     }
-    if (g_ik.shown && (a == 2 || (a == 1 && g_ik.text_sent && g_ik.shown_frames >= g_ik.text_sent + 10))) {
+    if (g_ik.shown && !g_ik.ours && (a == 2 || (a == 1 && g_ik.text_sent && g_ik.shown_frames >= g_ik.text_sent + 10))) {
         InterlockedExchange(&g_ik.answer, 0);
         if (g_ik.thread) { CloseHandle(g_ik.thread); g_ik.thread = NULL; }
         /* decided: the keyboard closes in this same Calc (state 1). The game's closing step [0x7102099a80] waits for a 1 and
@@ -256,6 +321,14 @@ static void ik_calc(Ctx *c) {
     RET(0);
 }
 static void ik_get_image(Ctx *c) {                        /* (void *image, size_t size): transparent, sent once */
+    /* our keyboard: redrawn into the buffer when it changed; the answer is 1 on every call while it is up. The game reads 1
+     * as "the keyboard is visible": it writes the buffer into its texture (nvnTextureWriteTexels, linear RGBA) and shows the
+     * pane; a 0 hides the pane [0x7100359eb0]. */
+    if (g_ik.ours && g_ik.shown && A1 && A2 >= (uint64_t)IK_W * IK_H * 4) {
+        osk_inline_image((uint8_t *)(uintptr_t)A1, IK_W, IK_H, IK_W * 4);
+        RET(1);
+        return;
+    }
     if (g_ik.image_sent || !A1) { RET(0); return; }
     memset((void *)(uintptr_t)A1, 0, (size_t)A2);
     g_ik.image_sent = 1;

@@ -562,6 +562,8 @@ static int player_connected(uint32_t id) {
 }
 
 int menu_input_blocked(void);                                 /* U1 (menu.cpp) */
+int osk_blocks_input(void);                                   /* osk.c: a keyboard of ours is up (or just closed) */
+static int input_held(void) { return menu_input_blocked() || osk_blocks_input(); }
 /* U1 TEST ONLY (menu.cpp, SSBU_MENU_TEST): a key of the PC keyboard taken as held for the keyboard's player through its
  * configured binding, whatever the focus or the input sequence (the real keyboard is off in scripted runs); what the game
  * then reads for that player is recorded. 0 = off: nothing changes. */
@@ -574,7 +576,7 @@ static int key_for(uint32_t id, int vk, int kbidx) {         /* vk = the fixed k
     int down = 0;
     if (id == 0) down = scripted(vk) || script_key(vk) || seq_key(vk);
     /* U1 (menu.cpp): while the settings menu is open the real keyboard is its own */
-    if (!down && (int)id == g_keyboard_player && !menu_input_blocked()) {
+    if (!down && (int)id == g_keyboard_player && !input_held()) {
         int real = sdl_on() ? nnpad_kb_vk(kbidx) : vk;
         down = real && keyboard_ours() && (GetAsyncKeyState(real) & 0x8000) != 0;
         if (!down && g_test_vk && real == g_test_vk) down = 1;      /* U1 test only (nnhid_test_key) */
@@ -631,14 +633,14 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
         NnPadState ps;
         if (nnpad_get((int)id, &ps)) {
             wired = ps.wired;
-            if (devices_live() && !menu_input_blocked()) {      /* U1: not while the settings menu is open (menu.cpp) */
+            if (devices_live() && !input_held()) {      /* U1: not while the settings menu is open (menu.cpp) */
                 buttons |= ps.buttons;
                 if (ps.lx || ps.ly) { lx = ps.lx; ly = ps.ly; }
                 if (ps.rx || ps.ry || !rx) { rx = ps.rx; ry = ps.ry; }
                 if (kind == 2 && ps.gc) { trig_l = (unsigned)ps.trig_l; trig_r = (unsigned)ps.trig_r; }
             }
         }
-    } else if (x_present(slot) && devices_live() && !menu_input_blocked()) {
+    } else if (x_present(slot) && devices_live() && !input_held()) {
         const XGamepad *g = &g_x[slot].st.pad;
         static const struct { WORD x; int pos, label; } xmap[] = {
             {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},

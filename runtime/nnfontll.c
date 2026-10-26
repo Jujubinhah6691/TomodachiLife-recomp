@@ -1327,6 +1327,27 @@ static const ImportDef fontll_imports[] = {
     {"_ZN2nn6fontll24ScalableFontEngineHelper6DecodeEPKvj", fe_Decode},
 };
 
+/* osk.c, the inline keyboard: a font the game loaded whose name starts with `prefix` (its own typeface, Rodin NTLG), made
+ * usable by GDI; its family name and weight. 0 when the game has not loaded such a font. */
+int nnfontll_gdi_face(const char *prefix, WCHAR *face, int *weight) {
+    int ok = 0;
+#ifdef _WIN32
+    size_t n = strlen(prefix);
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < g_fontdata_count && !ok; i++) {
+        FontData *f = &g_fontdata[i];
+        if (strncmp(f->name, prefix, n) || !gdi_prepare(f)) continue;
+        lstrcpynW(face, f->face, LF_FACESIZE);
+        *weight = f->os2 ? (int)be16(f->os2 + 4) : FW_BOLD;
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_lock);
+#else
+    (void)prefix; (void)face; (void)weight;
+#endif
+    return ok;
+}
+
 void register_fontll_imports(void) {
     InitializeCriticalSection(&g_lock);
 #ifdef _WIN32
