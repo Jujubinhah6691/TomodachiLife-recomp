@@ -548,8 +548,15 @@ static void install_lifted(void) {
     int n = (int)(sizeof sdk_install_names / sizeof sdk_install_names[0]), ok = 0, skipped = 0;
     const char *off = getenv("SSBU_LIFT_INSTALL"), *skip = getenv("SSBU_LIFT_SKIP");
     if (!sdk_image_ready() || (off && atoi(off) == 0)) return;
+    /* 2026-10-25: these stay the host's own (vectorized) functions. Their results are fully defined, and as lifted ARM code
+     * memcpy was the cost of the game's texture streaming ("Texture Upsize Thread: memcpy" in 260 of 8,700 frames, 2.9 s of
+     * frames over 100 ms while the camera moved over the island). SSBU_LIFT_ALL=1 lifts them as before. */
+    static const char *const keep_host[] = {"memcpy", "memmove", "memset", "memcmp"};
+    const char *all = getenv("SSBU_LIFT_ALL");
     for (int i = 0; i < n; i++) {
         int skip_this = 0;
+        if (!(all && atoi(all)))
+            for (size_t h = 0; h < sizeof keep_host / sizeof keep_host[0]; h++) if (!strcmp(sdk_install_names[i], keep_host[h])) skip_this = 1;
         if (skip && skip[0]) {
             char buf[1024];
             snprintf(buf, sizeof buf, "%s", skip);
