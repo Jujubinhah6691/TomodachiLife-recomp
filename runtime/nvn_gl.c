@@ -1135,6 +1135,39 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
     if (queued) WakeAllConditionVariable(&g_dec_cv);
 }
 
+/* ---- the same texels again: the game's texture streaming makes textures anew every few frames, the same blocks at another
+ * place. A software-decoded texture whose blocks (full hash) and shape equal an earlier one's is copied from that one's GL
+ * texture on the GPU instead of being decoded again (nothing to wait for, nothing blank). TOMO_TWIN=1 on. */
+#define TWIN_SLOTS 4096
+static struct { uint64_t key, h; Tex *t; } g_twin[TWIN_SLOTS];
+static LONG64 g_twin_hits;
+static uint64_t twin_key(Tex *t, uint64_t h, int full) {      /* 0: not a candidate */
+    static int on = -1;
+    if (on < 0) on = getenv("TOMO_TWIN") && strcmp(getenv("TOMO_TWIN"), "0");      /* off until tested on the island */
+    const TexFormat *tf = tex_format(t->b.format);
+    if (!on || !tf || !tf->sw_decode || (t->b.flags & 0x10) || t->rw) return 0;
+    uint64_t k = full ? h : mem_hash(tex_source(t), t->data_size, 1);
+    return k ? k : 1;
+}
+static GLuint twin_copy(Tex *t, uint64_t key) {   /* the GL texture copied from, 0 = none */
+    unsigned i = (unsigned)key & (TWIN_SLOTS - 1);
+    Tex *c = g_twin[i].t;
+    if (!key || !c || c == t || g_twin[i].key != key || c->hash != g_twin[i].h || !c->o.gl || c->gpu_written || c->rw || c->b.format != t->b.format
+        || c->b.width != t->b.width || c->b.height != t->b.height || c->b.depth != t->b.depth || c->b.target != t->b.target || c->glevels != t->glevels
+        || !gl_has(glCopyImageSubData, "glCopyImageSubData")) return 0;
+    if (c->dec_pending) dec_finish(c);
+    TexLayout L;
+    GLenum tg = gl_target(t->b.target, t->b.samples);
+    tex_lay(&t->b, &L);
+    while (glGetError()) {}
+    for (int l = 0; l < t->glevels && l < L.levels; l++)
+        glCopyImageSubData(c->o.gl, tg, l, 0, 0, 0, t->o.gl, tg, l, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], tg == GL_TEXTURE_3D_ ? L.lvl_d[l] : L.layers);
+    if (glGetError()) return 0;
+    t->dec_gen++;                                  /* (levels of older texels still with the decoder are dropped) */
+    g_twin_hits++;
+    return c->o.gl;
+}
+
 /* Make the GL texture exist and hold what the guest memory holds. async: only sampled next (its decoded levels may land a
  * frame or two late, dec_*); otherwise the levels still with the decoder are waited for. */
 static void tex_sync_a(Tex *t, int async) {
@@ -1157,7 +1190,8 @@ static void tex_sync_a(Tex *t, int async) {
         t->ww_seen = newest;
         g_ww_dirty++;
     } else g_ww_unwatched++;
-    uint64_t h = mem_hash(src, t->data_size, newest != 0 || (t->b.flags & 0x10) != 0);
+    int full = newest != 0 || (t->b.flags & 0x10) != 0;
+    uint64_t h = mem_hash(src, t->data_size, full);
     int same = t->uploaded && !t->dirty && h == t->hash && (!newest || t->ww_hashed);
     t->ww_hashed = newest != 0;                    /* t->hash is the hash of every word (needed to compare the next time) */
     pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (LONG64)t->data_size;
@@ -1165,19 +1199,23 @@ static void tex_sync_a(Tex *t, int async) {
     if (same) return;
     while (glGetError()) {}
     pf0 = pf_now();
+    uint64_t key;
+    GLuint twin;
     { static int lf = -2; if (lf == -2) lf = getenv("TOMO_UPLOADLOG") ? atoi(getenv("TOMO_UPLOADLOG")) : -1;
       static int ln = -2; if (ln == -2) ln = getenv("TOMO_UPLOADLOG_N") ? atoi(getenv("TOMO_UPLOADLOG_N")) : 2;
       static LONG64 qpf; if (!qpf) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); qpf = q.QuadPart; }
       int log_it = lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln, again = t->uploaded, dirty = t->dirty;
-      { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f, async); HS_OUT(); }
-      if (log_it) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s, %.1f ms\n", (long long)g_st.frames,
+      key = twin_key(t, h, full);
+      if (!(twin = twin_copy(t, key))) { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f, async); HS_OUT(); }
+      if (log_it) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s, %.1f ms%s\n", (long long)g_st.frames,
           t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, again ? " (again)" : " (first)", dirty ? " dirty" : "",
-          (double)(pf_now() - pf0) * 1000.0 / (double)qpf); }
+          (double)(pf_now() - pf0) * 1000.0 / (double)qpf, twin ? " (copied from an earlier texture)" : ""); }
     pf_add(PF_TEXUP, pf0);
     GLenum e = glGetError();
     static int nlog;
     if (e) logf_limited(&nlog, 20, "nvn_gl: upload of texture %dx%d format 0x%x target %d failed with GL error 0x%x\n", t->b.width, t->b.height, t->b.format, t->b.target, e);
     t->hash = h; t->uploaded = 1; t->dirty = 0; t->upframe = g_st.frames;
+    if (key && !e) { unsigned i = (unsigned)key & (TWIN_SLOTS - 1); g_twin[i].key = key; g_twin[i].h = h; g_twin[i].t = t; }
     tex_release_packaged(t);
     g_st.tex_uploads++;
 }
