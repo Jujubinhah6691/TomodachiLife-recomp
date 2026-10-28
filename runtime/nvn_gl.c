@@ -912,6 +912,13 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
 static uint64_t g_wwr_base[64], g_wwr_size[64], g_wwl_base[64], g_wwl_size[64];
 static int g_wwr_n, g_wwl_n;
 static SRWLOCK g_wwl_lock = SRWLOCK_INIT;
+int nvn_ww_regions(uint64_t *base, uint64_t *size, int max) {      /* tomo.c TOMO_MEMSCAN: the game's heap */
+    AcquireSRWLockShared(&g_wwl_lock);
+    int n = g_wwl_n < max ? g_wwl_n : max;
+    for (int i = 0; i < n; i++) { base[i] = g_wwl_base[i]; size[i] = g_wwl_size[i]; }
+    ReleaseSRWLockShared(&g_wwl_lock);
+    return n;
+}
 void nvn_ww_region(uint64_t base, uint64_t size, int add) {      /* nnsdk.c: memory reserved with MEM_WRITE_WATCH, made or released */
     AcquireSRWLockExclusive(&g_wwl_lock);
     int i = 0;

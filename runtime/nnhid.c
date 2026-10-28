@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -235,6 +236,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         g_seq_left = g_seq[g_seq_index].hold;
         printf("input sequence: poll %lld step %d keys %s for %d (%ld draws)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, g_seq[g_seq_index].hold, g_frame_draws_seen);
         { void nvn_front_shot_step(int step); nvn_front_shot_step(g_seq_index); }      /* track V: SSBU_SHOT_STEPS=1 saves the frame of every key step (renderer comparison) */
+        { void tomo_memscan_step(int step); tomo_memscan_step(g_seq_index); }         /* tomo.c, TEST ONLY: TOMO_MEMSCAN */
         return;
     }
     seq_begin(g_seq_index + 1);                           /* the hold just ended */
@@ -599,6 +601,59 @@ static void fight_shot_poll(int ticks) {
 }
 /* kind: 0 = a style the controller is not reported in (zeroed), 1 = NpadFullKeyState (Pro Controller, 0x28 bytes), 2 = NpadGcState (0x30 bytes:
  * the same first 0x24 bytes, then analog trigger L at +0x24 and R at +0x28, 0..0x7fff; the layout follows libnx / suyu, NOT VERIFIED on a console). */
+/* The mouse steers the game's hand pointer (tomo.c pointer_hook) from the moment it moves over the picture until a stick
+ * moves again; meanwhile its left button is A (hold to grab and drag) and its right button B, on player 1, who holds the
+ * pointer. The wheel: ZL / ZR (pages, tabs) while the free hand is up; elsewhere (dialogs, where the hand jumps between
+ * buttons and a click presses the one it is on) a flick of the stick left / right, one button per notch.
+ * TEST ONLY, TOMO_MOUSE_TEST="<poll>:<x>,<y>[,L|R|U|D] ...": a mouse of the input sequence's polls (game screen coordinates;
+ * a button is held 8 polls, U / D = a wheel notch away from / towards the user), the real one ignored. */
+int display_mouse(float *x, float *y, int *buttons); int display_mouse_wheel(void);     /* display.c */
+static volatile LONG g_mouse_on, g_pointer_tick;
+static float g_mouse_xy[2];
+int nnhid_mouse(float xy[2]) { if (!g_mouse_on) return 0; xy[0] = g_mouse_xy[0]; xy[1] = g_mouse_xy[1]; return 1; }
+void nnhid_pointer_free(void) { InterlockedExchange(&g_pointer_tick, (LONG)GetTickCount()); }     /* tomo.c: the free hand is up this frame */
+static int mouse_test(float *x, float *y, int *b, int *wheel) {
+    static const char *spec = (const char *)-1;
+    if (spec == (const char *)-1) spec = getenv("TOMO_MOUSE_TEST");
+    if (!spec) return -1;
+    int in = 0;
+    *b = 0; *wheel = 0;
+    for (const char *p = spec; p && *p; p = strchr(p, ' '), p = p ? p + 1 : NULL) {
+        long long at = 0; float tx, ty; char k = 0;
+        int n = sscanf(p, "%lld:%f,%f,%c", &at, &tx, &ty, &k);
+        if (n < 3 || at > g_seq_polls) break;
+        *x = tx; *y = ty; in = 1;
+        *b = n == 4 && g_seq_polls < at + 8 ? (k == 'L' ? 1 : k == 'R' ? 2 : 0) : 0;
+        *wheel = n == 4 && g_seq_polls == at ? (k == 'U' ? 1 : k == 'D' ? -1 : 0) : 0;
+    }
+    return in;
+}
+/* While the mouse moves (and half a second after) the left stick gets a nudge too small to move anything else, its sign
+ * flipping every poll: the game hides its hand 2-3 s after the last stick input, and a position put in by tomo.c is not
+ * one. The hand itself stays on the mouse (tomo.c puts the position in before every update). */
+static void mouse_poll(uint64_t *buttons, int *lx, int *ly) {
+    static float px = -1e9f, py = -1e9f;
+    static int nudge, wheel_hold, wheel_bit, flick, flick_dir;
+    float x = 0, y = 0;
+    int b = 0, wheel = 0, in = mouse_test(&x, &y, &b, &wheel);
+    int free_hand = GetTickCount() - (DWORD)g_pointer_tick < 250;
+    if (in < 0) { in = !scripted_run() && !input_held() && display_mouse(&x, &y, &b); wheel = scripted_run() ? 0 : display_mouse_wheel(); }
+    if ((long long)*lx * *lx + (long long)*ly * *ly > (long long)(STICK_MAX / 4) * (STICK_MAX / 4)) InterlockedExchange(&g_mouse_on, 0);      /* a stick takes over */
+    if (in) {
+        int moved = px > -1e8f && (fabsf(x - px) >= 1.0f || fabsf(y - py) >= 1.0f);      /* (the first look only notes where it is) */
+        if (moved || (px > -1e8f && b)) InterlockedExchange(&g_mouse_on, 1);
+        if (moved) nudge = 30;
+        px = x; py = y; g_mouse_xy[0] = x; g_mouse_xy[1] = y;
+        if (g_mouse_on) { if (b & 1) *buttons |= 1ull << BTN_A; if (b & 2) *buttons |= 1ull << BTN_B; }
+    }
+    if (wheel && !wheel_hold && !flick && !input_held()) {
+        if (free_hand) { wheel_bit = wheel > 0 ? BTN_ZL : BTN_ZR; wheel_hold = 4; }
+        else { flick_dir = wheel > 0 ? -1 : 1; flick = 4; }
+    }
+    if (wheel_hold) { wheel_hold--; *buttons |= 1ull << wheel_bit; }
+    if (flick && !*lx && !*ly) { flick--; *lx = flick_dir * STICK_MAX; }
+    else if (g_mouse_on && free_hand && nudge > 0 && !*lx && !*ly) { nudge--; *lx = (nudge & 1) ? STICK_MAX / 6 : -STICK_MAX / 6; }
+}
 static void fill_pad(uint64_t out, uint32_t id, int kind) {
     size_t size = kind == 2 ? 0x30 : 0x28;
     { void r1_wrote(uint64_t, uint64_t); r1_wrote(out, size); }   /* R1: marked (nothing without SSBU_R1_MARK) */
@@ -671,6 +726,7 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
         }
         t_merge = 0;
     }
+    if (id == 0 && !t_merge) mouse_poll(&buttons, &lx, &ly);
     if (id == 0) record_or_replay(&buttons, &lx, &ly, &rx, &ry);
     if (id == 0 && r1_on()) r1_pad(&buttons, &lx, &ly, &rx, &ry);
     if (id == 1 && r1_on()) { void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry); r1_pad_id(1, &buttons, &lx, &ly, &rx, &ry); }      /* R3: port 2 in an online rollback match */

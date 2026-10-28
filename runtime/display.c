@@ -414,8 +414,28 @@ static DWORD WINAPI close_watchdog(LPVOID arg) {
     TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
+/* The mouse for the game's hand pointer (nnhid.c mouse_poll, tomo.c pointer_hook): where the cursor is in the game's
+ * 1280x720 screen (the 16:9 picture, centred in a wider window) and the buttons (bit 0 left, bit 1 right), while this window
+ * is the foreground one and the cursor is over the picture. The arrow is hidden over the window while the hand follows it. */
+static volatile LONG g_mouse_hand_tick, g_mouse_wheel;
+void display_mouse_hand(void) { InterlockedExchange(&g_mouse_hand_tick, (LONG)GetTickCount()); }
+int display_mouse_wheel(void) { return (int)InterlockedExchange(&g_mouse_wheel, 0); }      /* notches since the last call, + = away from the user */
+int display_mouse(float *x, float *y, int *buttons) {
+    POINT p; RECT rc; int fit[4];
+    HWND h = g_hwnd;
+    if (!h || GetForegroundWindow() != h || !GetCursorPos(&p) || !ScreenToClient(h, &p) || !GetClientRect(h, &rc)) return 0;
+    fit[0] = 0; fit[1] = 0; fit[2] = rc.right; fit[3] = rc.bottom;           /* as display_fit (without its log): the 16:9 picture, centred */
+    if ((long long)rc.right * ASPECT_H > (long long)rc.bottom * ASPECT_W) { fit[2] = rc.bottom * ASPECT_W / ASPECT_H; fit[0] = (rc.right - fit[2]) / 2; }
+    else if ((long long)rc.right * ASPECT_H < (long long)rc.bottom * ASPECT_W) { fit[3] = rc.right * ASPECT_H / ASPECT_W; fit[1] = (rc.bottom - fit[3]) / 2; }
+    if (fit[2] <= 0 || fit[3] <= 0 || p.x < fit[0] || p.y < fit[1] || p.x >= fit[0] + fit[2] || p.y >= fit[1] + fit[3]) return 0;
+    *x = (float)(p.x - fit[0]) * 1280.0f / (float)fit[2];
+    *y = (float)(p.y - fit[1]) * 720.0f / (float)fit[3];
+    *buttons = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0) | ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0);
+    return 1;
+}
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (la_wndproc(h, m, w)) return 0;
+    if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && GetTickCount() - (DWORD)g_mouse_hand_tick < 300) { SetCursor(NULL); return TRUE; }
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
         { static LONG once; if (!InterlockedExchange(&once, 1)) CloseHandle(CreateThread(NULL, 0, close_watchdog, NULL, 0, NULL)); }
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
@@ -450,6 +470,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (osk_key(WM_CHAR, (WPARAM)u)) return 0;
         } else if (m == WM_KEYDOWN && osk_key(WM_KEYDOWN, w)) return 0;
     }
+    if (m == WM_MOUSEWHEEL) { static int rest; rest += (short)HIWORD(w); InterlockedExchangeAdd(&g_mouse_wheel, rest / WHEEL_DELTA); rest %= WHEEL_DELTA; return 0; }      /* (nnhid.c mouse_poll) */
     return DefWindowProcA(h, m, w, l);
 }
 

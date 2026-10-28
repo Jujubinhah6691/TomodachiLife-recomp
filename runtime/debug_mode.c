@@ -163,6 +163,7 @@ static void parse_match(const char *s) {
 static void match_player_hook(Ctx *c, void *user);
 static ImportFn g_orig_player_record;
 static volatile LONG g_dm_setups;                      /* match set-ups seen (player 1's record built) */
+static int g_dw_rw;                                     /* debug_watch_rw: reads too */
 #ifdef _WIN32
 static LONG CALLBACK watch_veh(EXCEPTION_POINTERS *ep) {
     static volatile LONG shown;
@@ -175,7 +176,7 @@ static LONG CALLBACK watch_veh(EXCEPTION_POINTERS *ep) {
      * fight (run m1: record said 6 and 9, the fighters spawned were still kinds 0 and 8): the record is a copy made from
      * the select-screen data, not the source. */
     if (InterlockedIncrement(&shown) <= 160) {
-        char line[1200]; int n = snprintf(line, sizeof line, "debug watch: write to %llx (reg %d) now %016llx by thread %lu, guest stack:", (unsigned long long)addr, which, (unsigned long long)*(uint64_t *)(uintptr_t)(addr & ~7ull), GetCurrentThreadId());
+        char line[1200]; int n = snprintf(line, sizeof line, "debug watch: %s %llx (reg %d) now %016llx by thread %lu, guest stack:", g_dw_rw ? "access to" : "write to", (unsigned long long)addr, which, (unsigned long long)*(uint64_t *)(uintptr_t)(addr & ~7ull), GetCurrentThreadId());
         CONTEXT c2 = *cx; uint64_t last = 0;
         for (int depth = 0, sh = 0; depth < 400 && sh < 14; depth++) {
             uint64_t g = guest_function_of(c2.Rip);
@@ -217,7 +218,7 @@ static void watch_set(const uint64_t *addrs, int n) {
         CONTEXT cx; memset(&cx, 0, sizeof cx); cx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(th, &cx)) {
             DWORD64 *dr = &cx.Dr0; DWORD64 d7 = 0;
-            for (int i = 0; i < n && i < 4; i++) { dr[i] = addrs[i]; d7 |= (1ull << (2 * i)) | (1ull << (16 + 4 * i)) | (3ull << (18 + 4 * i)); }
+            for (int i = 0; i < n && i < 4; i++) { dr[i] = addrs[i]; d7 |= (1ull << (2 * i)) | ((g_dw_rw ? 3ull : 1ull) << (16 + 4 * i)) | (3ull << (18 + 4 * i)); }
             cx.Dr7 = d7;
             if (SetThreadContext(th, &cx)) set++;
         }
@@ -236,6 +237,7 @@ static void watch_set(const uint64_t *addrs, int n) {      /* Linux build: no de
 /* research (R3, SSBU_RB_NET_WATCH=1 only): write watchpoints on up to 4 addresses from another file (fighter_host.c) */
 static uint64_t g_dw_a[4]; static int g_dw_n;
 static DWORD WINAPI dw_thread(LPVOID u) { (void)u; watch_set(g_dw_a, g_dw_n); return 0; }
+void debug_watch_rw(const uint64_t *addrs, int n) { g_dw_rw = 1; void debug_watch(const uint64_t *a, int k); debug_watch(addrs, n); }      /* reads and writes */
 void debug_watch(const uint64_t *addrs, int n) {        /* from a helper thread, so that the calling thread is watched too */
     g_dw_n = n > 4 ? 4 : n; memcpy(g_dw_a, addrs, sizeof(uint64_t) * (size_t)g_dw_n);
     HANDLE t = CreateThread(NULL, 0, dw_thread, NULL, 0, NULL); if (t) { WaitForSingleObject(t, 5000); CloseHandle(t); }

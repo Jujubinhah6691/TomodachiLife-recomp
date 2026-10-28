@@ -1302,11 +1302,123 @@ static void persp_install(void) {
     if (hook_install(0x71008ce838ull, persp_wide, NULL, &g_persp) && hook_install(0x71006ec3c0ull, layout_cam_wide, NULL, &g_layout_cam)) nvn_wide_camera();
     else printf("widescreen: the camera projection hook is not installed (the 3D view is squeezed instead)\n");
 }
+/* The hand pointer follows the mouse (nnhid.c mouse_poll). [0x710022dce0] (pointer) updates the hand once a frame: it
+ * keeps the position at +0x118 (x, y in the 1280x720 screen from the top left) as the previous one (+0x1b0), moves it by
+ * the stick (a direct call to 0x710022e7e0, which also places the drawn hand) and works out what lies under it
+ * (0x7100284b80: the panes under the hand). With the mouse in use the position is the mouse's before that, so hovering,
+ * picking and dragging happen where the mouse is; the game still hides an idle hand 2-3 s after the last stick input
+ * (a position put in is none), hence nnhid.c's nudge while the mouse moves. The hand is shown while bit 0 of the halfword
+ * at +0x14 is set. Found 2026-10-28 with TOMO_MEMSCAN and write watchpoints. TOMO_MOUSE=0 off. */
+static ImportFn g_pointer_update;
+static void pointer_hook(Ctx *c, void *user) {
+    int nnhid_mouse(float xy[2]); void display_mouse_hand(void);
+    float xy[2];
+    (void)user;
+    {   static int n; static const char *dbg = (const char *)-1; if (dbg == (const char *)-1) dbg = getenv("TOMO_MOUSE_DEBUG");      /* TEST ONLY: the pointer's state */
+        const float *f = (const float *)(uintptr_t)A0; const int *w = (const int *)(uintptr_t)A0;
+        if (dbg && n++ % 30 == 0) printf("mouse: state flags %x 1a0 %d 1a4 %d pos %g,%g prev %g,%g 08 %x 10 %x 114 %x%c", *(const uint16_t *)(uintptr_t)(A0 + 0x14), w[0x1a0 / 4], w[0x1a4 / 4],
+                                        f[0x118 / 4], f[0x11c / 4], f[0x1b0 / 4], f[0x1b4 / 4], w[2], w[4], w[0x114 / 4], 10); }
+    if (*(const uint16_t *)(uintptr_t)(A0 + 0x14) & 1) { void nnhid_pointer_free(void); nnhid_pointer_free(); }
+    if ((*(const uint16_t *)(uintptr_t)(A0 + 0x14) & 1) && nnhid_mouse(xy)) { memcpy((void *)(uintptr_t)(A0 + 0x118), xy, 8); display_mouse_hand(); }
+    g_pointer_update(c);
+}
+static void pointer_install(void) {
+    if (getenv("TOMO_MOUSE") && getenv("TOMO_MOUSE")[0] == '0') return;
+    if (!hook_install(0x710022dce0ull, pointer_hook, NULL, &g_pointer_update)) printf("mouse: the hand pointer hook is not installed (the mouse cannot move the hand)%c", 10);
+}
 static void heaplog_install(void) {
     trace_install();
     if (getenv("TOMO_TASKLOG")) printf("tasklog: hook %s\n", hook_install(0x71005e1ffcull, tasklog_step, NULL, &g_task_step) ? "installed" : "NOT installed");
     if (!getenv("TOMO_HEAPLOG")) return;
     printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");
+}
+
+/* TEST ONLY, TOMO_MEMSCAN=<step>:<op>,... with SSBU_SEQ: a search for a game value that follows the input (the hand cursor).
+ * At the start of each listed sequence step the 32-bit floats of the game's heap (committed pages of the write-watched
+ * regions) are compared with the previous look: snap = copy everything; up / down = keep the floats that grew / shrank by
+ * 0.01..100000 since the previous look; same = keep those unchanged. Up to 40 survivors are printed after each look. */
+int nvn_ww_regions(uint64_t *base, uint64_t *size, int max);      /* nvn_gl.c */
+typedef struct { uint64_t a; float v; } MsCand;
+static struct { uint64_t a, n; uint8_t *copy; } g_ms_snap[4096];
+static int g_ms_nsnap;
+static MsCand *g_ms; static size_t g_ms_n;
+static int ms_keep(float was, float now, char op) {
+    if (now != now || was != was || now > 1e9f || now < -1e9f) return 0;
+    float d = now - was;
+    return op == 'u' ? d > 0.01f && d < 1e5f : op == 'd' ? -d > 0.01f && -d < 1e5f : d == 0.0f && was != 0.0f;
+}
+void tomo_memscan_step(int step) {
+    static const char *spec = (const char *)-1;
+    if (spec == (const char *)-1) spec = getenv("TOMO_MEMSCAN");
+    if (!spec) return;
+    char op = 0;
+    for (const char *p = spec; *p;) {
+        int s = atoi(p); const char *q = strchr(p, ':');
+        if (q && s == step) { op = q[1]; break; }
+        if (!(p = strchr(p, ','))) break;
+        p++;
+    }
+    if (!op) return;
+    if (op == 'w' || op == 'W') {                  /* watch: write watchpoints (debug_mode.c) on up to 4 survivors that look like screen x, y (W: any) */
+        void debug_watch(const uint64_t *addrs, int n);
+        uint64_t w[4]; int n = 0;
+        for (size_t i = 0; i < g_ms_n && n < 4; i++) {
+            float y = *(const float *)(uintptr_t)(g_ms[i].a + 4);
+            if (op == 'W' || (g_ms[i].v >= 10.0f && g_ms[i].v <= 1280.0f && y >= 0.0f && y <= 720.0f)) { w[n++] = g_ms[i].a; printf("memscan: watching %llx%c", (unsigned long long)g_ms[i].a, 10); }
+        }
+        if (n) debug_watch(w, n);
+        return;
+    }
+    if (op == 's') {                               /* snap */
+        uint64_t base[64], size[64], total = 0;
+        int nr = nvn_ww_regions(base, size, 64);
+        for (int i = 0; i < g_ms_nsnap; i++) free(g_ms_snap[i].copy);
+        g_ms_nsnap = 0;
+        for (int r = 0; r < nr; r++)
+            for (uint64_t a = base[r]; a < base[r] + size[r];) {
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) break;
+                uint64_t end = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+                if (end > base[r] + size[r]) end = base[r] + size[r];
+                if (mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE && g_ms_nsnap < 4096) {
+                    uint8_t *cp = malloc((size_t)(end - a));
+                    if (cp) { memcpy(cp, (void *)(uintptr_t)a, (size_t)(end - a)); g_ms_snap[g_ms_nsnap].a = a; g_ms_snap[g_ms_nsnap].n = end - a; g_ms_snap[g_ms_nsnap++].copy = cp; total += end - a; }
+                }
+                a = end;
+            }
+        free(g_ms); g_ms = NULL; g_ms_n = 0;
+        printf("memscan: step %d snap: %d ranges, %.1f MB%c", step, g_ms_nsnap, (double)total / 1048576.0, 10);
+        return;
+    }
+    size_t cap = 0, k = 0;
+    if (g_ms_nsnap) {                              /* first compare: against the copy */
+        for (int i = 0; i < g_ms_nsnap; i++) {
+            const float *was = (const float *)g_ms_snap[i].copy, *now = (const float *)(uintptr_t)g_ms_snap[i].a;
+            for (uint64_t w = 0; w < g_ms_snap[i].n / 4; w++)
+                if (ms_keep(was[w], now[w], op)) {
+                    if (k == cap) { cap = cap ? cap * 2 : 1 << 20; g_ms = realloc(g_ms, cap * sizeof *g_ms); }
+                    g_ms[k].a = g_ms_snap[i].a + w * 4; g_ms[k++].v = now[w];
+                }
+            free(g_ms_snap[i].copy);
+        }
+        g_ms_nsnap = 0;
+    } else {
+        for (size_t i = 0; i < g_ms_n; i++) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (i == 0 || (g_ms[i].a >> 12) != (g_ms[i - 1].a >> 12)) {
+                if (!VirtualQuery((void *)(uintptr_t)g_ms[i].a, &mi, sizeof mi) || mi.State != MEM_COMMIT || mi.Protect != PAGE_READWRITE) {      /* (page gone) */
+                    uint64_t pg = g_ms[i].a >> 12; while (i + 1 < g_ms_n && (g_ms[i + 1].a >> 12) == pg) i++;
+                    continue;
+                }
+            }
+            float now = *(const float *)(uintptr_t)g_ms[i].a;
+            if (ms_keep(g_ms[i].v, now, op)) { g_ms[k].a = g_ms[i].a; g_ms[k++].v = now; }
+        }
+    }
+    g_ms_n = k;
+    printf("memscan: step %d %s: %llu candidates%c", step, op == 'u' ? "up" : op == 'd' ? "down" : "same", (unsigned long long)k, 10);
+    for (size_t i = 0; i < k && i < 40; i++) printf("memscan:   %llx = %g (next %g %g)%c", (unsigned long long)g_ms[i].a, g_ms[i].v,
+                                                    *(const float *)(uintptr_t)(g_ms[i].a + 4), *(const float *)(uintptr_t)(g_ms[i].a + 8), 10);
 }
 
 static void ret7(Ctx *c) { RET(7); }
@@ -1319,6 +1431,7 @@ static const ImportDef tomo_overrides[] = {
 };
 void register_tomo_imports(void) {
     persp_install();
+    pointer_install();
     audio_volume_selftest();                     /* SSBU_AUDIO_VOLUME_SELFTEST=<expected startup percent>, -1 for no device */
     for (size_t i = 0; i < sizeof tomo_imports / sizeof tomo_imports[0]; i++)
         if (!import_lookup(tomo_imports[i].name)) register_imports(&tomo_imports[i], 1);
