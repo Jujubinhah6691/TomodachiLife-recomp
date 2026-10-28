@@ -2432,8 +2432,8 @@ static void shp_queue(void) {                      /* render thread, start (prec
         memset(&fa, 0, sizeof fa);
         GetFileAttributesExA(exe, GetFileExInfoStandard, &fa);
         const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
-        int kl = snprintf(key, sizeof key, "%s %lu %lu %lu %d %d %d %016llx", base, fa.nFileSizeLow, fa.ftLastWriteTime.dwLowDateTime, fa.ftLastWriteTime.dwHighDateTime,
-                          ubo_on(), rs_on(), wide_k() != 1.0f ? 1 + g_wide_camera : 0, (unsigned long long)g_shd_drv);
+        int kl = snprintf(key, sizeof key, "%s %lu %lu %lu %d %d %d %016llx%s", base, fa.nFileSizeLow, fa.ftLastWriteTime.dwLowDateTime, fa.ftLastWriteTime.dwHighDateTime,
+                          ubo_on(), rs_on(), wide_k() != 1.0f ? 1 + g_wide_camera : 0, (unsigned long long)g_shd_drv, mx_bl_misslog() ? " blmiss" : "");
         g_shp_key = sh_hash(sh_hash(0x5348505245ULL, txt, n), key, (size_t)kl);
         snprintf(g_shp_mark, sizeof g_shp_mark, "%s/prepared_%s.txt", g_shd_dir, base);
         snprintf(g_shp_wpath, sizeof g_shp_wpath, "%s/warmed_%s.txt", g_shd_dir, base);
@@ -5869,42 +5869,114 @@ static void frozen_drawtexture_selftest(void) {
 /* ---------------------------------------------------------------- render-thread jobs */
 /* Bindless texture handles read by shaders (TEX.B: the handle comes from a register, not a bound unit): every handle the game
  * asked for (nvnDeviceGetTextureHandle) is a pair (texture id, sampler id); the render thread resolves the pairs to resident
- * GL handles into a hash table of 65536 entries {handle, gl, used} (SSBO binding 39; the GLSL mx_bl probes it the way bl_note
- * does), again whenever a pool registration changed anything. A handle not in the table samples the 1x1 dummy. */
-static struct { uint32_t nh, gen, slot; } g_bl[65536];
-static uint16_t g_bl_slot[65536];                         /* open addressing on the handle: 0 = free, else index + 1 */
-static int g_bl_n;
+ * GL handles into a hash table of BL_SLOTS entries {handle, gl lo, gl hi, used} (SSBO binding 39; the GLSL mx_bl probes it
+ * the way bl_note does, mx_translate.h MX_BL_BITS), again whenever a pool registration changed anything. A handle not in
+ * the table samples the 1x1 dummy (entry BL_SLOTS).
+ * The game asks for about 1,000 new pairs a second while it streams textures (measured 2026-10-26: each pair asked for ~20
+ * times within a few seconds, then never again), so once the table is 3/4 full it drops the pairs of destroyed textures
+ * (bl_evict). Before, nothing was dropped: the 65,536 entries were full after ~2 minutes of play, every later pair scanned the
+ * whole table on the job threads (main-thread stalls) and sampled the dummy. TOMO_BL_CAP=<entries> (test: evict sooner),
+ * TOMO_BL_MISSLOG=1 (the shaders count handles they did not find: "bindless misses" every 10 s). */
+#define BL_SLOTS (1u << MX_BL_BITS)
+static struct { uint32_t nh, gen, slot, seen; uint64_t gl; } g_bl[BL_SLOTS / 2];
+static uint32_t g_bl_slot[BL_SLOTS];                      /* open addressing on the handle: 0 = free, else index + 1 */
+static int g_bl_n, g_bl_cap = BL_SLOTS / 2;              /* at most half the slots used: short probes (GLSL gives up after BL_PROBE) */
+#define BL_PROBE 256
+static volatile uint32_t g_bl_now;                        /* seconds; bl_update keeps it */
 static SRWLOCK g_bl_lock = SRWLOCK_INIT;
 static uint32_t g_tgen[1 << 20], g_sgen[1 << 12];       /* bumped by a registration of that texture / sampler id: only its pairs are resolved again */
 static volatile LONG g_pool_gen = 1;
 static GLuint g_bl_buf;
+static uint32_t bl_home(uint32_t nh) { return (nh * 2654435761u) >> (32 - MX_BL_BITS); }
+static int bl_find(uint32_t nh) {                         /* index or -1; the lock held */
+    for (uint32_t k = bl_home(nh); g_bl_slot[k]; k = (k + 1) & (BL_SLOTS - 1)) if (g_bl[g_bl_slot[k] - 1].nh == nh) return (int)g_bl_slot[k] - 1;
+    return -1;
+}
 static int bl_has(uint32_t nh) {
-    uint32_t k = (nh * 2654435761u) >> 16;
-    for (int i = 0; i < 65536 && g_bl_slot[k]; i++, k = (k + 1) & 65535) if (g_bl[g_bl_slot[k] - 1].nh == nh) return 1;
-    return 0;
+    AcquireSRWLockShared(&g_bl_lock);
+    int i = bl_find(nh);
+    ReleaseSRWLockShared(&g_bl_lock);
+    return i >= 0;
 }
 static void bl_note(uint32_t nh) {
-    uint32_t k = (nh * 2654435761u) >> 16;
+    /* shared lock for the usual case, a pair asked for again: the job threads ask ~20,000 times a second */
+    AcquireSRWLockShared(&g_bl_lock);
+    int i = bl_find(nh);
+    if (i >= 0 && g_bl[i].seen != g_bl_now) g_bl[i].seen = g_bl_now;
+    ReleaseSRWLockShared(&g_bl_lock);
+    if (i >= 0) return;
     AcquireSRWLockExclusive(&g_bl_lock);
-    for (;; k = (k + 1) & 65535) {
-        if (!g_bl_slot[k]) { if (g_bl_n < 65535) { g_bl[g_bl_n].nh = nh; g_bl[g_bl_n].gen = 0; g_bl[g_bl_n].slot = k; g_bl_slot[k] = (uint16_t)(++g_bl_n); } break; }
-        if (g_bl[g_bl_slot[k] - 1].nh == nh) break;
-    }
+    uint32_t k = bl_home(nh);
+    int probe = 0;
+    for (; g_bl_slot[k] && g_bl[g_bl_slot[k] - 1].nh != nh; k = (k + 1) & (BL_SLOTS - 1)) probe++;
+    if (!g_bl_slot[k] && g_bl_n < g_bl_cap && probe < BL_PROBE) {
+        g_bl[g_bl_n].nh = nh; g_bl[g_bl_n].gen = 0; g_bl[g_bl_n].slot = k; g_bl[g_bl_n].seen = g_bl_now; g_bl[g_bl_n].gl = 0;
+        g_bl_slot[k] = (uint32_t)++g_bl_n;
+    } else if (!g_bl_slot[k]) { static int nlog; logf_limited(&nlog, 5, "nvn_gl: bindless table full (%d handles): handle %08x samples the dummy\n", g_bl_n, nh); }
     ReleaseSRWLockExclusive(&g_bl_lock);
 }
-static void bl_update(void) {                                /* render thread, before a batch runs */
+/* render thread: drop the pairs whose texture was destroyed and that were not asked for in the last minute; a pair of a live
+ * texture is kept however old: the game asks for some handles once and samples them for good, also after registering another
+ * texture under the same id (it asked for 1bb00759 once while loading; tried 2026-10-26: dropping by age or by
+ * re-registration made shaders miss it every frame). Measured: ~87 % of the pairs are of destroyed textures (they sample the
+ * dummy anyway). Then the hash is rebuilt and the whole table uploaded. */
+static int bl_evict(void) {                                  /* how many were dropped */
+    static uint32_t *up;
+    if (!up && !(up = malloc((size_t)BL_SLOTS * 16))) return 0;
+    AcquireSRWLockShared(&g_pool_lock);
+    AcquireSRWLockExclusive(&g_bl_lock);
+    int n0 = g_bl_n, j = 0;
+    for (int i = 0; i < g_bl_n; i++) {
+        uint32_t t = g_bl[i].nh & 0xfffff;
+        Tex *x = t < (uint32_t)S.tpool->count ? S.tpool->e[t].tex : NULL;
+        if ((x && !x->dead) || g_bl_now - g_bl[i].seen <= 60) g_bl[j++] = g_bl[i];
+    }
+    ReleaseSRWLockShared(&g_pool_lock);
+    g_bl_n = j;
+    if (j == n0) { ReleaseSRWLockExclusive(&g_bl_lock); return 0; }
+    memset(g_bl_slot, 0, sizeof g_bl_slot);
+    memset(up, 0, (size_t)BL_SLOTS * 16);
+    for (int i = 0; i < g_bl_n; i++) {
+        uint32_t k = bl_home(g_bl[i].nh);
+        while (g_bl_slot[k]) k = (k + 1) & (BL_SLOTS - 1);
+        g_bl_slot[k] = (uint32_t)i + 1; g_bl[i].slot = k;
+        if (g_bl[i].gen) { uint32_t *e = up + (size_t)k * 4; e[0] = g_bl[i].nh; e[1] = (uint32_t)g_bl[i].gl; e[2] = (uint32_t)(g_bl[i].gl >> 32); e[3] = 1; }
+    }
+    ReleaseSRWLockExclusive(&g_bl_lock);
+    glNamedBufferSubData(g_bl_buf, 0, (ptrdiff_t)BL_SLOTS * 16, up);
     static int nlog;
+    logf_limited(&nlog, 20, "nvn_gl: bindless table: dropped %d handles of destroyed textures, %d kept\n", n0 - g_bl_n, g_bl_n);
+    return n0 - g_bl_n;
+}
+static void bl_update(void) {                                /* render thread, before a batch runs */
+    static int miss_log = -1;
+    static ULONGLONG miss_next;
+    g_bl_now = (uint32_t)(GetTickCount64() / 1000);
     if (!g_bl_n || !S.tpool) return;
-    if (!g_bl_buf) {                                         /* 65536 entries {handle, gl lo, gl hi, used} + the dummy at 65536: the GLSL probes the same way bl_note does */
-        uint32_t dummy[4] = {0, (uint32_t)g_dummy_handle, (uint32_t)(g_dummy_handle >> 32), 1};
-        glCreateBuffers(1, &g_bl_buf); glNamedBufferData(g_bl_buf, 65537 * 16, NULL, 0x88E8 /* DYNAMIC_DRAW */);
-        { void *z = calloc(65536, 16); glNamedBufferSubData(g_bl_buf, 0, 65536 * 16, z); free(z); }
-        glNamedBufferSubData(g_bl_buf, 65536 * 16, 16, dummy);
+    if (!g_bl_buf) {                                         /* BL_SLOTS entries + the dummy + the miss counter (TOMO_BL_MISSLOG) */
+        uint32_t tail[8] = {0, (uint32_t)g_dummy_handle, (uint32_t)(g_dummy_handle >> 32), 1, 0, 0, 0, 0};
+        const char *cap = getenv("TOMO_BL_CAP");
+        if (cap && atoi(cap) >= 1024 && atoi(cap) < (int)(BL_SLOTS / 2)) g_bl_cap = atoi(cap);
+        glCreateBuffers(1, &g_bl_buf); glNamedBufferData(g_bl_buf, (ptrdiff_t)(BL_SLOTS + 2) * 16, NULL, 0x88E8 /* DYNAMIC_DRAW */);
+        { void *z = calloc(BL_SLOTS, 16); glNamedBufferSubData(g_bl_buf, 0, (ptrdiff_t)BL_SLOTS * 16, z); free(z); }
+        glNamedBufferSubData(g_bl_buf, (ptrdiff_t)BL_SLOTS * 16, 32, tail);
+    }
+    {   /* again once 1/8 of the capacity was added since, or after 10 s: the pairs that could not be dropped stay */
+        static int after; static uint32_t when;
+        if (g_bl_n >= g_bl_cap - g_bl_cap / 4 && (g_bl_n >= after + g_bl_cap / 8 || g_bl_now >= when + 10)) { bl_evict(); after = g_bl_n; when = g_bl_now; }
+    }
+    if (miss_log < 0) miss_log = mx_bl_misslog();
+    if (miss_log && GetTickCount64() >= miss_next) {             /* test only: a read-back stall every 10 s */
+        uint32_t m[2] = {0, 0}, z[2] = {0, 0};
+        glGetNamedBufferSubData(g_bl_buf, (ptrdiff_t)(BL_SLOTS + 1) * 16, 8, m);
+        glNamedBufferSubData(g_bl_buf, (ptrdiff_t)(BL_SLOTS + 1) * 16, 8, z);
+        if (miss_next) printf("nvn_gl: bindless misses in 10 s: %u (last handle %08x), %d handles in the table\n", m[0], m[1], g_bl_n);
+        miss_next = GetTickCount64() + 10000;
     }
     AcquireSRWLockShared(&g_bl_lock);
     int n = g_bl_n;
     ReleaseSRWLockShared(&g_bl_lock);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++) {                            /* only this thread moves entries (bl_evict); bl_note appends past n */
         uint32_t nh = g_bl[i].nh, dims[4] = {0, 0, 0, 0};
         uint32_t gen = 1 + g_tgen[nh & 0xfffff] + (g_sgen[(nh >> 20) & 0xfff] << 16);
         if (g_bl[i].gen == gen) continue;
@@ -5912,11 +5984,10 @@ static void bl_update(void) {                                /* render thread, b
         uint64_t h = resolve_handle(S.tpool, S.spool, (uint64_t)nh | 0x100000000ull, dims, &isint);
         uint32_t entry[4] = {nh, (uint32_t)h, (uint32_t)(h >> 32), 1};
         glNamedBufferSubData(g_bl_buf, (ptrdiff_t)g_bl[i].slot * 16, 16, entry);
-        g_bl[i].gen = gen;
-        (void)nlog;
+        g_bl[i].gl = h; g_bl[i].gen = gen;
     }
 }
-static void bl_bind(void) { if (g_bl_buf) gs_ssbo(39, g_bl_buf, 0, 65537 * 16); }
+static void bl_bind(void) { if (g_bl_buf) gs_ssbo(39, g_bl_buf, 0, (BL_SLOTS + 2) * 16); }
 static void job_submit(void *arg) {
     SubmitJob *j = arg;
     static int nlog;

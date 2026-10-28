@@ -61,6 +61,11 @@ const char *mx_opcode_name(uint64_t insn) {
         if ((insn & mx_op_table[k].mask) == mx_op_table[k].value) return mx_op_name[mx_op_table[k].op];
     return "INVALID";
 }
+int mx_bl_misslog(void) {
+    static int v = -1;
+    if (v < 0) { const char *s = getenv("TOMO_BL_MISSLOG"); v = s && atoi(s) ? 1 : 0; }
+    return v;
+}
 static int decode(uint64_t insn) {
     for (size_t k = 0; k < sizeof mx_op_table / sizeof mx_op_table[0]; k++)
         if ((insn & mx_op_table[k].mask) == mx_op_table[k].value) return mx_op_table[k].op;
@@ -1760,8 +1765,14 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (e->uses_lmem) emit(&h, "uint lmem[%u];\n", e->lmem_words);
         for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1) emit(&h, "layout(std430, %sbinding = %u) %sbuffer SB%u { uint s%u[]; };\n", set0, in->ssbo_base + k, e->uses_gstore ? "" : "readonly ", k, k);
         if (e->uses_gstore && in->track_writes) emit(&h, "layout(std430, %sbinding = %u) buffer WM { uint mx_wm; };\n", set0, in->wmask_binding);
-        if (e->uses_bl) emit(&h, "layout(std430, binding = 39) readonly buffer MXBL { uvec4 mx_blt[]; };\n"
-                                 "uvec2 mx_bl(uint h) { uint k = (h * 2654435761u) >> 16u; for (int i = 0; i < 32; i++) { uvec4 e = mx_blt[k]; if (e.x == h) return e.yz; if (e.w == 0u) break; k = (k + 1u) & 65535u; } return mx_blt[65536].yz; }\n");
+        if (e->uses_bl) {
+            int miss = mx_bl_misslog();
+            emit(&h, "layout(std430, binding = 39) %sbuffer MXBL { uvec4 mx_blt[]; };\n", miss ? "" : "readonly ");
+            emit(&h, "uvec2 mx_bl(uint h) { uint k = (h * 2654435761u) >> %uu; for (int i = 0; i < 256; i++) { uvec4 e = mx_blt[k]; if (e.x == h) return e.yz; if (e.w == 0u) break; k = (k + 1u) & %uu; } ",
+                 32 - MX_BL_BITS, (1u << MX_BL_BITS) - 1);
+            if (miss) emit(&h, "atomicAdd(mx_blt[%uu].x, 1u); mx_blt[%uu].y = h; ", (1u << MX_BL_BITS) + 1, (1u << MX_BL_BITS) + 1);
+            emit(&h, "return mx_blt[%uu].yz; }\n", 1u << MX_BL_BITS);
+        }
         if (e->uses_red) {
             emit(&h, "void mx_red(uint ad, uint v, uint op, uint ty) { uint o = (ad & 0x07ffffffu) >> 2; switch (ad >> 27) {\n");
             for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1)
