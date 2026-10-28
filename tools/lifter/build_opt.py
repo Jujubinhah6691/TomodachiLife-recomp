@@ -36,8 +36,8 @@ import threading
 import time
 
 os.environ.setdefault('RECOMP_GEN', 'gen_eh_o2')
-os.environ.setdefault('RECOMP_OBJ', 'obj_eh_o1')          # P3 (2026-10-09): the set that is the default of build.py
-os.environ.setdefault('RECOMP_DLL', 'ssbu_game_eh_o1.dll')
+os.environ.setdefault('RECOMP_OBJ', 'obj_eh_o1')          # P3 (2026-10-09): the set that is the default of build.py (compiled at OPT; the name is older)
+os.environ.setdefault('RECOMP_DLL', 'tomodachi_game.dll')     # build.py's name
 os.environ.setdefault('RECOMP_NRO_SUFFIX', '_eh_o2')
 
 import build          # noqa: E402  (reads the environment at import)
@@ -45,7 +45,9 @@ import build_nro      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-9.0.0\bin\clang.exe')
-OPT = os.environ.get('RECOMP_OPT', '-O1')
+# -O2 since 2026-10-26: the lifted Mii voice synthesis, which the main thread waits for, takes half the time of -O1 (its
+# longest bursts 160-315 -> 70-125 ms); the whole game compiles in 23 min with 9 jobs (16 threads, 16 GB)
+OPT = os.environ.get('RECOMP_OPT', '-O2')
 EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_CFLAGS', '').split()
 # RECOMP_INLINE=1: the helpers of runtime.h / neon.h / fpexact.h (every guest load / store, flag, NEON op) inlined into the
 # lifted code. clang 9 at -O1 runs only the always-inline inliner, so without this each helper is a real call: measured
