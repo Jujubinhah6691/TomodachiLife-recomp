@@ -85,8 +85,7 @@ enum { T_MATCH = 20, T_MATCH_STATE };                 /* O2 matchmaking */
 #define GONE_AFTER_MS 5000
 #define PUNCH_FOR_MS 5000          /* hellos every 200 ms this long; no answer -> relayed (hello every 5 s in case it opens) */
 #define FRESH_MS 1200              /* a direct path is used while its last answer is younger than this */
-#define NET_BUILD_DEFAULT "ssbu-recomp-ldn1"
-#define NET_PUBLIC_LOBBY "opensmash-lobby.duckdns.org:39500"     /* the project's public lobby (menu.cpp ONLINE_DEFAULT_LOBBY): the default without online_mode / online_server */
+#define NET_BUILD_DEFAULT "tomodachi-recomp-ldn1"     /* (the Smash port's was ssbu-recomp-ldn1: the two never meet) */
 
 static uint16_t g16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static uint32_t g32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -287,14 +286,10 @@ static void configure(void) {
     } else if (ini_value("online_mode", v, sizeof v)) {
         if (is_off(v)) return;
         snprintf(mode, sizeof mode, "%s", v);
-    } else {                                        /* no online_mode: ON through a lobby, the file's or the public one (2026-10-20) */
-        if (ini_value("online_server", v, sizeof v)) { if (is_off(v)) return; }
-        else {
-            /* scripted test runs (key script, debug match, deterministic mode) stay offline unless they ask */
-            if (getenv("SSBU_SEQ") || getenv("SSBU_DEBUG_MATCH") || getenv("SSBU_DETERMINISTIC") || getenv("SSBU_SDK_SELFTEST") ||
-                getenv("SSBU_PAD_SELFTEST") || getenv("SSBU_CXXRT_SELFTEST")) return;     /* (self-tests: their socket checks hung on the lobby) */
-            snprintf(g_server, sizeof g_server, "%s", NET_PUBLIC_LOBBY);
-        }
+    } else {                                        /* no online_mode: a lobby only when online_server names one */
+        /* Tomodachi Life (2026-10-28): OFF unless asked. The Smash port went to its public lobby by default, and this file
+         * came with that: every start of the game joined opensmash-lobby with a made-up name and the LAN address. */
+        if (!ini_value("online_server", v, sizeof v) || is_off(v)) return;
         snprintf(mode, sizeof mode, "lobby");
     }
     if (!_stricmp(mode, "1") || !_stricmp(mode, "on") || !_stricmp(mode, "auto")) g_auto = 1;
@@ -331,9 +326,6 @@ static void configure(void) {
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
     else {
         size_t l = strlen(g_build);
-        if (g_game_build >= 0)         /* players of 13.0.4 and 13.0.5 never share a room: the lobby and the LAN lobby part rooms by build */
-            snprintf(g_build + l, sizeof g_build - l, "-%s", g_game_build == 1 ? "13.0.5" : "13.0.4");
-        l = strlen(g_build);
         if (g_nmods) snprintf(g_build + l, sizeof g_build - l, "+m%08x", g_mods_hash);      /* nor do different mod sets */
     }
     if ((e = getenv("SSBU_ONLINE_LIST_OTHER"))) g_list_other = !is_off(e);
