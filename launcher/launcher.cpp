@@ -8,12 +8,14 @@
  *   GAME       the game's files: a folder holding exefs\main.elf and romfs\ (build\dump unless another is chosen);
  *   SETTINGS   the options of build\config\graphics.ini that the port reads, written when changed (comments and other
  *              keys are kept);
- *   SAVE DATA  backups of build\userdata into build\saves, restore (the current save is backed up first), folders;
+ *   SAVE DATA  backups of build\userdata into build\saves, restore (the current save is backed up first), importing a
+ *              save from a folder (a console dump: Map.sav, Mii.sav, Player.sav), folders;
  *   CONTROLS   the controller SDL sees and the keyboard's keys; build\config\controllers.ini;
  *   MORE       logs, graphics.ini, the shader cache, the port's folder.
  * Pictures beside the exe, made from the player's own game files (scripts\launcher_art.py): title-logo.png, the game's
  * logo; launcher-background.jpg, the island. Without them: a plain gradient and the name in text.
  * --shot <file.bmp> [main|settings|saves|controls|more]: draws that screen off screen into a picture and exits.
+ * --import <folder>: SAVE DATA > IMPORT A SAVE with that folder (no dialog), the result printed; for tests.
  * Built by scripts\build_launcher.sh (clang, SDL3 of ..\ssbu-recomp\deps, third_party\stb). */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -21,6 +23,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -216,6 +219,7 @@ public:
         refresh();
     }
     bool running() const { return !quit_; }
+    std::string import_now(const char* dir) { import_save(fs::u8path(dir)); return note_; }      // --import (main)
     bool game_running() const { return game_.hProcess != nullptr; }
     void open_screen(const std::string& s) {
         if (s == "settings") go(Screen::kSettings);
@@ -303,7 +307,8 @@ public:
             chosen.swap(dialog_result_);
             std::swap(done, dialog_done_);
         }
-        if (done && !chosen.empty()) {
+        if (done && !chosen.empty() && dialog_for_ == kForImport) import_save(fs::u8path(chosen));
+        else if (done && !chosen.empty()) {
             game_dir_ = chosen;
             lini_.set("game", chosen);
             refresh();
@@ -433,6 +438,7 @@ private:
             break;
         case Screen::kSaves:
             list_.push_back({"BACK UP NOW", ""});
+            list_.push_back({"IMPORT A SAVE", "Choose a folder"});
             for (size_t i = 0; i < backups_.size() && i < 4; ++i) {
                 fs::file_time_type t{};
                 dir_size(backups_[i], &t);
@@ -495,12 +501,13 @@ private:
         case Screen::kSaves: {
             const int nb = int(std::min<size_t>(backups_.size(), 4));
             if (i == 0) { note_ = backup_now("") ? "Backup made." : "There is no save to back up yet."; note_ok_ = save_size_ > 0; refresh(); }
-            else if (i <= nb) {
+            else if (i == 1) choose_folder(kForImport, "");
+            else if (i <= nb + 1) {
                 if (armed_ != i) { armed_ = i; build_items(); break; }
                 armed_ = -1;
-                restore(backups_[i - 1]);
-            } else if (i == nb + 1) { fs::create_directories(g_userdata); open_path(g_userdata); }
-            else if (i == nb + 2) { fs::create_directories(g_saves); open_path(g_saves); }
+                restore(backups_[i - 2]);
+            } else if (i == nb + 2) { fs::create_directories(g_userdata); open_path(g_userdata); }
+            else if (i == nb + 3) { fs::create_directories(g_saves); open_path(g_saves); }
             else back();
             break;
         }
@@ -540,9 +547,60 @@ private:
         refresh();
     }
 
-    void choose_game(bool then_play = false) {
-        play_after_dialog_ = then_play;
-        const std::string def = game_dir_.string();
+    /* A save from elsewhere (a dump made on the console with JKSV or Checkpoint: Map.sav, Mii.sav and Player.sav, in the
+     * folder chosen or up to three levels below it, as in JKSV\<game>\<date>; the newest if several). The current save is
+     * backed up first; a commit the game left half done (save.commit, nnfs.c) would be finished over the new files at the
+     * next start: it goes too. */
+    static fs::path find_save(const fs::path& dir, int depth = 3) {
+        if (is_file(dir / "Map.sav") && is_file(dir / "Mii.sav") && is_file(dir / "Player.sav")) return dir;
+        fs::path best;
+        fs::file_time_type best_t{};
+        std::error_code e;
+        if (depth > 0)
+            for (auto& d : fs::directory_iterator(dir, e))
+                if (d.is_directory(e))
+                    if (fs::path f = find_save(d.path(), depth - 1); !f.empty()) {
+                        const auto t = fs::last_write_time(f / "Mii.sav", e);
+                        if (best.empty() || t > best_t) { best = f; best_t = t; }
+                    }
+        return best;
+    }
+    static bool game_process_running() {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof pe;
+        bool found = false;
+        if (snap != INVALID_HANDLE_VALUE && Process32FirstW(snap, &pe))
+            do found = !_wcsicmp(pe.szExeFile, L"tomodachi_play.exe") || !_wcsicmp(pe.szExeFile, L"tomodachi_native.exe");
+            while (!found && Process32NextW(snap, &pe));
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        return found;
+    }
+    void import_save(const fs::path& dir) {
+        note_ok_ = false;
+        if (game_running() || game_process_running()) { note_ = "Close the game before importing a save."; return; }
+        const fs::path from = find_save(dir);
+        if (from.empty()) { note_ = "No save there: the folder needs Map.sav, Mii.sav and Player.sav."; return; }
+        bool ok = !is_dir(g_userdata / "save") || backup_now("before_import");
+        std::error_code e;
+        if (ok) {
+            fs::create_directories(g_userdata / "save", e);
+            for (auto& d : fs::directory_iterator(g_userdata, e)) {
+                const std::string n = d.path().filename().string();
+                if (n == "save.commit" || n.rfind("save.journal.", 0) == 0) fs::remove(d.path(), e);
+            }
+            for (const char* n : {"Map.sav", "Mii.sav", "Player.sav"})
+                ok = ok && fs::copy_file(from / n, g_userdata / "save" / n, fs::copy_options::overwrite_existing, e);
+        }
+        note_ = ok ? "Save imported. Your previous save is in the backups." : "The import failed: your previous save is in the backups.";
+        note_ok_ = ok;
+        refresh();
+    }
+
+    enum { kForGame, kForImport };
+    void choose_game(bool then_play = false) { play_after_dialog_ = then_play; choose_folder(kForGame, game_dir_.string()); }
+    void choose_folder(int purpose, const std::string& def) {
+        dialog_for_ = purpose;
         SDL_ShowOpenFolderDialog(
             [](void* self, const char* const* list, int) {
                 auto* l = static_cast<Launcher*>(self);
@@ -550,7 +608,7 @@ private:
                 l->dialog_result_ = list && list[0] ? list[0] : "";
                 l->dialog_done_ = true;
             },
-            this, window_, def.c_str(), false);
+            this, window_, def.empty() ? nullptr : def.c_str(), false);
     }
 
     void play() {
@@ -649,7 +707,7 @@ private:
             if (screen_ == Screen::kSettings) detail = "Saved to graphics.ini as you change it. The game reads it when it starts.";
             if (screen_ == Screen::kSaves) {
                 if (line.empty()) line = save_size_ ? "Your island, saved " + save_when_ + "." : "No save yet: the game starts a new island.";
-                detail = "Backups go to build\\saves. Restoring backs up your current save first.";
+                detail = "Backups go to build\\saves. Restoring or importing backs up your current save first.";
             }
             if (screen_ == Screen::kControls) {
                 if (line.empty()) line = pad_name_.empty() ? "Plug in a controller at any time." : "Controller ready.";
@@ -730,6 +788,7 @@ private:
     int selected_ = 0;
     float selection_y_ = 0, fade_ = 0, time_ = 0, stick_x_ = 0, stick_y_ = 0, held_x_ = 0, held_y_ = 0;
     bool mouse_moved_ = false, quit_ = false, play_after_dialog_ = false;
+    int dialog_for_ = 0;      // kForGame / kForImport: what the folder dialog is for
     PROCESS_INFORMATION game_{};
     DWORD exit_code_ = 0;
     Uint64 started_ = 0;
@@ -772,7 +831,10 @@ void set_icon(SDL_Window* win) {
 int main(int argc, char** argv) {
     const char* shot = nullptr;
     std::string shot_screen;
+    const char* import_dir = nullptr;
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--shot")) { shot = argv[i + 1]; if (i + 2 < argc) shot_screen = argv[i + 2]; }
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--import")) import_dir = argv[i + 1];      // SAVE DATA > IMPORT A SAVE without the dialog
+    if (import_dir) shot = "";
     paths_init();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
     int ww = 1600, wh = 900;
@@ -789,10 +851,11 @@ int main(int argc, char** argv) {
     set_icon(window);
     {
         Launcher launcher(window, renderer);
+        if (import_dir) { printf("%s\n", launcher.import_now(import_dir).c_str()); fflush(stdout); }
         SDL_Texture* target = shot ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, 1600, 900) : nullptr;
         if (shot) launcher.open_screen(shot_screen);
         Uint64 last = SDL_GetTicksNS(), started = last;
-        while (launcher.running()) {
+        while (!import_dir && launcher.running()) {
             SDL_Event e;
             if (launcher.game_running() ? SDL_WaitEventTimeout(&e, 250) : SDL_PollEvent(&e)) {      // while the game runs: only wait for it
                 do launcher.event(e);
