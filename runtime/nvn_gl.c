@@ -1010,13 +1010,13 @@ uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n);
 
 /* ---- software-decoded (ASTC) textures off the render thread
  * A room or a talking scene brings dozens of ASTC textures at once; decoded here, the frame waited 100-300 ms (the game's
- * main thread with it). Up to DEC_BUDGET_MS of decoding per frame is still done here, so a few small textures appear in the
- * frame that first draws them; a large texture (256 KB of blocks and up) or anything past the budget is deswizzled here and
- * decoded by the decoder thread (below normal priority, its bands on the thread pool), and lands at the start of a later
- * batch: a frame or two late. On a first upload its small levels stand in meanwhile (tex_upload_memory); textures the game
- * makes anew with the same blocks are copied instead (twin_copy): with zeros meanwhile, the user saw heavy flicker
- * (2026-10-28). TOMO_DECODE_ASYNC=0 off. */
-#define DEC_BUDGET_MS 2
+ * main thread with it). Only a burst goes elsewhere: a large texture (256 KB of blocks and up) never seen before, once this
+ * frame has decoded DEC_BUDGET_MS here, is deswizzled here and decoded by the decoder thread (below normal priority, its
+ * bands on the thread pool), and lands at the start of a later batch, a frame or two late, its small levels standing in
+ * meanwhile (tex_upload_memory). Textures the game makes anew with the same blocks are copied instead (twin_copy). The user
+ * saw flicker each time it went further (2026-10-28): zeros meanwhile (the island), then blurry item pictures in the
+ * catalogue (small textures past a 2 ms budget, and the item's textures made anew every few frames). TOMO_DECODE_ASYNC=0 off. */
+#define DEC_BUDGET_MS 8
 typedef struct Dec { struct Dec *next; Tex *t; GLuint gl; uint32_t gen; int format, level, layer, w, h; Fmt f; uint8_t *buf; size_t lin; } Dec;
 static SRWLOCK g_dec_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_dec_cv = CONDITION_VARIABLE_INIT;      /* the decoder waits for work, dec_finish for results */
@@ -1100,10 +1100,11 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
     int defer = 0, queued = 0, keep = 0;
     if (tf && tf->sw_decode) {
         t->dec_gen++;                              /* (levels still with the decoder are older now) */
-        defer = async && dec_async() && (t->data_size >= (256u << 10) || g_dec_spent >= g_dec_budget) && g_dec_bytes < (256u << 20);
-        if (defer && !t->uploaded) {               /* first upload: the levels from `keep` (128x128 and smaller) are decoded now and
-                                                    * stand in, scaled up, for the larger ones until they land (zeros flickered: a
-                                                    * dark frame on the island whenever new textures came); no such level: decoded now */
+        defer = async && dec_async() && t->data_size >= (256u << 10) && g_dec_spent >= g_dec_budget && g_dec_bytes < (256u << 20);
+        if (defer) {                               /* (async: a first upload of blocks never seen before, tex_sync_a) the levels from
+                                                    * `keep` (128x128 and smaller) are decoded now and stand in, scaled up, for the
+                                                    * larger ones until they land (zeros flickered: a dark frame on the island whenever
+                                                    * new textures came); no such level: decoded now */
             for (keep = 1; keep < t->glevels - 1 && keep < L.levels - 1 && (long long)L.lvl_w[keep] * L.lvl_h[keep] > 128 * 128; keep++) {}
             if (gl_target(b->target, b->samples) != GL_TEXTURE_2D || L.layers != 1 || t->rw || t->glevels < 2 || L.levels < 2) defer = keep = 0;
         }
@@ -1151,6 +1152,17 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
 #define TWIN_SLOTS 4096
 static struct { uint64_t key, h; Tex *t; } g_twin[TWIN_SLOTS];
 static LONG64 g_twin_hits;
+/* Every block hash uploaded so far: blocks seen before are texels the game showed already (a texture refilled or made anew
+ * after its twin went): decoded at once, never late, so a picture on screen does not turn blurry or old for a frame. */
+#define SEEN_SLOTS (1u << 16)
+static uint64_t g_seen[SEEN_SLOTS];
+static int seen_has(uint64_t key, int add) {
+    for (unsigned i = (unsigned)(key * 0x9E3779B97F4A7C15ULL >> 48), n = 0; key && n < 64; i = (i + 1) & (SEEN_SLOTS - 1), n++) {
+        if (g_seen[i] == key) return 1;
+        if (!g_seen[i]) { if (add) g_seen[i] = key; return 0; }
+    }
+    return 0;                                      /* (a full neighbourhood: not recorded) */
+}
 static uint64_t twin_key(Tex *t, uint64_t h, int full) {      /* 0: not a candidate */
     static int on = -1;
     if (on < 0) on = !(getenv("TOMO_TWIN") && !strcmp(getenv("TOMO_TWIN"), "0"));
@@ -1216,16 +1228,17 @@ static void tex_sync_a(Tex *t, int async) {
       static LONG64 qpf; if (!qpf) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); qpf = q.QuadPart; }
       int log_it = lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln, again = t->uploaded, dirty = t->dirty;
       key = twin_key(t, h, full);
-      if (!(twin = twin_copy(t, key))) { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f, async); HS_OUT(); }
+      int seen = seen_has(key, 0);
+      if (!(twin = twin_copy(t, key))) { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f, async && !again && !seen); HS_OUT(); }
       if (log_it) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s, %.1f ms%s\n", (long long)g_st.frames,
           t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, again ? " (again)" : " (first)", dirty ? " dirty" : "",
-          (double)(pf_now() - pf0) * 1000.0 / (double)qpf, twin ? " (copied from an earlier texture)" : ""); }
+          (double)(pf_now() - pf0) * 1000.0 / (double)qpf, twin ? " (copied from an earlier texture)" : t->dec_pending ? " (deferred)" : seen ? " (seen before)" : ""); }
     pf_add(PF_TEXUP, pf0);
     GLenum e = glGetError();
     static int nlog;
     if (e) logf_limited(&nlog, 20, "nvn_gl: upload of texture %dx%d format 0x%x target %d failed with GL error 0x%x\n", t->b.width, t->b.height, t->b.format, t->b.target, e);
     t->hash = h; t->uploaded = 1; t->dirty = 0; t->upframe = g_st.frames;
-    if (key && !e) { unsigned i = (unsigned)key & (TWIN_SLOTS - 1); g_twin[i].key = key; g_twin[i].h = h; g_twin[i].t = t; }
+    if (key && !e) { unsigned i = (unsigned)key & (TWIN_SLOTS - 1); g_twin[i].key = key; g_twin[i].h = h; g_twin[i].t = t; seen_has(key, 1); }
     tex_release_packaged(t);
     g_st.tex_uploads++;
 }
