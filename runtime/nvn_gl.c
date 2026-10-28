@@ -1013,7 +1013,9 @@ uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n);
  * main thread with it). Up to DEC_BUDGET_MS of decoding per frame is still done here, so a few small textures appear in the
  * frame that first draws them; a large texture (256 KB of blocks and up) or anything past the budget is deswizzled here and
  * decoded by the decoder thread (below normal priority, its bands on the thread pool), and lands at the start of a later
- * batch: a frame or two late, zeros until then on a first upload. TOMO_DECODE_ASYNC=0: every decode here, as before. */
+ * batch: a frame or two late, zeros until then on a first upload. TOMO_DECODE_ASYNC=1 turns it on (off by default since the
+ * user saw heavy flicker on 2026-10-28: the game's texture streaming makes textures anew every few frames, each new one was
+ * zeros until its decode landed). */
 #define DEC_BUDGET_MS 2
 typedef struct Dec { struct Dec *next; Tex *t; GLuint gl; uint32_t gen; int format, level, layer, w, h; Fmt f; uint8_t *buf; size_t lin; } Dec;
 static SRWLOCK g_dec_lock = SRWLOCK_INIT;
@@ -1040,7 +1042,7 @@ static DWORD WINAPI dec_main(LPVOID arg) {
 static int dec_async(void) {
     static int on = -1;
     if (on < 0) {
-        on = !(getenv("TOMO_DECODE_ASYNC") && !strcmp(getenv("TOMO_DECODE_ASYNC"), "0")) && g_rb != &rb_vk;
+        on = getenv("TOMO_DECODE_ASYNC") && strcmp(getenv("TOMO_DECODE_ASYNC"), "0") && g_rb != &rb_vk;      /* off by default: see the comment above */
         if (on) { HANDLE h = CreateThread(NULL, 0, dec_main, NULL, 0, NULL); if (h) CloseHandle(h); else on = 0; }
         LARGE_INTEGER q; QueryPerformanceFrequency(&q); g_dec_budget = q.QuadPart * DEC_BUDGET_MS / 1000;
     }
