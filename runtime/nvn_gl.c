@@ -1013,9 +1013,9 @@ uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n);
  * main thread with it). Up to DEC_BUDGET_MS of decoding per frame is still done here, so a few small textures appear in the
  * frame that first draws them; a large texture (256 KB of blocks and up) or anything past the budget is deswizzled here and
  * decoded by the decoder thread (below normal priority, its bands on the thread pool), and lands at the start of a later
- * batch: a frame or two late, zeros until then on a first upload. TOMO_DECODE_ASYNC=1 turns it on (off by default since the
- * user saw heavy flicker on 2026-10-28: the game's texture streaming makes textures anew every few frames, each new one was
- * zeros until its decode landed). */
+ * batch: a frame or two late. On a first upload its small levels stand in meanwhile (tex_upload_memory); textures the game
+ * makes anew with the same blocks are copied instead (twin_copy): with zeros meanwhile, the user saw heavy flicker
+ * (2026-10-28). TOMO_DECODE_ASYNC=0 off. */
 #define DEC_BUDGET_MS 2
 typedef struct Dec { struct Dec *next; Tex *t; GLuint gl; uint32_t gen; int format, level, layer, w, h; Fmt f; uint8_t *buf; size_t lin; } Dec;
 static SRWLOCK g_dec_lock = SRWLOCK_INIT;
@@ -1042,7 +1042,7 @@ static DWORD WINAPI dec_main(LPVOID arg) {
 static int dec_async(void) {
     static int on = -1;
     if (on < 0) {
-        on = getenv("TOMO_DECODE_ASYNC") && strcmp(getenv("TOMO_DECODE_ASYNC"), "0") && g_rb != &rb_vk;      /* off by default: see the comment above */
+        on = !(getenv("TOMO_DECODE_ASYNC") && !strcmp(getenv("TOMO_DECODE_ASYNC"), "0")) && g_rb != &rb_vk;
         if (on) { HANDLE h = CreateThread(NULL, 0, dec_main, NULL, 0, NULL); if (h) CloseHandle(h); else on = 0; }
         LARGE_INTEGER q; QueryPerformanceFrequency(&q); g_dec_budget = q.QuadPart * DEC_BUDGET_MS / 1000;
     }
@@ -1074,6 +1074,7 @@ static void dec_finish(Tex *t) {                   /* render thread: wait for th
 }
 
 static void rb_land_range(uint64_t addr, uint64_t size);
+static void rs_blit(GLuint from, int fl, GLuint to, int tl, GLenum att, const int *a, const int *b, GLbitfield mask);
 static int g_rbp_n;
 static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
     static uint8_t *tmp;
@@ -1096,11 +1097,16 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
     Fmt sw = *f;
     tex_lay(b, &L);
     if (tf && tf->sw_decode) { sw.kind = 0; sw.format = 0x1908; sw.type = 0x1401; sw.bw = sw.bh = 1; sw.bpb = 4; }     /* decoded in software to RGBA8 */
-    int defer = 0, queued = 0;
+    int defer = 0, queued = 0, keep = 0;
     if (tf && tf->sw_decode) {
         t->dec_gen++;                              /* (levels still with the decoder are older now) */
         defer = async && dec_async() && (t->data_size >= (256u << 10) || g_dec_spent >= g_dec_budget) && g_dec_bytes < (256u << 20);
-        if (defer && !t->uploaded && gl_has(glClearTexImage, "glClearTexImage")) for (int l = 0; l < t->glevels; l++) glClearTexImage(t->o.gl, l, 0x1908, 0x1401, NULL);      /* zeros, not an old texture's texels */
+        if (defer && !t->uploaded) {               /* first upload: the levels from `keep` (128x128 and smaller) are decoded now and
+                                                    * stand in, scaled up, for the larger ones until they land (zeros flickered: a
+                                                    * dark frame on the island whenever new textures came); no such level: decoded now */
+            for (keep = 1; keep < t->glevels - 1 && keep < L.levels - 1 && (long long)L.lvl_w[keep] * L.lvl_h[keep] > 128 * 128; keep++) {}
+            if (gl_target(b->target, b->samples) != GL_TEXTURE_2D || L.layers != 1 || t->rw || t->glevels < 2 || L.levels < 2) defer = keep = 0;
+        }
     }
     for (int layer = 0; layer < L.layers; layer++) {
         for (int l = 0; l < t->glevels && l < L.levels; l++) {
@@ -1111,7 +1117,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
                 if (queued) WakeAllConditionVariable(&g_dec_cv);
                 return;
             }
-            Dec *d = defer ? malloc(sizeof *d) : NULL;
+            Dec *d = defer && (!keep || l < keep) ? malloc(sizeof *d) : NULL;
             if (d && !(d->buf = malloc(need))) { free(d); d = NULL; }
             if (d) {
                 tex_deswizzle_level(&L, l, p, d->buf);
@@ -1133,17 +1139,21 @@ static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
         }
     }
     if (queued) WakeAllConditionVariable(&g_dec_cv);
+    for (int l = 0; queued && l < keep; l++) {
+        int a[4] = {0, 0, L.lvl_w[keep], L.lvl_h[keep]}, z[4] = {0, 0, L.lvl_w[l], L.lvl_h[l]};
+        rs_blit(t->o.gl, keep, t->o.gl, l, GL_COLOR_ATTACHMENT0_, a, z, GL_COLOR_BUFFER_BIT);
+    }
 }
 
 /* ---- the same texels again: the game's texture streaming makes textures anew every few frames, the same blocks at another
  * place. A software-decoded texture whose blocks (full hash) and shape equal an earlier one's is copied from that one's GL
- * texture on the GPU instead of being decoded again (nothing to wait for, nothing blank). TOMO_TWIN=1 on. */
+ * texture on the GPU instead of being decoded again (nothing to wait for, nothing blank). TOMO_TWIN=0 off. */
 #define TWIN_SLOTS 4096
 static struct { uint64_t key, h; Tex *t; } g_twin[TWIN_SLOTS];
 static LONG64 g_twin_hits;
 static uint64_t twin_key(Tex *t, uint64_t h, int full) {      /* 0: not a candidate */
     static int on = -1;
-    if (on < 0) on = getenv("TOMO_TWIN") && strcmp(getenv("TOMO_TWIN"), "0");      /* off until tested on the island */
+    if (on < 0) on = !(getenv("TOMO_TWIN") && !strcmp(getenv("TOMO_TWIN"), "0"));
     const TexFormat *tf = tex_format(t->b.format);
     if (!on || !tf || !tf->sw_decode || (t->b.flags & 0x10) || t->rw) return 0;
     uint64_t k = full ? h : mem_hash(tex_source(t), t->data_size, 1);
