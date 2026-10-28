@@ -1090,18 +1090,21 @@ static void decode_rows(int nf, const TexFormat *f, const void *src, int w, int 
 #include <windows.h>
 /* A large image is decoded by the system thread pool in bands of 16 block rows: an ASTC 2048x2048 took 100+ ms on the
  * render thread alone (hitches whenever the island streamed textures in). Each band writes its own rows only. */
-typedef struct { int nf; const TexFormat *f; const void *src; int w, h, hb; uint8_t *dst; volatile LONG next; } Bands;
+typedef struct { int nf; const TexFormat *f; const void *src; int w, h, hb; uint8_t *dst; volatile LONG next; int prio; } Bands;
 static void CALLBACK decode_band(PTP_CALLBACK_INSTANCE inst, void *arg, PTP_WORK work) {
     Bands *b = arg;
-    (void)inst; (void)work;
+    int prio = inst ? GetThreadPriority(GetCurrentThread()) : b->prio;
+    (void)work;
+    if (prio != b->prio) SetThreadPriority(GetCurrentThread(), b->prio);      /* the caller's (nvn_gl.c: the decoder thread is below normal) */
     for (LONG i; (i = InterlockedIncrement(&b->next) - 1) * 16 < b->hb;)
         decode_rows(b->nf, b->f, b->src, b->w, b->h, b->dst, (int)i * 16, (int)i * 16 + 16 < b->hb ? (int)i * 16 + 16 : b->hb);
+    if (prio != b->prio) SetThreadPriority(GetCurrentThread(), prio);
 }
 static int decode_parallel(int nf, const TexFormat *f, const void *src, int w, int h, uint8_t *dst, int wb, int hb) {
     static int off = -1;
     if (off < 0) off = getenv("TOMO_DECODE_THREADS") && !strcmp(getenv("TOMO_DECODE_THREADS"), "0");
     if (off || (long long)wb * hb < 1024 || hb < 32) return 0;      /* 1024: a 512x512 ASTC 6x6 (7,396 blocks) took 6 ms alone */
-    Bands b = {nf, f, src, w, h, hb, dst, 0};
+    Bands b = {nf, f, src, w, h, hb, dst, 0, GetThreadPriority(GetCurrentThread())};
     PTP_WORK work = CreateThreadpoolWork(decode_band, &b, NULL);
     if (!work) return 0;
     SYSTEM_INFO si;

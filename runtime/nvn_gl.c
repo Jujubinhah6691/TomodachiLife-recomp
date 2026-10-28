@@ -1008,9 +1008,72 @@ static void ww_note(uint64_t addr, uint64_t size) {      /* the emulator wrote g
  * the stamp the caller remembers? 0 = the memory is not write-watched. Render thread only. */
 uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n); }
 
+/* ---- software-decoded (ASTC) textures off the render thread
+ * A room or a talking scene brings dozens of ASTC textures at once; decoded here, the frame waited 100-300 ms (the game's
+ * main thread with it). Up to DEC_BUDGET_MS of decoding per frame is still done here, so a few small textures appear in the
+ * frame that first draws them; a large texture (256 KB of blocks and up) or anything past the budget is deswizzled here and
+ * decoded by the decoder thread (below normal priority, its bands on the thread pool), and lands at the start of a later
+ * batch: a frame or two late, zeros until then on a first upload. TOMO_DECODE_ASYNC=0: every decode here, as before. */
+#define DEC_BUDGET_MS 2
+typedef struct Dec { struct Dec *next; Tex *t; GLuint gl; uint32_t gen; int format, level, layer, w, h; Fmt f; uint8_t *buf; size_t lin; } Dec;
+static SRWLOCK g_dec_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_dec_cv = CONDITION_VARIABLE_INIT;      /* the decoder waits for work, dec_finish for results */
+static Dec *g_dec_todo, **g_dec_tail = &g_dec_todo, *volatile g_dec_done;
+static LONG64 g_dec_spent, g_dec_budget;          /* render thread: QPC ticks of decoding this frame (job_present resets it) */
+static size_t g_dec_bytes;                         /* render thread: held by queued levels (past 256 MB the decoding is done here again) */
+static DWORD WINAPI dec_main(LPVOID arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);     /* the game's threads first; its bands inherit it */
+    for (;;) {
+        AcquireSRWLockExclusive(&g_dec_lock);
+        while (!g_dec_todo) SleepConditionVariableSRW(&g_dec_cv, &g_dec_lock, INFINITE, 0);
+        Dec *d = g_dec_todo;
+        if (!(g_dec_todo = d->next)) g_dec_tail = &g_dec_todo;
+        ReleaseSRWLockExclusive(&g_dec_lock);
+        tex_decode_rgba8(d->format, d->buf, d->w, d->h, d->buf + d->lin);
+        AcquireSRWLockExclusive(&g_dec_lock);
+        d->next = g_dec_done; g_dec_done = d;
+        ReleaseSRWLockExclusive(&g_dec_lock);
+        WakeAllConditionVariable(&g_dec_cv);
+    }
+}
+static int dec_async(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = !(getenv("TOMO_DECODE_ASYNC") && !strcmp(getenv("TOMO_DECODE_ASYNC"), "0")) && g_rb != &rb_vk;
+        if (on) { HANDLE h = CreateThread(NULL, 0, dec_main, NULL, 0, NULL); if (h) CloseHandle(h); else on = 0; }
+        LARGE_INTEGER q; QueryPerformanceFrequency(&q); g_dec_budget = q.QuadPart * DEC_BUDGET_MS / 1000;
+    }
+    return on;
+}
+static void tex_put(Tex *t, const Fmt *f, int level, int layer, int x, int y, int z, int w, int h, int d, const void *data);
+static void dec_land(void) {                       /* render thread: the decoded levels into their textures */
+    if (!g_dec_done) return;
+    AcquireSRWLockExclusive(&g_dec_lock);
+    Dec *d = g_dec_done; g_dec_done = NULL;
+    ReleaseSRWLockExclusive(&g_dec_lock);
+    for (Dec *next; d; d = next) {
+        next = d->next;
+        Tex *t = d->t;
+        if (t->o.gl == d->gl && t->dec_gen == d->gen) tex_put(t, &d->f, d->level, d->layer, 0, 0, 0, d->w, d->h, 1, d->buf + d->lin);      /* (else newer texels came, or its GL object went) */
+        t->dec_pending--;
+        g_dec_bytes -= d->lin + (size_t)d->w * d->h * 4;
+        free(d->buf); free(d);
+    }
+    while (glGetError()) {}
+}
+static void dec_finish(Tex *t) {                   /* render thread: wait for the texture's levels (a copy or a CPU write of it comes next) */
+    while (t->dec_pending > 0) {
+        AcquireSRWLockExclusive(&g_dec_lock);
+        if (!g_dec_done) SleepConditionVariableSRW(&g_dec_cv, &g_dec_lock, 100, 0);
+        ReleaseSRWLockExclusive(&g_dec_lock);
+        dec_land();
+    }
+}
+
 static void rb_land_range(uint64_t addr, uint64_t size);
 static int g_rbp_n;
-static void tex_upload_memory(Tex *t, const Fmt *f) {
+static void tex_upload_memory(Tex *t, const Fmt *f, int async) {
     static uint8_t *tmp;
     static size_t tmp_cap;
     static int nlog;
@@ -1031,28 +1094,50 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
     Fmt sw = *f;
     tex_lay(b, &L);
     if (tf && tf->sw_decode) { sw.kind = 0; sw.format = 0x1908; sw.type = 0x1401; sw.bw = sw.bh = 1; sw.bpb = 4; }     /* decoded in software to RGBA8 */
+    int defer = 0, queued = 0;
+    if (tf && tf->sw_decode) {
+        t->dec_gen++;                              /* (levels still with the decoder are older now) */
+        defer = async && dec_async() && (t->data_size >= (256u << 10) || g_dec_spent >= g_dec_budget) && g_dec_bytes < (256u << 20);
+        if (defer && !t->uploaded && gl_has(glClearTexImage, "glClearTexImage")) for (int l = 0; l < t->glevels; l++) glClearTexImage(t->o.gl, l, 0x1908, 0x1401, NULL);      /* zeros, not an old texture's texels */
+    }
     for (int layer = 0; layer < L.layers; layer++) {
         for (int l = 0; l < t->glevels && l < L.levels; l++) {
             const uint8_t *p = tex_level_ptr(&L, src, l, layer);
             size_t lin = L.lvl_linear_size[l], need = lin + (tf && tf->sw_decode ? (size_t)L.lvl_w[l] * L.lvl_h[l] * 4 : 0);
             if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) {
                 logf_limited(&nlog, 20, "nvn_gl: texture %dx%d format 0x%x level %d layer %d runs past its memory pool; not uploaded\n", b->width, b->height, b->format, l, layer);
+                if (queued) WakeAllConditionVariable(&g_dec_cv);
                 return;
+            }
+            Dec *d = defer ? malloc(sizeof *d) : NULL;
+            if (d && !(d->buf = malloc(need))) { free(d); d = NULL; }
+            if (d) {
+                tex_deswizzle_level(&L, l, p, d->buf);
+                d->t = t; d->gl = t->o.gl; d->gen = t->dec_gen; d->format = b->format; d->level = l; d->layer = layer; d->w = L.lvl_w[l]; d->h = L.lvl_h[l]; d->f = sw; d->lin = lin; d->next = NULL;
+                t->dec_pending++; queued = 1; g_dec_bytes += need;
+                AcquireSRWLockExclusive(&g_dec_lock); *g_dec_tail = d; g_dec_tail = &d->next; ReleaseSRWLockExclusive(&g_dec_lock);
+                g_st.tex_bytes += (LONG64)lin;
+                continue;
             }
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
             if (tf && tf->sw_decode) {
+                LONG64 d0 = pf_now();
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 tex_put(t, &sw, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin);
+                g_dec_spent += pf_now() - d0;
             } else tex_put(t, f, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l], tmp);
             g_st.tex_bytes += (LONG64)lin;
         }
     }
+    if (queued) WakeAllConditionVariable(&g_dec_cv);
 }
 
-/* Make the GL texture exist and hold what the guest memory holds. */
-static void tex_sync(Tex *t) {
+/* Make the GL texture exist and hold what the guest memory holds. async: only sampled next (its decoded levels may land a
+ * frame or two late, dec_*); otherwise the levels still with the decoder are waited for. */
+static void tex_sync_a(Tex *t, int async) {
     Fmt f;
+    if (t->dec_pending && !async) dec_finish(t);
     if (t->dead) return;                           /* finalized: its memory may hold something else now */
     if (!t->o.gl) tex_realize(t);
     if (t->label_dirty && t->o.gl) { t->label_dirty = 0; if (glObjectLabel) glObjectLabel(0x1702 /* TEXTURE */, t->o.gl, -1, nvn_label_get(t->guest)); }
@@ -1082,7 +1167,7 @@ static void tex_sync(Tex *t) {
       static int ln = -2; if (ln == -2) ln = getenv("TOMO_UPLOADLOG_N") ? atoi(getenv("TOMO_UPLOADLOG_N")) : 2;
       static LONG64 qpf; if (!qpf) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); qpf = q.QuadPart; }
       int log_it = lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln, again = t->uploaded, dirty = t->dirty;
-      { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f); HS_OUT(); }
+      { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f, async); HS_OUT(); }
       if (log_it) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s, %.1f ms\n", (long long)g_st.frames,
           t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, again ? " (again)" : " (first)", dirty ? " dirty" : "",
           (double)(pf_now() - pf0) * 1000.0 / (double)qpf); }
@@ -1094,6 +1179,7 @@ static void tex_sync(Tex *t) {
     tex_release_packaged(t);
     g_st.tex_uploads++;
 }
+static void tex_sync(Tex *t) { tex_sync_a(t, 0); }
 
 static void eview_base(Tex *t, EView *e) {
     memset(e, 0, sizeof *e);
@@ -1385,7 +1471,7 @@ static uint64_t handle_make(Tex *t, View v, SamplerParams p, int have_sampler, u
      * there (its texture streaming moves the house's textures every few frames: they turned black or dark red for a frame). */
     if (!t || (t->dead && !t->o.gl)) return g_dummy_handle;
     t->last_bind = g_st.frames;
-    tex_sync(t);
+    tex_sync_a(t, 1);
     TexObj *o = tex_view_obj(t, &v);
     {   /* what TXQ reports, and whether the shader must use an integer sampler */
         Fmt f;
@@ -1441,7 +1527,7 @@ static int resolve_names(TexPool *tp, SamplerPool *sp, uint64_t nh, GLuint *tex,
     if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { p = sp->e[sid]; have_sampler = 1; }
     ReleaseSRWLockShared(&g_pool_lock);
     if (!t || t->dead) return 0;
-    tex_sync(t);
+    tex_sync_a(t, 1);
     *tex = tex_view_obj(t, &v)->gl;
     *smp = have_sampler ? sampler_gl(&p) : 0;
     return 1;
@@ -6002,6 +6088,7 @@ static void job_submit(void *arg) {
     g_arena_gen++;                               /* guest memory may have changed since the last batch */
     ww_scan_regions();                           /* which: the arena keeps what nobody wrote */
     bl_update();
+    dec_land();
     LONG64 pf0 = pf_now();
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     compute_flush_async();                       /* the guest may read what compute wrote once its fence after this batch has passed */
@@ -6233,6 +6320,7 @@ static void joblog(void (*fn)(void *), LONG64 t) {
 }
 static void job_present(void *arg) {
     if (g_rbp_n) rb_land(0);
+    g_dec_spent = 0;
     pair_off();
     pw_gate();
     PresentJob *j = arg;
@@ -8287,7 +8375,7 @@ void nvn_front_memory_retire(uint64_t addr, uint64_t size) {
         if (hit) { Range range = {addr, size}; gl_run(job_rb_land_range, &range); } }   /* OpenGL: no barrier by default since 2026-10-23 (TOMO_RETIRE_BARRIER=1 restores it): the game frees storage only after its fences (nvnSyncWait), which pass through the render thread, and read-backs over the freed range land first (above); the barrier made the game wait 18 ms a frame for the render thread (house close-up 20 -> 25 fps). The sea foam that once drew wrong without it looked the same in a side-by-side check. */
 }
 /* Seam step S2: the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
-static void rb_gl_idle(void) { gl_housekeeping(); if (g_rbp_n) rb_land(0); }     /* read-backs land as soon as the GPU is done (the game reads some results without a fence: late data made the island's shadows jump) */
+static void rb_gl_idle(void) { gl_housekeeping(); if (g_rbp_n) rb_land(0); dec_land(); }     /* read-backs land as soon as the GPU is done (the game reads some results without a fence: late data made the island's shadows jump) */
 const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_present_movie, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,
                         job_write_texels, job_read_texels, job_housekeeping, job_reset_status, job_grid, rb_gl_idle};
 
