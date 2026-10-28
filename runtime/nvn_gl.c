@@ -1080,9 +1080,12 @@ static void tex_sync(Tex *t) {
     pf0 = pf_now();
     { static int lf = -2; if (lf == -2) lf = getenv("TOMO_UPLOADLOG") ? atoi(getenv("TOMO_UPLOADLOG")) : -1;
       static int ln = -2; if (ln == -2) ln = getenv("TOMO_UPLOADLOG_N") ? atoi(getenv("TOMO_UPLOADLOG_N")) : 2;
-      if (lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s\n", (long long)g_st.frames,
-          t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, t->uploaded ? " (again)" : " (first)", t->dirty ? " dirty" : ""); }
-    { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f); HS_OUT(); }
+      static LONG64 qpf; if (!qpf) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); qpf = q.QuadPart; }
+      int log_it = lf >= 0 && g_st.frames >= lf && g_st.frames < lf + ln, again = t->uploaded, dirty = t->dirty;
+      { HS_IN("texture upload (deswizzle, decode, glTexSubImage)", 0); tex_upload_memory(t, &f); HS_OUT(); }
+      if (log_it) printf("uploadlog: frame %lld: texture target %d %dx%dx%d format 0x%x levels %d flags 0x%x %llu bytes gl %u%s%s, %.1f ms\n", (long long)g_st.frames,
+          t->b.target, t->b.width, t->b.height, t->b.depth, t->b.format, t->b.levels, (unsigned)t->b.flags, (unsigned long long)t->data_size, t->o.gl, again ? " (again)" : " (first)", dirty ? " dirty" : "",
+          (double)(pf_now() - pf0) * 1000.0 / (double)qpf); }
     pf_add(PF_TEXUP, pf0);
     GLenum e = glGetError();
     static int nlog;
