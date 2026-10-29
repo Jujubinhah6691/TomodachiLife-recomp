@@ -103,11 +103,11 @@ TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's 
               'fd37507c8476a6d14cc7c4b352401f31bcbd0f0d995d35390811e968c466f46e', 'imgui', 'imgui.h'),
 }
 
-# The prebuilt runtime package of the GitHub Release of this version (scripts/make_release.py): (URL, SHA-256 of the zip).
+# The prebuilt runtime package of this version (scripts/make_release.py): (URL, SHA-256 of the zip). It sits beside the
+# other installer downloads (MIRROR), not on the game's release page: unpacked there by hand it passed for the game.
 # (None, None) until the maintainer has uploaded the package made from this commit and written its hash here; the
 # download is refused when the hash does not match, and setup.py uses the package only with the tree it was built from.
-RUNTIME_RELEASE = ('https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases/download/v0.1.0-beta/tomodachi-runtime-fd9c42201f.zip',
-                   '1f7cd5bebb78007d09f5b65111120891be1dfbaceabec5a3aecc8bf2dbd66113')
+RUNTIME_RELEASE = (MIRROR + 'tomodachi-runtime-e9555d34e2.zip', '4a2768abf5a91f24315bdae34444014d15a737b9218b39294ad0865ca3b98606')
 
 SETUP_STEPS = ['deps', 'stage', 'convert', 'tables', 'lift', 'sdk', 'compile', 'link', 'prepare']
 # expected seconds, measured 2026-10-28 on a PC with 9 jobs, 16 GB (compile scales with 12 / jobs)
