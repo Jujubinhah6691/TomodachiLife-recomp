@@ -724,6 +724,9 @@ def step_link(cx):
     for f in (EXE, 'SDL3.dll', GAME_DLL):
         if not os.path.exists(os.path.join(cx.work, f)):
             raise Fail('%s was not produced' % f)
+    if os.path.exists(os.path.join(cx.work, 'tomodachi.ico')):     # exes copied again (a new package): the prepare step's icon back in
+        import launcher_art
+        launcher_art.stamp_icon(cx.work)
     opus = copy_opus(cx)
     ff = copy_ffmpeg(cx)
     say('  %s, SDL3.dll%s %s%s; %s %.0f MB linked here%s' % (
@@ -774,7 +777,7 @@ def step_prepare(cx):
     say('  shader store: %s' % os.path.join(cx.build, 'cache', 'shader_store'))
     try:
         cx.run('prepare', [sys.executable, os.path.join(REPO, 'scripts', 'launcher_art.py'), game, cx.build], cwd=REPO)
-        say('  launcher logo: %s' % os.path.join(cx.work, 'title-logo.png'))
+        say('  launcher logo and icon: %s' % os.path.join(cx.work, 'title-logo.png'))
     except Fail as e:                         # the launcher then writes the name in text
         say('  WARNING: the launcher\'s logo could not be made: %s' % str(e).splitlines()[0])
 
