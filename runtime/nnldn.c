@@ -537,6 +537,10 @@ static void ldn_GetSecurityParameter(Ctx *c) {
     RET(ok ? 0 : R_LDN_STATE);
 }
 static void ldn_GetDisconnectReason(Ctx *c) { RET((uint32_t)L.reason); }
+static void ldn_SetProtocol(Ctx *c) {      /* Result (Protocol): Tomodachi Life calls it before opening a station or access point; nothing to model */
+    if (LOGL(1)) printf("[online] ldn SetProtocol(%d)%c", (int)c->x[0], 10);
+    RET(0);                                 /* (left as it came, x0 = the protocol, 1: the game took it as a failure and said "A communication error has occurred") */
+}
 static void ldn_SetAdvertiseData(Ctx *c) {
     uint64_t size = c->x[1] < 0x180 ? c->x[1] : 0x180;
     AcquireSRWLockExclusive(&L.lock);
@@ -571,7 +575,8 @@ static void ldn_SetWirelessControllerRestriction(Ctx *c) { RET(0); }
 #define ALL_ONES 0xffffffffu
 enum { E_BADF = 9, E_AGAIN = 11, E_INVAL = 22, E_MFILE = 24, E_DESTADDRREQ = 89, E_MSGSIZE = 90, E_NOPROTOOPT = 92,
        E_PROTONOSUPPORT = 93, E_OPNOTSUPP = 95, E_AFNOSUPPORT = 97, E_ADDRINUSE = 98, E_ADDRNOTAVAIL = 99,
-       E_NETUNREACH = 101, E_NOTCONN = 107, E_CONNREFUSED = 111 };
+       E_NETUNREACH = 101, E_CONNRESET = 104, E_ISCONN = 106, E_NOTCONN = 107, E_TIMEDOUT = 110, E_CONNREFUSED = 111,
+       E_INPROGRESS = 115 };
 typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; uint8_t data[]; } Dgram;
 typedef struct {
     int open, type, flags, nonblock, reuse, shut_rd, shut_wr;
@@ -579,6 +584,12 @@ typedef struct {
     uint16_t port, peer_port;
     Dgram *head, *tail;
     uint32_t count, bytes;
+    /* a stream (type 1, virtual TCP: vt_* below) */
+    int st, err, listener, taken;     /* st: VT_*; err: why it ended; listener: the listening fd an accepted one came from */
+    uint32_t conn;                    /* connection id, chosen by the side that connects */
+    uint8_t *rx; uint32_t rx_len, rx_cap, rx_next;          /* received in order, not read yet; the next byte expected */
+    uint8_t *tx; uint32_t tx_len, tx_base, tx_sent;         /* not acknowledged yet (tx[0] is byte tx_base); tx_sent of them went out */
+    uint64_t rto_at, heard, born, ka_at; uint32_t rto; int peer_fin, fin_sent;
 } VSock;
 #define VS_MAX 128
 static VSock vs[VS_MAX];
@@ -587,7 +598,7 @@ static CONDITION_VARIABLE vs_cv = CONDITION_VARIABLE_INIT;
 static uint16_t vs_next_port = 49152;
 static volatile LONG64 vs_in, vs_out;
 
-static VSock *vsock(int fd) { return fd >= 0 && fd < VS_MAX && vs[fd].open ? &vs[fd] : NULL; }
+static VSock *vsock(int fd) { return fd >= 0 && fd < VS_MAX && vs[fd].open == 1 ? &vs[fd] : NULL; }      /* (open 2: a closed stream still sending) */
 static int *errno_ptr(Ctx *c) {
     uint64_t keep = c->x[0];
     ImportFn f = import_lookup("__errno_location");
@@ -636,10 +647,158 @@ static void drop_queue(VSock *s) {
     while (s->head) { Dgram *d = s->head; s->head = d->next; free(d); }
     s->tail = NULL;
     s->count = s->bytes = 0;
+    free(s->rx); free(s->tx);
+    s->rx = s->tx = NULL;
+    s->rx_len = s->rx_cap = s->tx_len = 0;
 }
+
+/* ---- streams (virtual TCP). Tomodachi Life's Local Play listens, accepts and connects stream sockets; the virtual network
+ * carries datagrams only (the lobby's relay or a direct UDP path, either may lose or reorder one). A stream is segments of
+ * those: header 'V' 'T' kind flags, connection id, seq, ack (16 bytes, little-endian), then the bytes. SYN / SYNACK open it,
+ * DATA carries bytes at seq (in order only: anything else is dropped and the next byte expected acknowledged again), ACK
+ * acknowledges every byte before ack, FIN ends the sending side at seq, RST ends it all. The sender keeps what is not
+ * acknowledged and sends it again from the oldest byte when the timer (vt_thread) finds no progress (go-back-N, 64 KB in
+ * flight, segments of 1200 bytes). A datagram is a stream's when a stream socket is bound to its port; others stay UDP. */
+enum { VT_CLOSED = 0, VT_LISTEN, VT_SYN_SENT, VT_OPEN };
+enum { VK_SYN = 1, VK_SYNACK, VK_DATA, VK_ACK, VK_FIN, VK_RST };
+#define VT_SEG 1200
+#define VT_FLIGHT 65536u
+#define VT_TXCAP (1u << 20)
+#define VT_RXCAP (4u << 20)
+typedef struct Out { struct Out *next; uint32_t src, dst, len; uint16_t sport, dport; uint8_t d[]; } Out;
+static Out *vt_seg(Out *list, const VSock *s, int kind, int flags, uint32_t seq, uint32_t ack, const uint8_t *data, uint32_t len) {
+    Out *o = malloc(sizeof *o + 16 + len);
+    if (!o) return list;
+    o->next = list; o->src = s->ip ? s->ip : net_my_ip(); o->dst = s->peer_ip; o->sport = s->port; o->dport = s->peer_port; o->len = 16 + len;
+    o->d[0] = 'V'; o->d[1] = 'T'; o->d[2] = (uint8_t)kind; o->d[3] = (uint8_t)flags;
+    memcpy(o->d + 4, &s->conn, 4); memcpy(o->d + 8, &seq, 4); memcpy(o->d + 12, &ack, 4);
+    if (len) memcpy(o->d + 16, data, len);
+    return o;
+}
+void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len);
+static void vt_flush(Out *o) {                     /* (vs_lock NOT held) the segments built under it, oldest first */
+    Out *rev = NULL;
+    while (o) { Out *n = o->next; o->next = rev; rev = o; o = n; }
+    for (uint32_t me = net_my_ip(); rev; ) {
+        Out *n = rev->next;
+        if (rev->dst == me || rev->dst == LOOPBACK) nnldn_deliver(rev->dst == LOOPBACK ? LOOPBACK : me, rev->sport, rev->dst, rev->dport, rev->d, rev->len);
+        else { net_send(me, rev->sport, rev->dst, rev->dport, rev->d, rev->len); InterlockedIncrement64(&vs_out); }
+        free(rev);
+        rev = n;
+    }
+}
+static Out *vt_pump(VSock *s, Out *o, int resend) {   /* (vs_lock held) what may go out now: from the oldest byte when resend */
+    uint64_t now = ms_now();
+    if (s->st != VT_OPEN) return o;
+    if (resend) s->tx_sent = 0;
+    while (s->tx_sent < s->tx_len && s->tx_sent < VT_FLIGHT) {
+        uint32_t n = s->tx_len - s->tx_sent;
+        if (n > VT_SEG) n = VT_SEG;
+        o = vt_seg(o, s, VK_DATA, 0, s->tx_base + s->tx_sent, s->rx_next, s->tx + s->tx_sent, n);
+        s->tx_sent += n;
+    }
+    if (s->shut_wr && !s->tx_len && (!s->fin_sent || resend)) { o = vt_seg(o, s, VK_FIN, 0, s->tx_base, s->rx_next, NULL, 0); s->fin_sent = 1; }
+    if ((s->tx_sent || (s->fin_sent && s->shut_wr)) && !s->rto_at) s->rto_at = now + s->rto;
+    return o;
+}
+static VSock *vt_find(uint32_t src, uint16_t sport, uint16_t dport, uint32_t conn) {   /* (vs_lock held) the stream of that connection */
+    for (int i = 0; i < VS_MAX; i++)
+        if (vs[i].open && vs[i].type == 1 && vs[i].st >= VT_SYN_SENT && vs[i].port == dport && vs[i].peer_ip == src && vs[i].peer_port == sport && vs[i].conn == conn) return &vs[i];
+    return NULL;
+}
+static int vt_deliver(uint32_t src, uint16_t sport, uint16_t dport, const uint8_t *p, uint32_t len) {   /* 1: a stream's segment */
+    int kind = p[2], flags = p[3];
+    if (kind < VK_SYN || kind > VK_RST) return 0;
+    uint32_t conn, seq, ack;
+    memcpy(&conn, p + 4, 4); memcpy(&seq, p + 8, 4); memcpy(&ack, p + 12, 4);
+    const uint8_t *data = p + 16;
+    uint32_t n = len - 16;
+    Out *o = NULL;
+    int used = 0;
+    (void)flags;
+    AcquireSRWLockExclusive(&vs_lock);
+    VSock *s = vt_find(src, sport, dport, conn);
+    if (!s && kind == VK_SYN) {                   /* a new connection: a child of the socket listening there, accept() takes it */
+        for (int i = 0; i < VS_MAX && !s; i++) if (vs[i].open && vs[i].type == 1 && vs[i].st == VT_LISTEN && vs[i].port == dport) {
+            for (int j = 0; j < VS_MAX; j++) if (!vs[j].open) {
+                VSock *c = &vs[j];
+                memset(c, 0, sizeof *c);
+                c->open = 1; c->type = 1; c->st = VT_OPEN; c->listener = i + 1; c->ip = vs[i].ip; c->port = dport;
+                c->peer_ip = src; c->peer_port = sport; c->conn = conn; c->rto = 300; c->born = c->heard = ms_now();
+                c->rcvbuf = c->sndbuf = 0x10000;
+                s = c;
+                if (LOGL(1)) { char a[16]; ip_str(src, a); printf("[online] stream: %s:%u connects to port %u (fd %d, for fd %d)\n", a, sport, dport, j, i); }
+                break;
+            }
+            used = 1;
+        }
+    }
+    if (s) {
+        used = 1;
+        s->heard = ms_now();
+        switch (kind) {
+        case VK_SYN: o = vt_seg(o, s, VK_SYNACK, 0, 0, 0, NULL, 0); break;              /* (again when the SYNACK was lost) */
+        case VK_SYNACK: if (s->st == VT_SYN_SENT) { s->st = VT_OPEN; s->rto_at = 0; o = vt_pump(s, o, 0); } break;
+        case VK_RST: s->st = VT_CLOSED; s->err = E_CONNRESET; break;
+        case VK_FIN: if (seq == s->rx_next) s->peer_fin = 1; o = vt_seg(o, s, VK_ACK, 1, 0, s->rx_next, NULL, 0); break;
+        case VK_DATA:
+            if (seq == s->rx_next && !s->peer_fin && s->rx_len + n <= VT_RXCAP) {
+                if (s->rx_len + n > s->rx_cap) { uint32_t cap = s->rx_cap ? s->rx_cap : 65536; while (cap < s->rx_len + n) cap *= 2; uint8_t *r = realloc(s->rx, cap); if (r) { s->rx = r; s->rx_cap = cap; } }
+                if (s->rx_len + n <= s->rx_cap) { memcpy(s->rx + s->rx_len, data, n); s->rx_len += n; s->rx_next += n; }
+            }
+            o = vt_seg(o, s, VK_ACK, 0, 0, s->rx_next, NULL, 0);
+            /* fall through: a DATA segment acknowledges too */
+        case VK_ACK:
+            if (s->st == VT_OPEN && ack - s->tx_base <= s->tx_len && ack != s->tx_base) {
+                uint32_t k = ack - s->tx_base;
+                memmove(s->tx, s->tx + k, s->tx_len - k);
+                s->tx_len -= k; s->tx_base = ack; s->tx_sent = s->tx_sent > k ? s->tx_sent - k : 0;
+                s->rto = 300; s->rto_at = 0;
+                o = vt_pump(s, o, 0);
+            }
+            if (kind == VK_ACK && (flags & 1)) s->rto_at = 0;                       /* our FIN arrived */
+            break;
+        }
+    } else if (!s && kind != VK_RST) {          /* nothing here knows that connection (nobody listens there): the sender is told */
+        VSock t; memset(&t, 0, sizeof t); t.peer_ip = src; t.peer_port = sport; t.port = dport; t.conn = conn;
+        o = vt_seg(o, &t, VK_RST, 0, 0, 0, NULL, 0);
+    }
+    used = 1;
+    ReleaseSRWLockExclusive(&vs_lock);
+    if (used) WakeAllConditionVariable(&vs_cv);
+    vt_flush(o);
+    return used;
+}
+static DWORD WINAPI vt_thread(LPVOID arg) {        /* retransmission, and connections that stopped answering */
+    (void)arg;
+    for (;;) {
+        Sleep(30);
+        Out *o = NULL;
+        int woke = 0;
+        uint64_t now = ms_now();
+        AcquireSRWLockExclusive(&vs_lock);
+        for (int i = 0; i < VS_MAX; i++) {
+            VSock *s = &vs[i];
+            if (s->open == 2 && (s->st != VT_OPEN || (!s->tx_len && s->fin_sent && !s->rto_at) || now - s->born > 5000)) { drop_queue(s); memset(s, 0, sizeof *s); continue; }
+            if (!s->open || s->type != 1 || (s->st != VT_OPEN && s->st != VT_SYN_SENT)) continue;
+            if (now - s->heard > 20000) { s->st = VT_CLOSED; s->err = E_TIMEDOUT; woke = 1; continue; }       /* 20 s of silence */
+            if (s->st == VT_OPEN && now >= s->ka_at) { o = vt_seg(o, s, VK_ACK, 0, 0, s->rx_next, NULL, 0); s->ka_at = now + 4000; }   /* keepalive: an idle session (choosing a Mii) stays */
+            if (!s->rto_at || now < s->rto_at) continue;
+            if (s->st == VT_SYN_SENT) o = vt_seg(o, s, VK_SYN, 0, 0, 0, NULL, 0);
+            else o = vt_pump(s, o, 1);
+            s->rto = s->rto < 2000 ? s->rto * 2 : 2000;
+            s->rto_at = now + s->rto;
+        }
+        ReleaseSRWLockExclusive(&vs_lock);
+        if (woke) WakeAllConditionVariable(&vs_cv);
+        vt_flush(o);
+    }
+}
+static void vt_start(void) { static LONG once; if (!InterlockedExchange(&once, 1)) { HANDLE h = CreateThread(NULL, 0, vt_thread, NULL, 0, NULL); if (h) CloseHandle(h); } }
 
 void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
     if (dport == VNET_LDN_PORT) { if (sport == VNET_LDN_PORT) ldn_receive(src, data, len); return; }
+    if (len >= 16 && ((const uint8_t *)data)[0] == 'V' && ((const uint8_t *)data)[1] == 'T' && vt_deliver(src, sport, dport, data, len)) return;
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST, got = 0;
     AcquireSRWLockExclusive(&vs_lock);
     for (int i = 0; i < VS_MAX; i++) {
@@ -698,13 +857,15 @@ static void so_bind(Ctx *c) {
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] bind(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
     if (err) fail(c, err); else RET(0);
 }
+static void vt_connect(Ctx *c, int fd, uint32_t ip, uint16_t port);
 static void so_connect(Ctx *c) {
     int fd = (int)c->x[0], err;
     uint32_t ip = 0;
     uint16_t port = 0;
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    err = !s ? E_BADF : !read_sa(c->x[1], (uint32_t)c->x[2], &ip, &port) ? E_INVAL : s->type == 1 ? E_CONNREFUSED : 0;
+    err = !s ? E_BADF : !read_sa(c->x[1], (uint32_t)c->x[2], &ip, &port) ? E_INVAL : 0;
+    if (!err && s->type == 1) { ReleaseSRWLockExclusive(&vs_lock); vt_connect(c, fd, ip, port); return; }
     if (!err) { if (!s->port) s->port = free_port(s); s->peer_ip = ip; s->peer_port = port; }
     ReleaseSRWLockExclusive(&vs_lock);
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] connect(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
@@ -740,7 +901,9 @@ static void do_send(Ctx *c, int fd, uint64_t buf, uint64_t len, uint64_t addr, u
     }
     RET(len);
 }
-static void so_send(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], 0, 0); }
+static void vt_send(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags);
+static int is_stream(int fd) { AcquireSRWLockShared(&vs_lock); VSock *s = vsock(fd); int r = s && s->type == 1; ReleaseSRWLockShared(&vs_lock); return r; }
+static void so_send(Ctx *c) { if (is_stream((int)c->x[0])) vt_send(c, (int)c->x[0], c->x[1], c->x[2], (int)c->x[3]); else do_send(c, (int)c->x[0], c->x[1], c->x[2], 0, 0); }
 static void so_sendto(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], c->x[4], (uint32_t)c->x[5]); }
 
 static int wait_vs(uint64_t deadline) {   /* (vs_lock held) 0 once the deadline has passed */
@@ -780,9 +943,93 @@ static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint6
     write_sa(addr, alenp, ip, port);
     RET(n);
 }
-static void so_recv(Ctx *c) { do_recv(c, (int)c->x[0], c->x[1], c->x[2], (int)c->x[3], 0, 0); }
+static void vt_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags);
+static void so_recv(Ctx *c) { if (is_stream((int)c->x[0])) vt_recv(c, (int)c->x[0], c->x[1], c->x[2], (int)c->x[3]); else do_recv(c, (int)c->x[0], c->x[1], c->x[2], (int)c->x[3], 0, 0); }
 static void so_recvfrom(Ctx *c) { do_recv(c, (int)c->x[0], c->x[1], c->x[2], (int)c->x[3], c->x[4], c->x[5]); }
 
+static void vt_connect(Ctx *c, int fd, uint32_t ip, uint16_t port) {
+    int err = 0;
+    Out *o = NULL;
+    vt_start();
+    AcquireSRWLockExclusive(&vs_lock);
+    VSock *s = vsock(fd);
+    if (!s) err = E_BADF;
+    else if (s->st == VT_OPEN) err = E_ISCONN;
+    else if (s->st != VT_SYN_SENT) {
+        if (!s->port && !(s->port = free_port(s))) err = E_ADDRINUSE;
+        if (!err) {
+            uint64_t now = ms_now();
+            s->peer_ip = ip; s->peer_port = port; s->st = VT_SYN_SENT; s->err = 0; s->rto = 300; s->rto_at = now + 300; s->heard = s->born = now;
+            s->conn = (uint32_t)(now * 2654435761u) ^ (uint32_t)fd << 24 ^ (uint32_t)GetCurrentThreadId() << 8 ^ net_my_ip();
+            o = vt_seg(o, s, VK_SYN, 0, 0, 0, NULL, 0);
+        }
+    }
+    if (!err && s->nonblock) err = E_INPROGRESS;
+    ReleaseSRWLockExclusive(&vs_lock);
+    vt_flush(o);
+    if (!err) {                                   /* blocking: until it opens or fails (10 s) */
+        uint64_t deadline = ms_now() + 10000;
+        AcquireSRWLockExclusive(&vs_lock);
+        for (;;) {
+            if (!(s = vsock(fd))) { err = E_BADF; break; }
+            if (s->st == VT_OPEN) break;
+            if (s->st == VT_CLOSED) { err = s->err == E_CONNRESET ? E_CONNREFUSED : s->err ? s->err : E_CONNREFUSED; break; }
+            if (!wait_vs(deadline)) { err = E_TIMEDOUT; s->st = VT_CLOSED; break; }
+        }
+        ReleaseSRWLockExclusive(&vs_lock);
+    }
+    if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] stream connect(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
+    if (err) fail(c, err); else RET(0);
+}
+static void vt_send(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags) {
+    int err = 0;
+    uint32_t n = 0;
+    Out *o = NULL;
+    AcquireSRWLockExclusive(&vs_lock);
+    VSock *s;
+    for (;;) {
+        if (!(s = vsock(fd))) { err = E_BADF; break; }
+        if (s->st != VT_OPEN) { err = s->err ? s->err : E_NOTCONN; break; }
+        if (s->shut_wr) { err = 32; break; }      /* EPIPE */
+        if (s->tx_len < VT_TXCAP) break;
+        if (s->nonblock || (flags & 0x80)) { err = E_AGAIN; break; }
+        wait_vs(~0ull);
+    }
+    if (!err && !s->tx && !(s->tx = malloc(VT_TXCAP))) err = E_AGAIN;
+    if (!err) {
+        n = VT_TXCAP - s->tx_len < len ? VT_TXCAP - s->tx_len : (uint32_t)len;
+        memcpy(s->tx + s->tx_len, PTR(buf), n);
+        s->tx_len += n;
+        o = vt_pump(s, o, 0);
+    }
+    ReleaseSRWLockExclusive(&vs_lock);
+    vt_flush(o);
+    if (LOGL(3)) printf("[online] stream send(%d, %llu) = %d\n", fd, (unsigned long long)len, err ? -err : (int)n);
+    if (err) fail(c, err); else RET(n);
+}
+static void vt_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags) {
+    int err = 0;
+    AcquireSRWLockExclusive(&vs_lock);
+    VSock *s = vsock(fd);
+    uint64_t deadline = s && s->rcvtimeo ? ms_now() + s->rcvtimeo : ~0ull;
+    for (;;) {
+        if (!(s = vsock(fd))) { err = E_BADF; break; }
+        if (s->rx_len) break;
+        if (s->peer_fin || s->shut_rd) { ReleaseSRWLockExclusive(&vs_lock); RET(0); return; }
+        if (s->st == VT_CLOSED) { err = s->err ? s->err : E_NOTCONN; break; }
+        if (s->nonblock || (flags & 0x80)) { err = E_AGAIN; break; }
+        if (!wait_vs(deadline)) { err = E_AGAIN; break; }
+    }
+    uint32_t n = 0;
+    if (!err) {
+        n = s->rx_len < len ? s->rx_len : (uint32_t)len;
+        memcpy(PTR(buf), s->rx, n);
+        if (!(flags & 2)) { memmove(s->rx, s->rx + n, s->rx_len - n); s->rx_len -= n; }
+    }
+    ReleaseSRWLockExclusive(&vs_lock);
+    if (LOGL(3)) printf("[online] stream recv(%d, %llu) = %d\n", fd, (unsigned long long)len, err ? -err : (int)n);
+    if (err) fail(c, err); else RET(n);
+}
 static void so_poll(Ctx *c) {             /* (pollfd {int fd; short events, revents} *, nfds, timeout ms) */
     uint64_t fds = c->x[0], nfds = c->x[1];
     int timeout = (int)c->x[2];
@@ -802,7 +1049,14 @@ static void so_poll(Ctx *c) {             /* (pollfd {int fd; short events, reve
             else {
                 if (s->head) re |= ev & (0x1 | 0x40);
                 if (s->type == 2 && !s->shut_wr) re |= ev & 0x4;
-                if (s->shut_rd && s->type == 1) re |= 0x10;
+                if (s->type == 1 && s->st == VT_LISTEN) {
+                    for (int j = 0; j < VS_MAX; j++) if (vs[j].open == 1 && vs[j].listener == fd + 1) { re |= ev & (0x1 | 0x40); break; }
+                } else if (s->type == 1) {
+                    if (s->rx_len || s->peer_fin || s->st == VT_CLOSED) re |= ev & (0x1 | 0x40);
+                    if (s->st == VT_OPEN && !s->shut_wr && s->tx_len < VT_TXCAP) re |= ev & 0x4;
+                    if (s->st == VT_CLOSED && s->err) re |= 0x8;
+                    if (s->peer_fin || s->shut_rd) re |= 0x10;
+                }
             }
             st16(p + 6, re);
             ready += re != 0;
@@ -882,8 +1136,10 @@ static void so_shutdown(Ctx *c) {
     int fd = (int)c->x[0], how = (int)c->x[1];
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    if (s) { if (how != 1) s->shut_rd = 1; if (how != 0) s->shut_wr = 1; }
+    Out *o = NULL;
+    if (s) { if (how != 1) s->shut_rd = 1; if (how != 0) s->shut_wr = 1; if (s->type == 1 && how != 0) o = vt_pump(s, o, 0); }      /* a stream: FIN after what is queued */
     ReleaseSRWLockExclusive(&vs_lock);
+    vt_flush(o);
     WakeAllConditionVariable(&vs_cv);
     if (!s) fail(c, E_BADF); else RET(0);
 }
@@ -891,24 +1147,50 @@ static void so_close(Ctx *c) {
     int fd = (int)c->x[0];
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
+    Out *o = NULL;
+    if (s && s->type == 1) for (int j = 0; j < VS_MAX; j++)                  /* connections nobody accepted: refused */
+        if (vs[j].open == 1 && vs[j].listener == fd + 1) { o = vt_seg(o, &vs[j], VK_RST, 0, 0, 0, NULL, 0); drop_queue(&vs[j]); memset(&vs[j], 0, sizeof vs[j]); }
+    if (s && s->type == 1 && s->st == VT_OPEN) {                              /* what is queued still goes, then FIN (vt_thread frees it) */
+        s->shut_wr = 1; o = vt_pump(s, o, 0); s->open = 2; s->born = ms_now(); s->listener = 0;
+    } else if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
     ReleaseSRWLockExclusive(&vs_lock);
+    vt_flush(o);
     WakeAllConditionVariable(&vs_cv);
     if (LOGL(2)) printf("[online] close(%d)\n", fd);
     if (!s) fail(c, E_BADF); else RET(0);
 }
 static void so_listen(Ctx *c) {
-    VSock *s = vsock((int)c->x[0]);
-    if (!s) fail(c, E_BADF); else if (s->type != 1) fail(c, E_OPNOTSUPP); else RET(0);
-}
-static void so_accept(Ctx *c) {           /* no stream ever connects on the virtual network: wait until the socket goes */
-    int fd = (int)c->x[0], err;
+    int fd = (int)c->x[0], err = 0;
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    err = !s ? E_BADF : s->nonblock ? E_AGAIN : 0;
-    while (!err) { wait_vs(~0ull); if (!(s = vsock(fd)) || s->shut_rd) err = E_BADF; }
+    if (!s) err = E_BADF;
+    else if (s->type != 1) err = E_OPNOTSUPP;
+    else if (!s->port && !(s->port = free_port(s))) err = E_ADDRINUSE;
+    else s->st = VT_LISTEN;
+    uint16_t port = s ? s->port : 0;
     ReleaseSRWLockExclusive(&vs_lock);
-    fail(c, err);
+    if (!err) vt_start();
+    if (LOGL(1)) printf("[online] stream listen(%d) on port %u = %d\n", fd, port, err ? -err : 0);
+    if (err) fail(c, err); else RET(0);
+}
+static void so_accept(Ctx *c) {           /* (fd, sockaddr *, len *): a connection vt_deliver opened for this listening socket */
+    int fd = (int)c->x[0], err = 0, got = -1;
+    AcquireSRWLockExclusive(&vs_lock);
+    for (;;) {
+        VSock *s = vsock(fd);
+        if (!s || s->type != 1) { err = E_BADF; break; }
+        if (s->st != VT_LISTEN) { err = E_INVAL; break; }
+        for (int j = 0; j < VS_MAX && got < 0; j++) if (vs[j].open == 1 && vs[j].listener == fd + 1) got = j;
+        if (got >= 0) break;
+        if (s->nonblock) { err = E_AGAIN; break; }
+        wait_vs(~0ull);
+    }
+    uint32_t ip = 0; uint16_t port = 0;
+    if (got >= 0) { vs[got].listener = 0; vs[got].nonblock = vs[fd].nonblock; ip = vs[got].peer_ip; port = vs[got].peer_port; }      /* (non-blocking inherited, as the console's BSD stack does: blocking, the game's first read of it never returned) */
+    ReleaseSRWLockExclusive(&vs_lock);
+    if (got >= 0) write_sa(c->x[1], c->x[2], ip, port);
+    if (LOGL(1)) printf("[online] stream accept(%d) = %d\n", fd, got >= 0 ? got : -err);
+    if (err) fail(c, err); else RETI(got);
 }
 
 /* ================================================================== registration */
@@ -934,16 +1216,16 @@ void nnldn_register(void) {
         {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_CreateNetworkPrivate},
         {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_Connect},
         {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_ConnectPrivate},
-        {LDNK("19GetDisconnectReasonEv"), ldn_GetDisconnectReason},
+        {LDNK("19GetDisconnectReasonEv"), ldn_GetDisconnectReason}, {LDNK("11SetProtocolENS0_8ProtocolE"), ldn_SetProtocol},
         {SOK("6SocketEiii"), so_socket}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), so_socket}, {"nnsocketSocket", so_socket},
         {SOK("5CloseEi"), so_close}, {"nnsocketClose", so_close},
         {SOK("4BindEiPK8sockaddrj"), so_bind}, {SOK("4BindEiPKNS0_8SockAddrEj"), so_bind}, {"nnsocketBind", so_bind},
-        {SOK("7ConnectEiPK8sockaddrj"), so_connect}, {"nnsocketConnect", so_connect},
-        {SOK("6ListenEii"), so_listen}, {SOK("8ShutdownEii"), so_shutdown}, {SOK("6AcceptEiP8sockaddrPj"), so_accept},
+        {SOK("7ConnectEiPK8sockaddrj"), so_connect}, {SOK("7ConnectEiPKNS0_8SockAddrEj"), so_connect}, {"nnsocketConnect", so_connect},
+        {SOK("6ListenEii"), so_listen}, {SOK("8ShutdownEii"), so_shutdown}, {SOK("6AcceptEiP8sockaddrPj"), so_accept}, {SOK("6AcceptEiPNS0_8SockAddrEPj"), so_accept},
         {SOK("11GetSockNameEiP8sockaddrPj"), so_getsockname}, {"nnsocketGetSockName", so_getsockname}, {"nnsocketGetPeerName", so_getpeername},
-        {SOK("4RecvEiPvmi"), so_recv}, {"nnsocketRecv", so_recv},
+        {SOK("4RecvEiPvmi"), so_recv}, {SOK("4RecvEiPvmNS0_7MsgFlagE"), so_recv}, {"nnsocketRecv", so_recv},
         {SOK("8RecvFromEiPvmiP8sockaddrPj"), so_recvfrom}, {SOK("8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj"), so_recvfrom},
-        {SOK("4SendEiPKvmi"), so_send}, {"nnsocketSend", so_send},
+        {SOK("4SendEiPKvmi"), so_send}, {SOK("4SendEiPKvmNS0_7MsgFlagE"), so_send}, {"nnsocketSend", so_send},
         {SOK("6SendToEiPKvmiPK8sockaddrj"), so_sendto}, {SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), so_sendto},
         {SOK("5FcntlEiiz"), so_fcntl}, {"nnsocketFcntl", so_fcntl},
         {SOK("4PollEP6pollfdmi"), so_poll}, {"nnsocketPoll", so_poll},

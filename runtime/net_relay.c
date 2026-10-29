@@ -1163,6 +1163,21 @@ static const char *ip_text(uint32_t ip, char *b) { snprintf(b, 16, "%u.%u.%u.%u"
 
 static uint16_t g_upnp_mapped;
 static void upnp_cleanup(void) { if (g_upnp_mapped) upnp_unmap_udp(g_upnp_mapped); }
+/* The room code where the player sees it: the window's title (display.c), and the clipboard, ready to paste to a friend. */
+static void show_room(const char *what, const char *code, int clip) {
+    void display_room_note(const char *s);
+    char t[72];
+    snprintf(t, sizeof t, "%s %s", what, code);
+    display_room_note(t);
+    if (clip && OpenClipboard(NULL)) {
+        size_t n = strlen(code) + 1;
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
+        char *m = g ? GlobalLock(g) : NULL;
+        EmptyClipboard();
+        if (m) { memcpy(m, code, n); GlobalUnlock(g); if (!SetClipboardData(CF_TEXT, g)) GlobalFree(g); }
+        CloseClipboard();
+    }
+}
 static int start_host(void) {                   /* HOST mode: the lobby in this game, its code, the NAT opened if we can */
     uint16_t port = g_host_port;
     uint32_t lan = outbound_ip(), pub = 0;
@@ -1190,11 +1205,13 @@ static int start_host(void) {                   /* HOST mode: the lobby in this 
     if (pub) {
         code_of(pub, mapped ? port : pub_port, code);
         snprintf(g_room_code, sizeof g_room_code, "%s", code);
+        show_room("Local Play room code (copied):", code, 1);
         say("host: ROOM CODE %s (internet, %s:%u); on the same network: %s (%s:%u)", code, ip_text(pub, a), mapped ? port : pub_port, lan_code, ip_text(lan, b), port);
         if (!mapped && pub != lan)
             say("host: no port mapping: if the other player cannot join, forward UDP port %u to %s on the router, or set online_peer = <the joiner's code>, or use lobby mode", port, ip_text(lan, b));
     } else {
         snprintf(g_room_code, sizeof g_room_code, "%s", lan_code);
+        show_room("Local Play room code, this network only (copied):", lan_code, 1);
         say("host: ROOM CODE %s (this network only, %s:%u: the public address is not known)", lan_code, ip_text(lan ? lan : 0x7f000001u, b), port);
     }
     for (char *s = g_peer; *s;) {                             /* online_peer = code[,code...]: open our NAT towards them */
@@ -1429,7 +1446,8 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             g_cookie = g64(buf + 16);
             g_last_pong = ms_now();
             last_ping = 0;
-            if (!g_joined) { char a[16]; say("joined the lobby %s:%u as 10.13.%u.%u (code %s)", ip_text(ntohl(g_lobby.sin_addr.s_addr), a), ntohs(g_lobby.sin_port), g_ip >> 8 & 255, g_ip & 255, g_code); }
+            if (!g_joined) { char a[16]; say("joined the lobby %s:%u as 10.13.%u.%u (code %s)", ip_text(ntohl(g_lobby.sin_addr.s_addr), a), ntohs(g_lobby.sin_port), g_ip >> 8 & 255, g_ip & 255, g_code);
+                             if (g_mode == NET_MODE_JOIN) show_room("Local Play: in room", g_join, 0); }
             InterlockedExchange(&g_joined, 1);
             break;
         case T_REJECT:

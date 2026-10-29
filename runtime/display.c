@@ -418,6 +418,8 @@ static DWORD WINAPI close_watchdog(LPVOID arg) {
  * 1280x720 screen (the 16:9 picture, centred in a wider window) and the buttons (bit 0 left, bit 1 right), while this window
  * is the foreground one and the cursor is over the picture. The arrow is hidden over the window while the hand follows it. */
 static volatile LONG g_mouse_hand_tick, g_mouse_wheel;
+static char g_title_note[72];                       /* after the frame counter in the title (net_relay.c: the Local Play room code) */
+void display_room_note(const char *s) { snprintf(g_title_note, sizeof g_title_note, "%s", s ? s : ""); }
 void display_mouse_hand(void) { InterlockedExchange(&g_mouse_hand_tick, (LONG)GetTickCount()); }
 int display_mouse_wheel(void) { return (int)InterlockedExchange(&g_mouse_wheel, 0); }      /* notches since the last call, + = away from the user */
 int display_mouse(float *x, float *y, int *buttons) {
@@ -858,6 +860,7 @@ static void frame_queued(void) {
             snprintf(title, sizeof title, "%s - frame %lld - %lld fps - %.2f ms per frame", g_title, (long long)n, (long long)second_frames, ms);
         } else
         snprintf(title, sizeof title, "%s - frame %lld - %lld fps", g_title, (long long)n, (long long)second_frames);
+        if (g_title_note[0]) { size_t k = strlen(title); snprintf(title + k, sizeof title - k, " - %s", g_title_note); }
         SetWindowTextA(g_hwnd, title);
         second_frames = 0;
         second_start = now;

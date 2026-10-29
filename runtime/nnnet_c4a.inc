@@ -312,6 +312,11 @@ static void socket_Finalize(Ctx *c) {
     g_so_init = 0;
     RET(0);
 }
+static void socket_InitializeConfig(Ctx *c) {             /* (const Config &) -> Result: Tomodachi Life's Local Play; the pool settings are not needed here */
+    if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+    g_so_init = 1;
+    RET(0);
+}
 static void socket_GetLastErrno2(Ctx *c) { if (!g_so_init) RETI(22); else RETI(*so_errno_ptr(c)); }
 static void socket_SetLastErrno2(Ctx *c) { int e = (int)A0; so_set_errno(c, e); }
 
@@ -1061,8 +1066,8 @@ static void c4a_register(void) {
         {"_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", nifm_GetCurrentIpConfigInfo},
         {"_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", nifm_GetCurrentProxySetting},
         {"_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", nifm_HandleNetworkRequestErrorResult},
-        {SOK("10InitializeEPvmmi"), socket_Initialize}, {SOK("8FinalizeEv"), socket_Finalize},
-        {SOK("12GetLastErrnoEv"), socket_GetLastErrno2}, {"nnsocketGetLastErrno", socket_GetLastErrno2}, {"nnsocketSetLastErrno", socket_SetLastErrno2},
+        {SOK("10InitializeEPvmmi"), socket_Initialize}, {SOK("10InitializeERKNS0_6ConfigE"), socket_InitializeConfig}, {SOK("8FinalizeEv"), socket_Finalize},
+        {SOK("12GetLastErrnoEv"), socket_GetLastErrno2}, {SOK("12GetLastErrorEv"), socket_GetLastErrno2}, {"nnsocketGetLastErrno", socket_GetLastErrno2}, {"nnsocketSetLastErrno", socket_SetLastErrno2},
         {SOK("6SocketEiii"), socket_Socket}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), socket_Socket}, {"nnsocketSocket", socket_Socket},
         {SOK("5CloseEi"), socket_Close}, {"nnsocketClose", socket_Close},
         {SOK("4BindEiPK8sockaddrj"), socket_Bind}, {SOK("4BindEiPKNS0_8SockAddrEj"), socket_BindSockAddr}, {"nnsocketBind", socket_Bind},

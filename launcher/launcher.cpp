@@ -193,6 +193,8 @@ const std::vector<Option>& options() {
         {"LANGUAGE", "language", "auto", {{"auto", "Automatic"}, {"en", "English"}, {"fr", "Francais"}, {"de", "Deutsch"}, {"es", "Espanol"}, {"it", "Italiano"}, {"nl", "Nederlands"}, {"ja", "Japanese"}}},
         {"IN-GAME MENU (F1)", "menu", "on", {{"on", "On"}, {"off", "Off"}}},
         {"FRAME-TIME COUNTER", "frame_time_overlay", "off", {{"off", "Off"}, {"on", "On"}}},
+        // Local Play (the game's Mii and creation exchange) over a network instead of the console's radio (net_relay.c)
+        {"LOCAL PLAY ONLINE", "online_mode", "off", {{"off", "Off"}, {"lan", "Same network"}, {"host", "Host: share a room code"}, {"join", "Join a friend's code"}}},
     };
     return o;
 }
@@ -432,10 +434,13 @@ private:
                      {"MORE", ""},
                      {"QUIT", ""}};
             break;
-        case Screen::kSettings:
+        case Screen::kSettings: {
             for (const Option& o : options()) list_.push_back({o.label, option_value(o), true});
+            const std::string code = gfx_.get("online_join", "");
+            list_.push_back({"ROOM CODE TO JOIN", code.empty() ? "Copy a friend's code, then press" : code + "  -  press to paste another"});
             list_.push_back({"BACK", ""});
             break;
+        }
         case Screen::kSaves:
             list_.push_back({"BACK UP NOW", ""});
             list_.push_back({"IMPORT A SAVE", "Choose a folder"});
@@ -496,6 +501,7 @@ private:
             break;
         case Screen::kSettings:
             if (i == int(list_.size()) - 1) back();
+            else if (i == int(options().size())) paste_room_code();
             else change(1);
             break;
         case Screen::kSaves: {
@@ -528,6 +534,24 @@ private:
             else back();
             break;
         }
+    }
+
+    /* Local Play over the internet (net_relay.c): the host's game shows its room code in its title and copies it; the
+     * friend copies it from a chat and pastes it here. A code is 10 Crockford base-32 characters, shown as XXXXX-XXXXX. */
+    void paste_room_code() {
+        char* clip = SDL_GetClipboardText();
+        std::string code;
+        for (const char* p = clip ? clip : ""; *p && code.size() < 11; p++) {
+            const char ch = (char)toupper((unsigned char)*p);
+            if (isalnum((unsigned char)ch)) { if (code.size() == 5) code += '-'; code += ch; }
+        }
+        SDL_free(clip);
+        note_ok_ = code.size() == 11;
+        if (!note_ok_) { note_ = "No room code on the clipboard: copy the 10-character code your friend sent (XXXXX-XXXXX)."; build_items(); return; }
+        gfx_.set("online_join", code);
+        gfx_.set("online_mode", "join");
+        note_ = "Room code " + code + " saved: LOCAL PLAY ONLINE is set to Join. Start the game and open Local Play.";
+        build_items();
     }
 
     bool backup_now(const std::string& tag) {
