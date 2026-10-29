@@ -412,7 +412,7 @@ static void launch_defaults(void) {
 }
 /* The message of a start that cannot work, on the console and on stderr. A box on the screen as well, unless the run is a
  * scripted one or SSBU_ERROR_DIALOG=0 (the rule of nnmisc.c err_dialog: tests never hang on a dialog). Exit code 2. */
-static void romfs_fail(const char *msg) {
+void romfs_fail(const char *msg) {
     const char *off = getenv("SSBU_ERROR_DIALOG");
     int quiet = (off && off[0] == '0') || getenv("SSBU_SEQ") || getenv("SSBU_PLAY") || getenv("SSBU_PRESS") || getenv("SSBU_SCRIPT");
     printf("\n%s\n", msg);

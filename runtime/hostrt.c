@@ -1302,6 +1302,15 @@ void runtime_init(const char *elf, const char *trace_path) {
     if (fread(mem, 1, g_main.file_image, f) != g_main.file_image) { fprintf(stderr, "short read on image\n"); exit(1); }
     fclose(f);
     load_dynamic();
+    {   /* the game library is lifted from ONE build of main: with another build's main.elf (1.0.0 vs an update) its code
+         * would run at the wrong addresses. Its copy of main's symbol table (dyn_syms) tells them apart. */
+        void romfs_fail(const char *msg);           /* boot.c */
+        int differ = (uint64_t)dyn_sym_count != (g_main.strtab - g_main.symtab) / 24;
+        for (int i = 1; !differ && i < dyn_sym_count; i++)
+            differ = dyn_syms[i].defined && dyn_syms[i].value != rd64(GUEST_BASE + g_main.symtab + (uint64_t)i * 24 + 8);
+        if (differ) romfs_fail("The game was built from another version of Tomodachi Life than the game files chosen now (base "
+                               "game vs an update). Choose the game folder it was built from, or build again from this one.");
+    }
 
     unsigned long long rel = 0, sym_int = 0, sym_ext = 0, sym_weak = 0, other = 0;
     const uint64_t tables[2][2] = {{g_main.rela, g_main.relasz}, {g_main.jmprel, g_main.pltrelsz}};

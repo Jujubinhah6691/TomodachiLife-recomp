@@ -1187,6 +1187,17 @@ void sdk_host_override(const char *name, ImportFn fn);   /* sdklift_rt.c */
 /* TOMO_HEAPLOG=1 (diagnosis): every failed allocation of the game's sead::ExpHeap::tryAlloc [game 0x71001e68c0]
  * (this, size, alignment) with the heap's name (sead::Heap: the name pointer after the IDisposer, +0x20) and its size. */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk/hook_host.c */
+/* The game addresses written here are 1.0.0's (main's code 0x25ce6a0 bytes). Update v262144 (code 0x256d250 bytes) has the
+ * same functions elsewhere (found by their code; the struct offsets they use are unchanged). Any other build gets no hook. */
+static int tomo_hook(uint64_t a, void (*repl)(Ctx *, void *), ImportFn *orig) {
+    static const uint64_t v262144[][2] = {{0x71008ce838ull, 0x7100897d48ull}, {0x71006ec3c0ull, 0x71006ce020ull},
+        {0x710022dce0ull, 0x7100241170ull}, {0x71005e1ffcull, 0x71005824b8ull}, {0x71001e68c0ull, 0x7100232360ull}};
+    uint64_t at = 0;
+    if (g_main.text_size == 0x25ce6a0) at = a;
+    else if (g_main.text_size == 0x256d250)
+        for (size_t i = 0; i < sizeof v262144 / sizeof v262144[0]; i++) if (v262144[i][0] == a) at = v262144[i][1];
+    return at && hook_install(at, repl, NULL, orig);
+}
 static ImportFn g_try_alloc;
 const char *guest_thread_name_of(DWORD tid);               /* os_threads.c */
 static const char *heap_name(uint64_t heap) {
@@ -1300,7 +1311,7 @@ static void layout_cam_wide(Ctx *c, void *user) {
 static void persp_install(void) {
     void nvn_wide_camera(void);
     if (getenv("TOMO_WIDE_CAMERA") && getenv("TOMO_WIDE_CAMERA")[0] == '0') return;
-    if (hook_install(0x71008ce838ull, persp_wide, NULL, &g_persp) && hook_install(0x71006ec3c0ull, layout_cam_wide, NULL, &g_layout_cam)) nvn_wide_camera();
+    if (tomo_hook(0x71008ce838ull, persp_wide, &g_persp) && tomo_hook(0x71006ec3c0ull, layout_cam_wide, &g_layout_cam)) nvn_wide_camera();
     else printf("widescreen: the camera projection hook is not installed (the 3D view is squeezed instead)\n");
 }
 /* The hand pointer follows the mouse (nnhid.c mouse_poll). [0x710022dce0] (pointer) updates the hand once a frame: it
@@ -1325,13 +1336,13 @@ static void pointer_hook(Ctx *c, void *user) {
 }
 static void pointer_install(void) {
     if (getenv("TOMO_MOUSE") && getenv("TOMO_MOUSE")[0] == '0') return;
-    if (!hook_install(0x710022dce0ull, pointer_hook, NULL, &g_pointer_update)) printf("mouse: the hand pointer hook is not installed (the mouse cannot move the hand)%c", 10);
+    if (!tomo_hook(0x710022dce0ull, pointer_hook, &g_pointer_update)) printf("mouse: the hand pointer hook is not installed (the mouse cannot move the hand)%c", 10);
 }
 static void heaplog_install(void) {
     trace_install();
-    if (getenv("TOMO_TASKLOG")) printf("tasklog: hook %s\n", hook_install(0x71005e1ffcull, tasklog_step, NULL, &g_task_step) ? "installed" : "NOT installed");
+    if (getenv("TOMO_TASKLOG")) printf("tasklog: hook %s\n", tomo_hook(0x71005e1ffcull, tasklog_step, &g_task_step) ? "installed" : "NOT installed");
     if (!getenv("TOMO_HEAPLOG")) return;
-    printf("heaplog: hook %s\n", hook_install(0x71001e68c0ull, heaplog_try_alloc, NULL, &g_try_alloc) ? "installed" : "NOT installed");
+    printf("heaplog: hook %s\n", tomo_hook(0x71001e68c0ull, heaplog_try_alloc, &g_try_alloc) ? "installed" : "NOT installed");
 }
 
 /* TEST ONLY, TOMO_MEMSCAN=<step>:<op>,... with SSBU_SEQ: a search for a game value that follows the input (the hand cursor).

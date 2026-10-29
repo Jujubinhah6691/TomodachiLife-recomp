@@ -864,6 +864,8 @@ _ZN2nn5codec17GetOpusPacketSizeEPKhm
 lift _ZN2nn5codec17GetOpusPacketSizeEPKhm
 _ZN2nn3ngc12CountNumbersEPKc
 lift _ZN2nn3ngc12CountNumbersEPKc
+_ZN2nn3ngc12CountNumbersEPKDs
+lift _ZN2nn3ngc12CountNumbersEPKDs
 __cxa_demangle
 lift __cxa_demangle
 cbrtf
