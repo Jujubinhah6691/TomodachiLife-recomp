@@ -5,7 +5,7 @@
 
 * Music: the game's Opus streams are decoded by libopus, which runtime/nnaudio.c loads at run time (opus.dll or
   libopus-0.dll, next to the exe or named by SSBU_OPUS_DLL). fetch_opus() downloads a pinned prebuilt x64 libopus
-  (MSYS2's ucrt64 package of Opus 1.6.1, BSD licence) from repo.msys2.org, checks the package's SHA-256, unpacks
+  (MSYS2's ucrt64 package of Opus 1.6.1, BSD licence; a copy on this project's release), checks the package's SHA-256, unpacks
   libopus-0.dll, checks the DLL's SHA-256, checks that it imports only Windows system DLLs (the Universal CRT forwarders
   and KERNEL32: no libgcc / libwinpthread to ship) and that it exports the three functions nnaudio.c needs, and puts it
   in <deps>/opus/ (the folder scripts/setup.py already looks in). Download the .zst needs the `zstandard` module (pip
@@ -34,8 +34,11 @@ import urllib.request
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# MSYS2's package (repo.msys2.org/mingw/ucrt64 drops old versions) and the FFmpeg zip of ssbu-recomp's release, both kept
+# on this project's own release, byte for byte (the SHA-256 below)
+MIRROR = 'https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases/download/v0.1.0-beta/'
 OPUS_PKG = 'mingw-w64-ucrt-x86_64-opus-1.6.1-2-any.pkg.tar.zst'
-OPUS_URL = 'https://repo.msys2.org/mingw/ucrt64/' + OPUS_PKG
+OPUS_URL = MIRROR + OPUS_PKG
 OPUS_PKG_SHA256 = 'bb114bcf26225f50f874497ebfd6b8224fff2a20bda3f8ee45cd07ce5f02657b'
 OPUS_DLL_MEMBER = 'ucrt64/bin/libopus-0.dll'
 OPUS_DLL_SHA256 = 'e747edad6bf02cf5cdcce417b95be3b7ba108f93df1b024778be5d73fa6dae39'
@@ -48,7 +51,7 @@ SYSTEM_DLLS = {'kernel32.dll', 'ntdll.dll', 'user32.dll', 'advapi32.dll', 'ucrtb
 # Opus decoders, built by scripts/ffmpeg/build_ffmpeg_win.sh and packed by scripts/ffmpeg/package_ffmpeg.py (bin/ with the
 # five DLLs, include/ with the headers the runtime is compiled against, COPYING.LGPLv2.1, README.txt).
 FFMPEG_ZIP = 'ssbu-ffmpeg-8.1.3-lgpl-win64.zip'
-FFMPEG_URL = 'https://github.com/Denkishi/ssbu-recomp/releases/download/ffmpeg-8.1.3-lgpl/' + FFMPEG_ZIP
+FFMPEG_URL = MIRROR + FFMPEG_ZIP
 FFMPEG_ZIP_SHA256 = '47f0bb9ec3e1d3095625bb3272e7005d203b33e415d475fe051e9fe66ea69171'
 FFMPEG_DLLS = {     # load order: each one imports only the ones before it and Windows' own DLLs
     'avutil-60.dll': '5e492b29140b9cb5801ba2c0c4a5c6b2f29984638ee488c0c520991ad83f34c6',

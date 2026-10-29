@@ -82,6 +82,9 @@ MSVC_WINGET = ('winget install --id Microsoft.VisualStudio.2022.BuildTools -e --
 PKGS = ['zstandard', 'Pillow', 'pycryptodome']
 # name -> (url, sha256 or None, folder in deps, file that proves the folder is complete). A None hash refuses the download
 # until the maintainer has checked the archive and written its hash here.
+# Third-party files this project hosts itself, as assets of its v0.1.0-beta release (keep that release): the same bytes as
+# their first source, checked by the same SHA-256 (LLVM, FFmpeg, libopus, two suyu source files)
+MIRROR = 'https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases/download/v0.1.0-beta/'
 TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's installer has a good signature of the
             # LLVM release key B6C8 F982 82B9 44E3 B0D5 C253 0FC3 042E 345A D05D (LLVM-9.0.0-win64.exe.sig)
     'sdl3': ('https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-devel-3.4.18-VC.zip',
@@ -90,8 +93,9 @@ TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's 
                        '0f55079543cfbf023bda65f81bd2d5a1bab581f31e5c33cf9fd781bd754ebaba', 'Vulkan-Headers', os.path.join('include', 'vulkan', 'vulkan.h')),
     # LLVM 9 as a plain zip (no installer: no administrator prompt, and nothing to uninstall when another LLVM is on the
     # PC, which made the official installer fail with "uninstall failed"): the files of the official LLVM-9.0.0-win64.exe
-    # (SHA-256 71ed99a6...8863, signed) extracted with 7-Zip, unchanged, only what the build uses (README.txt inside)
-    'llvm': ('https://github.com/Denkishi/ssbu-recomp/releases/download/llvm-9.0.0-portable/llvm-9.0.0-win64-portable.zip',
+    # (SHA-256 71ed99a6...8863, signed) extracted with 7-Zip, unchanged, only what the build uses (README.txt inside); the
+    # zip of ssbu-recomp's release, kept on this project's own release (MIRROR) so the install never depends on another's
+    'llvm': (MIRROR + 'llvm-9.0.0-win64-portable.zip',
              '0e0c34046589a73efef3e2a4c06335815681afbc7c883b665cdbed98669a22e3', 'llvm', os.path.join('bin', 'clang.exe')),
     # Dear ImGui (MIT), optional: GitHub publishes no digest for tag archives, so this hash is the archive checked on
     # 2026-10-19 (2,021,831 bytes)
@@ -583,9 +587,9 @@ def step_dump(cx):
 
 
 # ------------------------------------------------------------------------------------------------------ 6. tools
-SUYU_BASE = 'https://raw.githubusercontent.com/suyu-emu/suyu-v0.0.4/c0dd2ff554327657f0c6318f29b740ac7e329ea0/'
-# the two files of a yuzu-family source tree that tools/lifter/gen_sdktest.py reads (default Miis for the self-test), from a
-# pinned commit of suyu (GPL-3.0); hashes of the files as GitHub serves them (LF line ends)
+# the two files of a yuzu-family source tree that tools/lifter/gen_sdktest.py reads (default Miis for the self-test), from
+# suyu-emu/suyu-v0.0.4 commit c0dd2ff5 (MIT / GPL-3.0), mirrored by name on this project's release (MIRROR); hashes of the
+# files as GitHub served them (LF line ends)
 SUYU_FILES = {'src/core/hle/service/mii/types/raw_data.cpp': '0f5b10dcde4038024fffd6079d75cd4bad8d72486efcf1ffa06e6c779803c486',
               'src/core/hle/service/mii/mii_types.h': 'cf2e0c990b881c238f5b7fd823f33fe2c0a8d0846cdbf012ec6f702b1647f3e1'}
 
@@ -596,7 +600,7 @@ def fetch_suyu():
         out = os.path.join(dst, *rel.split('/'))
         if os.path.exists(out):
             continue
-        data = urllib.request.urlopen(SUYU_BASE + rel).read()
+        data = urllib.request.urlopen(MIRROR + rel.rsplit('/', 1)[1]).read()
         if hashlib.sha256(data).hexdigest() != sha:
             raise Stop('suyu %s: the download does not match its SHA-256: refused' % rel)
         os.makedirs(os.path.dirname(out), exist_ok=True)
