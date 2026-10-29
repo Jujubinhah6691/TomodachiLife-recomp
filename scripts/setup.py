@@ -724,9 +724,13 @@ def step_link(cx):
     for f in (EXE, 'SDL3.dll', GAME_DLL):
         if not os.path.exists(os.path.join(cx.work, f)):
             raise Fail('%s was not produced' % f)
-    if os.path.exists(os.path.join(cx.work, 'tomodachi.ico')):     # exes copied again (a new package): the prepare step's icon back in
+    if os.path.exists(os.path.join(cx.work, 'title-logo.png')):    # exes copied again (a new package): the logo's icon back in
         import launcher_art
-        launcher_art.stamp_icon(cx.work)
+        try:
+            launcher_art.make_icon(cx.work)
+            launcher_art.stamp_icon(cx.work)
+        except ImportError:                                         # no Pillow: no icon
+            pass
     opus = copy_opus(cx)
     ff = copy_ffmpeg(cx)
     say('  %s, SDL3.dll%s %s%s; %s %.0f MB linked here%s' % (
