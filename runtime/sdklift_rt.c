@@ -155,12 +155,15 @@ static const char *sdk_name_of(uint64_t addr, uint64_t *offset) {
     return best;
 }
 
+static ImportFn sdk_override_of(const char *name);
 void sdk_dispatch(Ctx *c, uint64_t addr) {
     if (addr >= SDK_BASE && addr < SDK_BASE + SDK_IMAGE_SIZE) {
         const SdkFn *f = find_fn(addr);
         if (!f) {
             uint64_t off;
             const char *n = sdk_name_of(addr, &off);
+            ImportFn h = off ? NULL : sdk_override_of(n);       /* a host handler for that function (sdk_host_override) */
+            if (h) { h(c); return; }
             printf("\nsdklift: lifted SDK code (f_%llx) calls SDK address %llx (%s+0x%llx) through a pointer, and that function was not lifted.\n"
                    "Add `addr %llx` to sdklift_roots.txt and run `python sdklift.py gen`.\n",
                    (unsigned long long)c->fn, (unsigned long long)(addr - SDK_BASE), n, (unsigned long long)off, (unsigned long long)(addr - SDK_BASE));
@@ -174,10 +177,14 @@ void sdk_dispatch(Ctx *c, uint64_t addr) {
 
 /* Host handlers for SDK-internal callees that are cut (`cut <name>` in sdklift_roots.txt) and are not
  * imports of the game: a service call inside otherwise pure SDK code. */
-static struct { const char *name; ImportFn fn; } g_override[32];
+static struct { const char *name; ImportFn fn; } g_override[64];
 static int g_override_count;
+static ImportFn sdk_override_of(const char *name) {
+    for (int i = 0; i < g_override_count; i++) if (strcmp(g_override[i].name, name) == 0) return g_override[i].fn;
+    return NULL;
+}
 void sdk_host_override(const char *name, ImportFn fn) {
-    if (g_override_count < 32) { g_override[g_override_count].name = name; g_override[g_override_count].fn = fn; g_override_count++; }
+    if (g_override_count < 64) { g_override[g_override_count].name = name; g_override[g_override_count].fn = fn; g_override_count++; }
     for (int i = 0; g_host_fn && i < sdk_host_name_count; i++) if (strcmp(sdk_host_names[i], name) == 0) g_host_fn[i] = fn;
 }
 

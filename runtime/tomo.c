@@ -1163,6 +1163,7 @@ static void scv_timedwait(Ctx *c) { RET(os_sdk_cv_wait(A0, A1, (int64_t)A2)); } 
 static void scv_signal(Ctx *c) { os_sdk_cv_signal(A0, 0); }
 static void scv_broadcast(Ctx *c) { os_sdk_cv_signal(A0, 1); }
 static const ImportDef sdk_lock_overrides[] = {
+    {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", ngc_check_words},      /* also reached through a pointer by SDK code (Local Play checks a Mii's names before sending it: unlifted, the game stopped there) */
     {"_ZN2nn2os12SdkMutexType10InitializeEv", smx_init}, {"_ZN2nn2os12SdkMutexType4LockEv", smx_lock},
     {"_ZN2nn2os12SdkMutexType6UnlockEv", smx_unlock}, {"_ZN2nn2os12SdkMutexType7TryLockEv", smx_trylock},
     {"_ZNK2nn2os12SdkMutexType23IsLockedByCurrentThreadEv", smx_mine},
