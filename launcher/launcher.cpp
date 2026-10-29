@@ -388,6 +388,20 @@ private:
 
     bool exe_ok() const { return is_file(g_exe); }
     bool game_ok() const { return is_file(game_dir_ / "exefs" / "main.elf") && is_dir(game_dir_ / "romfs"); }
+    // The game's version, told by the size of main's code (the first PT_LOAD of main.elf), as the exe's gamedll.c does
+    std::string game_version() const {
+        unsigned char h[64], ph[56];
+        uint64_t phoff = 0, size = 0;
+        FILE* f = _wfopen((game_dir_ / "exefs" / "main.elf").wstring().c_str(), L"rb");
+        if (!f) return "";
+        if (fread(h, 1, 64, f) == 64) {
+            memcpy(&phoff, h + 0x20, 8);
+            for (int i = 0, n = h[0x38] | h[0x39] << 8; i < n && !size; i++)
+                if (!_fseeki64(f, (long long)(phoff + 56u * i), SEEK_SET) && fread(ph, 1, 56, f) == 56 && ph[0] == 1) memcpy(&size, ph + 32, 8);
+        }
+        fclose(f);
+        return size == 0x25ce6a0 ? "1.0.0" : size == 0x256d250 ? "1.0.4" : "Unknown version";
+    }
     bool ready() const { return exe_ok() && game_ok(); }
 
     void refresh() {
@@ -427,7 +441,7 @@ private:
         switch (screen_) {
         case Screen::kMain:
             list_ = {{"PLAY", game_running() ? "Running" : ""},
-                     {"GAME", !exe_ok() ? "Missing" : game_ok() ? "Found" : lini_.get("game", "").empty() ? "Choose..." : "Wrong folder"},
+                     {"GAME", !exe_ok() ? "Missing" : game_ok() ? game_version() : lini_.get("game", "").empty() ? "Choose..." : "Wrong folder"},
                      {"SETTINGS", ""},
                      {"SAVE DATA", save_size_ ? "Saved " + save_when_ : "New island"},
                      {"CONTROLS", pad_name_.empty() ? "Keyboard" : pad_name_},
