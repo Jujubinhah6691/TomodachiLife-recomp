@@ -3,3 +3,4 @@
 zstandard==0.25.0
 Pillow==13.0.0
 pycryptodome==4.1.0
+lz4==4.4.5

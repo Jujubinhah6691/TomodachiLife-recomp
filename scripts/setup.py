@@ -383,15 +383,15 @@ def step_deps(cx):
             cx.state.setdefault('done', {}).pop('link', None)
         cx.state['runtime_exe'] = exe_sha
     missing = []
-    # Pillow (gen_sdktest.py) is needed only when the exe is built here
-    for mod, pkg in (('zstandard', 'zstandard'),) + ((('PIL', 'Pillow'),) if not a.runtime else ()):
+    # lz4: tools/extract/nso2elf.py (the convert step); Pillow (gen_sdktest.py) is needed only when the exe is built here
+    for mod, pkg in (('zstandard', 'zstandard'), ('lz4', 'lz4')) + ((('PIL', 'Pillow'),) if not a.runtime else ()):
         try:
             __import__(mod)
         except ImportError:
             missing.append(pkg)
     if missing:
         raise Fail('missing Python packages: %s   (pip install %s)' % (', '.join(missing), ' '.join(missing)))
-    say('  python packages: zstandard%s: ok' % ('' if a.runtime else ' Pillow'))
+    say('  python packages: zstandard lz4%s: ok' % ('' if a.runtime else ' Pillow'))
 
     deps = os.path.join(REPO, 'deps')
     def is_9(d):                                   # another LLVM version installed on the PC is not used unless asked for

@@ -51,7 +51,7 @@ function Unblock-Tree {
 function Test-Private {
     if (-not (Test-Path $pyExe)) { return $false }
     try {
-        & $pyExe -c "import zstandard, PIL, Crypto" 2>$null | Out-Null
+        & $pyExe -c "import zstandard, PIL, Crypto, lz4" 2>$null | Out-Null
         return $LASTEXITCODE -eq 0
     } catch { return $false }
 }

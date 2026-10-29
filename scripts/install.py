@@ -79,7 +79,7 @@ def set_build(path):
 # could wait on a prompt nobody saw); 5-15 minutes, about 3 GB on C:
 MSVC_WINGET = ('winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-package-agreements --accept-source-agreements '
                '--override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
-PKGS = ['zstandard', 'Pillow', 'pycryptodome']
+PKGS = ['zstandard', 'Pillow', 'pycryptodome', 'lz4']
 # name -> (url, sha256 or None, folder in deps, file that proves the folder is complete). A None hash refuses the download
 # until the maintainer has checked the archive and written its hash here.
 # Third-party files this project hosts itself, in the release installer-tools of its files repository (keep it): the same bytes as
