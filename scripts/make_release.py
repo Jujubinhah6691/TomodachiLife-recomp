@@ -331,14 +331,17 @@ def main():
                 'Prebuilt runtime of the Tomodachi Life native port (our own code only; nothing of the game is in it).\n'
                 'scripts/install.py downloads and checks it; scripts/setup.py --runtime <this folder or zip> uses it, and builds\n'
                 'the game DLL from your own dump with LLVM alone. manifest.json lists the files and their SHA-256.\n')
-    digest = setup.tree_digest()
+    # the files git tracks only: a player's copy (the release zip, a clone) has no untracked or ignored file of this one,
+    # and a manifest naming one refused the package on every such copy (0.1.0-beta)
+    tracked = setup._git_tracked()
+    digest = setup.tree_digest(tracked)
     manifest = {
         'format': 1,
         'name': 'tomodachi-native runtime',
         'source_commit': commit, 'source_dirty': dirty,
         'tree_digest': digest,                              # setup.py --runtime compares it with the digest of its own tree
         # since 2026-10-20 also file by file: setup.py then names what differs and accepts files that were only added
-        'tree_files': setup.tree_files(),
+        'tree_files': setup.tree_files(tracked),
         'game_data_version': setup.game_data_version(),
         'game_dll': setup.GAME_DLL,
         'game_builds': sorted(setup.GAME_BUILDS.values()),

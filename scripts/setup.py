@@ -206,11 +206,11 @@ def tree_digest(only=None):
     return h.hexdigest()
 
 
-def tree_files():
-    """{repo-relative path: SHA-256 of its line-end-normalised content} of the same files (manifest 'tree_files'):
-    setup.py then names the files that differ and ignores files that are only added."""
+def tree_files(only=None):
+    """{repo-relative path: SHA-256 of its line-end-normalised content} of the same files (manifest 'tree_files'; only:
+    as _tree_rows): setup.py then names the files that differ and ignores files that are only added."""
     import hashlib
-    return {rel: hashlib.sha256(_norm_bytes(rel)).hexdigest() for _, rows in _tree_rows() for rel in rows}
+    return {rel: hashlib.sha256(_norm_bytes(rel)).hexdigest() for _, rows in _tree_rows(only) for rel in rows}
 
 
 def _git_tracked():

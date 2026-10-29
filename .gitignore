@@ -9,3 +9,6 @@ deps/
 dist/
 build_release/
 build_location.txt
+
+# graphify knowledge-graph output (local tool)
+graphify-out/
