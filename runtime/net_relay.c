@@ -1169,6 +1169,7 @@ static void show_room(const char *what, const char *code, int clip) {
     char t[72];
     snprintf(t, sizeof t, "%s %s", what, code);
     display_room_note(t);
+    if (getenv("SSBU_SEQ")) clip = 0;                       /* (scripted test runs leave the person's clipboard alone) */
     if (clip && OpenClipboard(NULL)) {
         size_t n = strlen(code) + 1;
         HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
