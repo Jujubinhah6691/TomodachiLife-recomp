@@ -204,6 +204,31 @@ def audit_against(folder, work):
     return bad, len(needles)
 
 
+# only developer tools import these (tools/debug, tools/lifter/difftest.py, ...): an install never runs them
+DEV_MODULES = {'capstone', 'unicorn', 'numpy', 'flags_local'}
+
+
+def undeclared_imports():
+    """{module: {files}} of the third-party modules tracked .py files import that requirements.txt does not install (nor
+    DEV_MODULES): 0.1.1-beta's installer lacked lz4 (tools/extract/nso2elf.py) and every install stopped at convert."""
+    import ast
+    files = git('ls-files', '*.py').splitlines()
+    with open(os.path.join(REPO, 'requirements.txt'), encoding='utf-8') as f:
+        reqs = [re.split(r'[=<>~!;\[ ]', l.strip(), 1)[0] for l in f if l.strip() and not l.lstrip().startswith('#')]
+    have = ({{'Pillow': 'PIL', 'pycryptodome': 'Crypto'}.get(r, r) for r in reqs} | DEV_MODULES | set(sys.stdlib_module_names) |
+            {os.path.splitext(os.path.basename(p))[0] for p in files})
+    out = {}
+    for rel in files:
+        with open(os.path.join(REPO, rel), encoding='utf-8', errors='replace') as f:
+            tree = ast.parse(f.read(), rel)
+        for n in ast.walk(tree):
+            mods = [x.name for x in n.names] if isinstance(n, ast.Import) else [n.module] if isinstance(n, ast.ImportFrom) and n.module and not n.level else []
+            for m in mods:
+                if m.split('.')[0] not in have:
+                    out.setdefault(m.split('.')[0], set()).add(rel)
+    return out
+
+
 # ---------------------------------------------------------------------------------------------- build
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -222,6 +247,10 @@ def main():
     dirty = bool(git('status', '--porcelain', '--untracked-files=no'))
     if dirty and not a.allow_dirty:
         sys.exit('the tree has uncommitted changes: a release is built from a commit (--allow-dirty to test)')
+    bad = undeclared_imports()
+    if bad:
+        sys.exit('requirements.txt lacks modules the code imports (an install stops at the first it runs): ' +
+                 '; '.join('%s <- %s' % (m, ', '.join(sorted(f))) for m, f in sorted(bad.items())))
 
     # tools: the same places setup.py looks
     deps = os.path.join(REPO, 'deps')
