@@ -102,7 +102,8 @@ TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's 
 # The prebuilt runtime package of the GitHub Release of this version (scripts/make_release.py): (URL, SHA-256 of the zip).
 # (None, None) until the maintainer has uploaded the package made from this commit and written its hash here; the
 # download is refused when the hash does not match, and setup.py uses the package only with the tree it was built from.
-RUNTIME_RELEASE = (None, None)
+RUNTIME_RELEASE = ('https://github.com/Denkishi/TomodachiLife-recomp/releases/download/v0.1.0-beta/tomodachi-runtime-8912b2d81a.zip',
+                   '3ddfc075f24a22ce676c2660ef817e5390823f887e901e9bdb7f59d3655c9662')
 
 SETUP_STEPS = ['deps', 'stage', 'convert', 'tables', 'lift', 'sdk', 'compile', 'link', 'prepare']
 # expected seconds, measured 2026-10-28 on a PC with 9 jobs, 16 GB (compile scales with 12 / jobs)
