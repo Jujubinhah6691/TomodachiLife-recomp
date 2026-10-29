@@ -3,8 +3,8 @@
 
     python scripts/shortcuts.py [--dry-run]
 
-Creates "SSBU native.lnk" (target: Play SSBU.bat, working folder: the repository) on the desktop and in the Start menu
-(Programs), and "SSBU native - Installer.lnk" (target: Install SSBU.bat) in the Start menu. Idempotent: a shortcut that
+Creates "Tomodachi Life.lnk" (target: Play Tomodachi Life.bat, working folder: the repository) on the desktop and in the
+Start menu (Programs), and "Tomodachi Life - Installer.lnk" (target: Install Tomodachi Life.bat) in the Start menu. Idempotent: a shortcut that
 already points at the right place is left alone; one that points elsewhere (the folder was moved) is rewritten.
 
 The python.org embeddable package has no pywin32, so the shortcuts are made through `powershell -NoProfile` with the
@@ -18,8 +18,8 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PLAY_NAME = 'SSBU native.lnk'
-INSTALL_NAME = 'SSBU native - Installer.lnk'
+PLAY_NAME = 'Tomodachi Life.lnk'
+INSTALL_NAME = 'Tomodachi Life - Installer.lnk'
 
 _PS = r"""
 $ErrorActionPreference = 'Stop'
@@ -48,16 +48,16 @@ foreach ($it in (ConvertFrom-Json $env:SSBU_LNK_JSON)) {
 
 def plan(repo=REPO):
     """-> list of dict(dir, name, target, cwd, desc, icon); dir is a real folder or '@desktop' / '@programs'."""
-    # Play SSBU.bat finds the install location by itself (scripts/run.py reads build_location.txt); only the icon is the exe's
+    # Play Tomodachi Life.bat finds the install location by itself (scripts/run.py reads build_location.txt); only the icon
+    # is the launcher's
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import build_location
-    exe = os.path.join(build_location.get(repo), 'work', 'ssbu_native.exe')
-    logo = os.path.join(repo, 'media', 'opensmash.ico')           # the project's logo (media/emblem.svg)
-    icon = logo + ',0' if os.path.isfile(logo) else exe + ',0' if os.path.isfile(exe) else ''
-    play = {'name': PLAY_NAME, 'target': os.path.join(repo, 'Play SSBU.bat'), 'cwd': repo,
-            'desc': 'Super Smash Bros. Ultimate, native PC build', 'icon': icon}
-    inst = {'name': INSTALL_NAME, 'target': os.path.join(repo, 'Install SSBU.bat'), 'cwd': repo,
-            'desc': 'Install, repair or update SSBU native', 'icon': logo + ',0' if os.path.isfile(logo) else ''}
+    exe = os.path.join(build_location.get(repo), 'work', 'TomodachiLauncher.exe')
+    icon = exe + ',0' if os.path.isfile(exe) else ''
+    play = {'name': PLAY_NAME, 'target': os.path.join(repo, 'Play Tomodachi Life.bat'), 'cwd': repo,
+            'desc': 'Tomodachi Life: Living the Dream, native PC build', 'icon': icon}
+    inst = {'name': INSTALL_NAME, 'target': os.path.join(repo, 'Install Tomodachi Life.bat'), 'cwd': repo,
+            'desc': 'Install, repair or update Tomodachi Life native', 'icon': ''}
     over = [d for d in (os.environ.get('SSBU_SHORTCUT_DIRS') or '').split(os.pathsep) if d]
     if over:
         return [dict(it, dir=d) for d in over for it in (play, inst)]

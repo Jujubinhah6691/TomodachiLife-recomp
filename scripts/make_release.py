@@ -2,24 +2,24 @@
 """Build the prebuilt-runtime package of a GitHub Release: the parts of the port that are OUR code only, so a player's PC
 needs neither the MSVC Build Tools nor the Windows SDK (scripts/setup.py --runtime <package>; scripts/install.py fetches it).
 
-    python scripts/make_release.py [--out dist] [--build build_release] [--llvm ..] [--sdl3 ..] [--vulkan-headers ..]
-                                   [--glslang ..] [--suyu ..] [--opus <opus.dll>] [--against <a build\\work of a dump>]
+    python scripts/make_release.py [--out dist] [--build build_release] [--llvm ..] [--launcher-llvm ..] [--sdl3 ..]
+                                   [--vulkan-headers ..] [--suyu ..] [--opus <opus.dll>] [--against <a build\\work of a dump>]
 
 Needs no dump and reads nothing of the game: the exe is built from the runtime's own sources (tools/lifter/build.py host),
 which since game_data.h hold nothing derived from the dump; the game DLL it loads is built on the player's PC.
 
-The package, dist/ssbu-runtime-<commit>.zip, holds:
-    ssbu_native.exe      the host runtime (runtime/*.c), linked against nocrt/ssbu_game.def, not against a game DLL
-    SDL3.dll             SDL 3 (zlib licence), as in the official VC development package
-    ssbu_glslang.dll     runtime/vk_glslang_shim.c + the glslang / SPIRV-Tools release libraries
-    opus.dll             only with --opus: libopus (BSD licence), for the music
-    LICENSE-*.txt        the licences of the above
-    manifest.json        SHA-256 and size of every file, the source commit, the tree digest setup.py compares with its own
-                         tree (the package is used only by the tree it was built from), the game-data interface version
+The package, dist/tomodachi-runtime-<commit>.zip, holds:
+    tomodachi_native.exe   the host runtime (runtime/*.c); it loads the game DLL at run time (gamedll.c), imports none
+    TomodachiLauncher.exe  launcher/launcher.cpp (third_party/stb), built with a clang whose C++17 suits the MSVC library
+    bntx_png.exe           tools/extract/bntx_png.c + runtime/tex_decode.c: the launcher's logo from the player's game files
+    SDL3.dll               SDL 3 (zlib licence), as in the official VC development package
+    opus.dll               only with --opus: libopus (BSD licence), for the game's Opus sounds
+    LICENSE-*.txt          the licences of the above
+    manifest.json          SHA-256 and size of every file, the source commit, the tree digest setup.py compares with its own
+                           tree (the package is used only by the tree it was built from), the game-data interface version
 
 Before the zip is written the package is audited (audit_package): only the files above; the exe's linker map lists no object
-but the runtime's own sources; the exe imports from the game DLL only its exports in nocrt/ssbu_game.def; no file holds a
-path or name of this PC or a lifted-function name. --against <build\\work> also checks that none of that build's dump-derived
+but the runtime's own sources; the exe imports no game DLL; no file holds a path or name of this PC or a lifted-function name. --against <build\\work> also checks that none of that build's dump-derived
 tables (sdkdata.c byte blobs, nro_registry.c build ids) occurs in any file. The result is printed with the zip's SHA-256,
 which goes into scripts/install.py (RUNTIME_RELEASE) once the zip is uploaded.
 """
@@ -40,8 +40,8 @@ spec = importlib.util.spec_from_file_location('ssbu_setup', os.path.join(REPO, '
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 
-EXE = 'ssbu_native.exe'
-PACKAGE_FILES = [EXE, 'SDL3.dll', 'ssbu_glslang.dll']      # (R4: no rollback exe any more: rollback runs on the normal build)
+EXE = setup.EXE
+PACKAGE_FILES = [EXE, 'SDL3.dll', setup.LAUNCHER, setup.BNTX_PNG]
 OPTIONAL_FILES = ['opus.dll']
 # what may be in the zip besides PACKAGE_FILES / OPTIONAL_FILES
 PACKAGE_EXTRA = re.compile(r'^(manifest\.json|README\.txt|LICENSE-[A-Za-z0-9_.-]+\.txt)$')
@@ -174,14 +174,9 @@ def audit_exe_build(work, exe, llvm):
             imports[cur] = []
         elif cur and re.match(r'\s+\d+\s+\S+', line):
             imports[cur].append(line.split()[-1])
-    game = [d for d in imports if d.startswith('ssbu_game')]
-    if len(game) != 1:
-        bad.append('the exe should import exactly one game DLL, it imports %s' % (game or 'none'))
-    else:
-        exports = set(l.split()[0] for l in open(os.path.join(work, 'nocrt', 'ssbu_game.def')).read().split('EXPORTS', 1)[1].splitlines() if l.strip())
-        extra = set(imports[game[0]]) - exports
-        if extra:
-            bad.append('the exe imports from %s names that are not in nocrt/ssbu_game.def: %s' % (game[0], ' '.join(sorted(extra))))
+    game = [d for d in imports if d.startswith(('ssbu_game', 'tomodachi_game'))]
+    if game:                                   # gamedll.c loads the game DLL of the game's version at run time
+        bad.append('the exe should import no game DLL, it imports %s' % game)
     return bad, imports
 
 
@@ -212,7 +207,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', default=os.path.join(REPO, 'dist'))
     ap.add_argument('--build', default=os.path.join(REPO, 'build_release'), help='scratch folder (default <repo>/build_release)')
-    ap.add_argument('--llvm'), ap.add_argument('--sdl3'), ap.add_argument('--vulkan-headers'), ap.add_argument('--glslang'), ap.add_argument('--suyu')
+    ap.add_argument('--llvm'), ap.add_argument('--sdl3'), ap.add_argument('--vulkan-headers'), ap.add_argument('--suyu')
+    ap.add_argument('--launcher-llvm', help='an LLVM whose clang compiles C++17 against the MSVC library (default C:\\Program Files\\LLVM)')
     ap.add_argument('--opus', help='opus.dll to ship beside the exe (optional; BSD licence)')
     ap.add_argument('--imgui', help='Dear ImGui v1.91.9b folder (imgui.h, imgui.cpp): the settings menu (F1) is built into the exe '
                                     '(MIT licence, shipped as LICENSE-imgui.txt); default IMGUI_ROOT or <repo>/deps/imgui; without it no menu')
@@ -232,9 +228,11 @@ def main():
     tools = {}
     for key, opt, envv, sub, probe in (('sdl3', a.sdl3, 'SDL3_ROOT', 'SDL3', os.path.join('lib', 'x64', 'SDL3.lib')),
                                        ('vulkan', a.vulkan_headers, 'VULKAN_HEADERS', 'Vulkan-Headers', os.path.join('include', 'vulkan', 'vulkan.h')),
-                                       ('glslang', a.glslang, 'GLSLANG_ROOT', 'glslang', os.path.join('lib', 'glslang.lib')),
                                        ('suyu', a.suyu, 'SUYU_ROOT', 'suyu', os.path.join('src', 'core', 'hle', 'service', 'mii', 'types', 'raw_data.cpp'))):
         tools[key] = find([opt, os.environ.get(envv), os.path.join(deps, sub)], lambda d, p=probe: os.path.exists(os.path.join(d, p)))
+    newer = find([a.launcher_llvm, os.environ.get('LAUNCHER_LLVM'), r'C:\Program Files\LLVM'], lambda d: os.path.exists(os.path.join(d, 'bin', 'clang.exe')))
+    if not newer:
+        sys.exit('not found: an LLVM for the launcher (--launcher-llvm; its C++17 must suit the MSVC library: clang 20 or newer)')
     imgui = find([a.imgui, os.environ.get('IMGUI_ROOT'), os.path.join(deps, 'imgui')],
                  lambda d: os.path.exists(os.path.join(d, 'imgui.h')) and os.path.exists(os.path.join(d, 'imgui.cpp')))
     if not imgui:
@@ -256,7 +254,7 @@ def main():
     setup.step_stage(cx)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('RECOMP_', 'SSBU_'))}
     env.update(PYTHONIOENCODING='utf-8', RECOMP_CLANG=clang, SDL3_ROOT=tools['sdl3'], VULKAN_HEADERS=tools['vulkan'],
-               GLSLANG_ROOT=tools['glslang'], SUYU_ROOT=tools['suyu'], RECOMP_EXE=EXE)
+               SUYU_ROOT=tools['suyu'], RECOMP_EXE=EXE)
     env['IMGUI_ROOT'] = imgui or os.path.join(build, 'no-imgui')     # build.py would otherwise look beside the study tree
     os.environ['IMGUI_ROOT'] = env['IMGUI_ROOT']                     # the audit imports the staged build.py in this process
     # the movie fallback (mf_ffmpeg.c) is compiled with FFmpeg's headers; a package exe without it would leave players whose
@@ -286,11 +284,15 @@ def main():
         if os.path.exists(os.path.join(work, gen_name)):
             sys.exit('%s is in the staged tree: it is derived from a dump and must not be (remove it from the repository)' % gen_name)
 
-    # 3. the exe (build.py host: no game DLL needed), ssbu_glslang.dll
+    # 3. the exe (build.py host: no game DLL needed), the launcher and bntx_png.exe (setup.py's own recipe for them)
     say('building %s from the runtime sources ...' % EXE)
     out = run([sys.executable, 'build.py', 'host'], 'build.py host')
     say('  ' + (out.strip().splitlines() or [''])[-1])
-    run([os.environ.get('COMSPEC', 'cmd.exe'), '/c', os.path.join(work, 'build_glslang.bat')], 'build_glslang.bat')
+    lcx = type('Cx', (), {})()
+    lcx.work, lcx.logs = work, os.path.join(build, 'logs')
+    lcx.tools = {'clang': clang, 'launcher_clang': os.path.join(newer, 'bin', 'clang.exe'), 'sdl3': tools['sdl3']}
+    lcx.run = lambda step, argv, log=None, **kw: run(argv, log or step)
+    setup.build_launcher(lcx)
     for f in PACKAGE_FILES:
         if not os.path.exists(os.path.join(work, f)):
             sys.exit('%s was not produced' % f)
@@ -310,34 +312,31 @@ def main():
         if os.path.isfile(lic):
             shutil.copy2(lic, os.path.join(pkg, 'LICENSE-opus.txt'))
             files.append('LICENSE-opus.txt')
-    licences = [(os.path.join(REPO, 'LICENSE'), 'LICENSE-ssbu-native.txt'),
-                (next((os.path.join(tools['sdl3'], n) for n in ('LICENSE.txt', 'COPYING.txt') if os.path.exists(os.path.join(tools['sdl3'], n))), None), 'LICENSE-SDL3.txt'),
-                (next((os.path.join(tools['glslang'], n) for n in ('LICENSE.txt', 'LICENSE') if os.path.exists(os.path.join(tools['glslang'], n))), None), 'LICENSE-glslang.txt')]
+    licences = [(os.path.join(REPO, 'LICENSE'), 'LICENSE-tomodachi-native.txt'),
+                (next((os.path.join(tools['sdl3'], n) for n in ('LICENSE.txt', 'COPYING.txt') if os.path.exists(os.path.join(tools['sdl3'], n))), None), 'LICENSE-SDL3.txt')]
     if imgui and os.path.exists(os.path.join(imgui, 'LICENSE.txt')):
         licences.append((os.path.join(imgui, 'LICENSE.txt'), 'LICENSE-imgui.txt'))
     for src, dst in licences:
         if src:
             shutil.copyfile(src, os.path.join(pkg, dst))
-        elif dst == 'LICENSE-glslang.txt':                 # the glslang release zip holds no licence file
-            with open(os.path.join(pkg, dst), 'w', newline='\r\n') as f:
-                f.write('ssbu_glslang.dll links the glslang and SPIRV-Tools libraries of the official glslang release\n'
-                        '(https://github.com/KhronosGroup/glslang/releases). Their licences: glslang, mostly BSD-3-Clause and\n'
-                        'other permissive licences, https://github.com/KhronosGroup/glslang/blob/main/LICENSE.txt ; SPIRV-Tools,\n'
-                        'Apache-2.0, https://github.com/KhronosGroup/SPIRV-Tools/blob/main/LICENSE\n')
+    with open(os.path.join(pkg, 'LICENSE-stb.txt'), 'w', newline='\r\n') as f:     # stb's licence is at the end of each header
+        f.write('TomodachiLauncher.exe uses stb_image.h and stb_truetype.h by Sean Barrett (https://github.com/nothings/stb),\n'
+                'under your choice of the MIT licence or the public domain (Unlicense), as written at the end of each header\n'
+                '(third_party/stb in the source repository).\n')
     with open(os.path.join(pkg, 'README.txt'), 'w', newline='\r\n') as f:
-        f.write('Prebuilt runtime of ssbu-native (our own code only; nothing of the game is in it).\n'
+        f.write('Prebuilt runtime of the Tomodachi Life native port (our own code only; nothing of the game is in it).\n'
                 'scripts/install.py downloads and checks it; scripts/setup.py --runtime <this folder or zip> uses it, and builds\n'
-                'the game DLLs from your own dump with LLVM alone. manifest.json lists the files and their SHA-256.\n')
+                'the game DLL from your own dump with LLVM alone. manifest.json lists the files and their SHA-256.\n')
     digest = setup.tree_digest()
     manifest = {
         'format': 1,
-        'name': 'ssbu-native runtime',
+        'name': 'tomodachi-native runtime',
         'source_commit': commit, 'source_dirty': dirty,
         'tree_digest': digest,                              # setup.py --runtime compares it with the digest of its own tree
         # since 2026-10-20 also file by file: setup.py then names what differs and accepts files that were only added
         'tree_files': setup.tree_files(),
         'game_data_version': setup.game_data_version(),
-        'game_dll': 'ssbu_game_eh_o1.dll',
+        'game_dll': setup.GAME_DLL,
         'game_builds': sorted(setup.GAME_BUILDS.values()),
         'built': time.strftime('%Y-%m-%d %H:%M'),
         'toolchain': {'clang': clang_ver, 'linker': 'MSVC link.exe (through clang)'},
@@ -365,7 +364,7 @@ def main():
 
     # 6. the zip
     os.makedirs(a.out, exist_ok=True)
-    zpath = os.path.join(a.out, 'ssbu-runtime-%s.zip' % (commit[:10] or 'local'))
+    zpath = os.path.join(a.out, 'tomodachi-runtime-%s.zip' % (commit[:10] or 'local'))
     with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED) as z:
         for n in sorted(os.listdir(pkg)):
             z.write(os.path.join(pkg, n), n)

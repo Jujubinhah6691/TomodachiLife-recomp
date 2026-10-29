@@ -1,9 +1,9 @@
 """Make the dump folder that scripts/setup.py --dump expects, from your own title packages (PR #38, Acid236).
 
-    python dump_folder.py <base.nsp|base.xci> <update.nsp|update.xci> <dump folder> [--exefs-only] [--firmware <folder>]
+    python dump_folder.py <base.nsp|base.xci> [<update.nsp|update.xci>] <dump folder> [--exefs-only] [--firmware <folder>]
 
-Writes <dump>/exefs/ (the ExeFS of the update's Program NCA: main, sdk, rtld, subsdk0, main.npdm) and <dump>/romfs/
-(the base RomFS with the update applied, romfs_extract.py). With --firmware, the system fonts of a firmware dump go to
+Writes <dump>/exefs/ (the ExeFS of the update's Program NCA, or the base game's without an update: main, sdk, rtld,
+main.npdm) and <dump>/romfs/ (the base RomFS with the update applied, romfs_extract.py). With --firmware, the system fonts of a firmware dump go to
 <dump>/sysdata/fonts (fw_fonts.py). The base game may be a cartridge image (.xci) or an .nsp; so may the update. Keys
 come from ~/.switch/prod.keys (and pycryptodome is needed), as for the other tools here. Nothing is written anywhere else.
 """
@@ -42,24 +42,28 @@ def main():
     if '--firmware' in sys.argv:
         fw = sys.argv[sys.argv.index('--firmware') + 1]
         args = [a for a in args if a != fw]
-    if len(args) < 3:
+    if len(args) < 2:
         print(__doc__)
         return 1
-    base_path, update_path, out = args[:3]
+    base_path, update_path, out = (args[0], args[1], args[2]) if len(args) >= 3 else (args[0], None, args[1])
     firmware = sys.argv[sys.argv.index('--firmware') + 1] if '--firmware' in sys.argv else None
-    base, update = rx.Nca(rx.open_package(base_path)), rx.Nca(rx.open_package(update_path))
+    base = rx.Nca(rx.open_package(base_path))
+    update = rx.Nca(rx.open_package(update_path)) if update_path else None
     def patch(n):                                     # an update's program NCA has a patch (BKTR) RomFS; the game's has not
         try:
             return n.section(0)['crypto'] == 4
         except StopIteration:
             return False
-    if patch(base) and not patch(update):            # given the other way round (both carry the game's program id)
+    if update and patch(base) and not patch(update):  # given the other way round (both carry the game's program id)
         print('base and update were given the other way round: swapped')
         base, update = update, base
+    if not update and patch(base):
+        raise SystemExit('%s is an update, not the game itself: give the base game too (base first, then the update)' % base_path)
     for label, nca in (('base', base), ('update', update)):
-        print('%-6s %s  program NCA %s, title %016x' % (label, type(nca.nsp).__name__.upper(), nca.name,
-                                                       struct.unpack('<Q', nca.header[0x210:0x218])[0]))
-    extract_exefs(update, os.path.join(out, 'exefs'))
+        if nca:
+            print('%-6s %s  program NCA %s, title %016x' % (label, type(nca.nsp).__name__.upper(), nca.name,
+                                                           struct.unpack('<Q', nca.header[0x210:0x218])[0]))
+    extract_exefs(update or base, os.path.join(out, 'exefs'))
     if '--exefs-only' not in sys.argv:
         rx.extract(base, update, os.path.join(out, 'romfs'))
     if firmware:

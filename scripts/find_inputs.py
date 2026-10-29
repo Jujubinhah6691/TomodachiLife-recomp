@@ -10,7 +10,7 @@ As a module:  from find_inputs import scan;  r = scan(extra=())  ->
 Every item is a dict with at least 'path' and 'desc' (a plain sentence); see the functions below for the other fields.
 
 Nothing is decrypted or copied and no key VALUE is ever read into a result: of a keys file only the key NAMES are looked at
-(header_key, key_area_key_application_*, titlekek_*). Game files are recognised from their names ([01006A800016E000][v...])
+(header_key, key_area_key_application_*, titlekek_*). Game files are recognised from their names ([010051F0207B2000][v...])
 or a cheap look at the package header (a .nsp/.nsz lists tickets named after their rights id, whose first 16 hex digits are
 the title id). Stdlib only, Python 3.10+; works with the python.org embeddable package.
 
@@ -24,13 +24,14 @@ import struct
 import sys
 import time
 
-APP_ID = 0x01006A800016E000                 # Super Smash Bros. Ultimate (base)
-UPDATE_ID = 0x01006A800016E800              # its update
-# update version number -> game build (docs/VERSIONS.md: 13.0.4 = v1966080, 13.0.5 = v2031616)
-BUILDS = {1966080: '13.0.4', 2031616: '13.0.5'}
-BUILD_ORDER = ['13.0.5', '13.0.4']          # newest first
+APP_ID = 0x010051F0207B2000                 # Tomodachi Life: Living the Dream (base, 1.0.0)
+UPDATE_ID = 0x010051F0207B2800              # its update
+# update version number -> game build (the base game alone is 1.0.0)
+BUILDS = {262144: '1.0.4'}
+BUILD_ORDER = ['1.0.4']                     # newest first
 GAME_EXT = ('.xci', '.nsp', '.nsz', '.xcz', '.nca')
-HUGE = 4 << 30                              # an .xci/.nsp this big and called Smash is a game even if its name has no id
+ROMFS_PROBE = ('Layout', 'Mii', 'Pack')     # folders every RomFS of the game has (a dump cut short lacks some)
+HUGE = 4 << 30                              # an .xci this big and called Tomodachi is a game even if its name has no id
 
 NEEDED_KEYS = ('header_key', 'key_area_key_application_', 'titlekek_')
 
@@ -250,7 +251,7 @@ def find_firmware(emus, extra_dirs):
 
 _TID = re.compile(r'\[(01[0-9A-Fa-f]{14})\]')
 _VER = re.compile(r'\[v(\d+)\]', re.I)
-_BUILD = re.compile(r'\b(13\.0\.[45])\b')
+_BUILD = re.compile(r'\b(1\.0\.4)\b')
 
 
 def _ids_from_package(path):
@@ -293,7 +294,7 @@ def classify_game_file(path):
     verified = tid is not None
     if tid is None:
         # an .xci/.xcz keeps its ids encrypted; call it a candidate when the name or the size says it is this game
-        if low.endswith(('.xci', '.xcz')) and (re.search(r'smash|ssbu|ultimate', low) or _size(path) > HUGE):
+        if low.endswith(('.xci', '.xcz')) and (re.search(r'tomodachi', low) or _size(path) > HUGE):
             tid = APP_ID
         else:
             return None
@@ -301,7 +302,7 @@ def classify_game_file(path):
         kind = 'base'
     elif tid == UPDATE_ID:
         kind = 'update'
-    elif (tid & ~0xFFF) == 0x01006A800016F000:
+    elif (tid & ~0xFFF) == APP_ID + 0x1000:
         kind = 'dlc'
     else:
         return None
@@ -311,9 +312,6 @@ def classify_game_file(path):
     if kind == 'update' and build is None:
         b = _BUILD.search(name) or _BUILD.search(os.path.basename(os.path.dirname(path)))
         build = b.group(1) if b else None
-        m2 = re.search(r'(?<!\d)130([45])(?!\d)', name)                   # e.g. update_1305.nsp
-        if build is None and m2:
-            build = '13.0.' + m2.group(1)
     ext = os.path.splitext(low)[1]
     size = _size(path)
     item = {'kind': kind, 'path': path, 'title_id': '%016X' % tid, 'version': version, 'build': build, 'format': ext[1:],
@@ -334,14 +332,14 @@ def classify_game_file(path):
 
 
 def dump_at(d):
-    """A dump folder in the form scripts/setup.py --dump wants: exefs\\ (main, rtld, sdk, subsdk0, main.npdm) and romfs\\."""
+    """A dump folder in the form scripts/setup.py --dump wants: exefs\\ (main, sdk, main.npdm) and romfs\\ (the game's folders)."""
     ex, rom = os.path.join(d, 'exefs'), os.path.join(d, 'romfs')
     if _isdir(ex) and _isdir(rom):
         files = {x.lower() for x in _listdir(ex)}
-        missing = [x for x in ('main', 'rtld', 'sdk', 'subsdk0', 'main.npdm') if x not in files]
-        has_arc = _isfile(os.path.join(rom, 'data.arc'))
+        missing = [x for x in ('main', 'sdk', 'main.npdm') if x not in files]
+        has_data = all(_isdir(os.path.join(rom, x)) for x in ROMFS_PROBE)
         fonts = _isdir(os.path.join(d, 'sysdata', 'fonts'))
-        problems = (['exefs lacks ' + ', '.join(missing)] if missing else []) + ([] if has_arc else ['romfs\\data.arc missing'])
+        problems = (['exefs lacks ' + ', '.join(missing)] if missing else []) + ([] if has_data else ['romfs lacks the game\'s folders'])
         return {'kind': 'dump', 'path': d, 'complete': not problems, 'problems': problems, 'fonts': fonts,
                 'use': 'python scripts/setup.py --dump "%s"' % d,
                 'desc': 'extracted dump (exefs + romfs%s) in %s%s' % (', sysdata\\fonts' if fonts else '', d,
@@ -471,16 +469,14 @@ def pick_best(keys, firmware, base, updates, dlc, dumps):
     # what the installer would do
     if 'dump' in best:
         best['plan'] = 'use the extracted dump (scripts/setup.py --dump)'
-    elif 'base' in best and 'update' in best and 'prod_keys' in best:
-        best['plan'] = 'make the dump from base + update (tools/extract/dump_folder.py)'
+    elif 'base' in best and 'prod_keys' in best:
+        best['plan'] = 'make the dump from %s (tools/extract/dump_folder.py)' % ('base + update 1.0.4' if 'update' in best else 'the base game alone (1.0.0)')
     else:
         miss = []
         if 'prod_keys' not in best:
             miss.append('prod.keys')
         if 'base' not in best:
             miss.append('the base game')
-        if 'update' not in best:
-            miss.append('an update 13.0.4 or 13.0.5')
         best['plan'] = 'missing: ' + ', '.join(miss)
     if 'firmware' not in best and 'dump' in best and not any(d.get('fonts') for d in dumps):
         best['firmware_note'] = 'no firmware or fonts found: the game stops at start without the system fonts'
@@ -516,7 +512,7 @@ def scan(extra=()):
     result['best'] = pick_best(keys, firmware, base, updates, dlc, dumps)
     unsupported = [u for u in updates if not u['build']]
     if unsupported:
-        result['notes'].append('%d update(s) of a version this port does not run (only 13.0.4 = v1966080 and 13.0.5 = v2031616)'
+        result['notes'].append('%d update(s) of a version this port does not run (only 1.0.4 = v262144; or the base game alone, 1.0.0)'
                                % len(unsupported))
     if any(g['needs_zstandard'] for g in games):
         result['notes'].append('.nsz/.xcz files need: pip install zstandard pycryptodome (tools/extract/nsz_to_nsp.py)')
@@ -538,7 +534,7 @@ def summary(r):
     section('Keys:', r['keys'], 'no prod.keys (put it in %USERPROFILE%\\.switch\\prod.keys, dump it from your own console)')
     section('Firmware / system fonts:', r['firmware'], 'none (a firmware folder of .nca files, or its sysdata\\fonts)')
     section('Base game:', r['base'], 'none')
-    section('Updates:', r['updates'], 'none (13.0.4 or 13.0.5 needed)')
+    section('Updates:', r['updates'], 'none (optional: 1.0.4; the base game alone is 1.0.0)')
     lines.append('  DLC: %d package(s)%s' % (len(r['dlc']), ' (not needed to run: they only unlock their content, '
                                             'tools/audit/dlc_list.py writes config\\dlc.txt)' if r['dlc'] else ''))
     section('Extracted dumps:', r['dumps'], 'none')

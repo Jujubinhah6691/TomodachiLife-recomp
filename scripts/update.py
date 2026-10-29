@@ -38,13 +38,13 @@ import urllib.request
 import zipfile
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_REPO = 'Denkishi/ssbu-recomp'
+DEFAULT_REPO = 'Denkishi/TomodachiLife-recomp'
 DEFAULT_BRANCH = 'main'
 MANIFEST = os.path.join('build', 'update_manifest.json')
 BACKUP = os.path.join('build', 'update_backup')
 # never written, never deleted (first path component, lower case; a trailing * is a prefix)
 PROTECTED = ('.git', 'build', 'deps', 'config', 'saves', 'userdata*', 'build_location.txt')   # build_location.txt: the install location chosen in the window
-UA = {'User-Agent': 'ssbu-recomp-update'}
+UA = {'User-Agent': 'tomodachi-recomp-update'}
 
 # changed path prefix -> the earliest setup.py step that has to run again (the list is in STEPS order of setup.py)
 STEPS = ['deps', 'stage', 'convert', 'modules', 'tables', 'lift', 'sdk', 'compile', 'nro', 'link', 'check']
@@ -52,8 +52,8 @@ REBUILD_RULES = [
     ('tools/extract/', 'convert'), ('tools/lifter/', 'tables'), ('tools/nro/', 'nro'), ('tools/audit/', 'check'),
     ('fighter_sdk/', 'nro'), ('mods/', 'nro'), ('tests/', 'check'), ('runtime/', 'compile'),
 ]
-NO_REBUILD = ('docs/', 'media/', 'scripts/', 'readme', 'building.md', 'contributing.md', 'license', 'install ssbu.bat',
-              'play ssbu.bat', '.gitignore', '.github/')
+NO_REBUILD = ('docs/', 'media/', 'scripts/', 'readme', 'building.md', 'contributing.md', 'license', 'install tomodachi life.bat',
+              'play tomodachi life.bat', '.gitignore', '.github/')
 
 
 def say(msg=''):
@@ -129,7 +129,7 @@ def rebuild_advice(paths):
         out.append('  `stage` copies the changed sources into build\\work (always, cheap); `--from %s` then repeats %s and the later steps,'
                    % (first, first))
         out.append('  and each of those recompiles / relifts only what its inputs changed (modification time). Steps before %s stay done.' % first)
-        out.append('  (or double-click Install SSBU.bat again: it does the same.)')
+        out.append('  (or double-click Install Tomodachi Life.bat again: it does the same.)')
     if other:
         out.append('  %d changed file(s) are in no known build folder; if in doubt use --from stage.' % other)
     return out
@@ -289,7 +289,7 @@ def update_zip(a):
         return
     say('Not a git checkout: using GitHub\'s ZIP. Recorded commit: %s; GitHub %s/%s: %s'
         % ((old_commit or 'none (first update)')[:10], repo, branch, (sha or 'unknown')[:10]))
-    work = tempfile.mkdtemp(prefix='ssbu_update_')
+    work = tempfile.mkdtemp(prefix='tomodachi_update_')
     try:
         zp = os.path.join(work, 'src.zip')
         url = 'https://codeload.github.com/%s/zip/%s' % (repo, ref if sha else 'refs/heads/' + branch)

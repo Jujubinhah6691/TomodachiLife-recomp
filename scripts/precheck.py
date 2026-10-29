@@ -29,10 +29,10 @@ PF_SSE2, PF_SSE3, PF_SSE4_2, PF_AVX, PF_AVX2 = 10, 13, 38, 39, 40
 #                              game dll 0.50, rest 0.2; binaries 0.14, sysdata 0.02)
 #   work_1305/pr11/build:      7.88 GB (same plus cache 1.06 and a bigger work folder 6.68)
 # The larger one, rounded up, is what a build needs; the dump made from .nsp packages (build/dump) is about 17 GB.
-BUILD_NEED_GB = 8.0
-DUMP_NEED_GB = 17.0
+BUILD_NEED_GB = 4.0
+DUMP_NEED_GB = 7.0
 # RAM: clang -O1 on the largest lifted files takes about 1.5 GB per parallel job (rule of thumb, not measured per file).
-GB_PER_JOB = 1.5
+GB_PER_JOB = 1.75
 RAM_WARN_GB = 16
 RAM_FAIL_GB = 8
 

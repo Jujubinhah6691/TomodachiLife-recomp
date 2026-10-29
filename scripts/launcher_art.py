@@ -2,7 +2,7 @@
 holding timg/__Combined.bntx), decoded by tools/extract/bntx_png.c into build/work/title-logo.png. Game art: it stays in
 build/ and is never committed.
 
-    python scripts/launcher_art.py [game folder]      (default build/dump: exefs/ and romfs/)
+    python scripts/launcher_art.py [game folder [build folder]]      (default build/dump: exefs/ and romfs/)
 
 The island behind the menu (build/work/launcher-background.jpg) is not in the game files: it is a 4K render of the title
 screen with the title's 2D drawn out (TOMO_SKIPPROG=3ad3b2cf,a2462987,7328f6bd,8ac327a9,d8efa8a1,4abb6b23,9d8999e9,
@@ -19,7 +19,8 @@ import zstandard
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(REPO, 'build', 'work')
-DEPS = os.environ.get('SSBU_DEPS') or os.path.join(REPO, '..', 'ssbu-recomp', 'deps')
+DEPS = os.environ.get('SSBU_DEPS') or next((d for d in (os.path.join(REPO, 'deps'), os.path.join(REPO, '..', 'ssbu-recomp', 'deps'))
+                                            if os.path.isdir(os.path.join(d, 'llvm'))), os.path.join(REPO, 'deps'))
 ARCHIVE = os.path.join('romfs', 'Layout', 'Common_Title_00.Nin_NX_NVN.blarc.zs')
 LOGO = 'Title_WW_LogoS^w'
 
@@ -40,6 +41,9 @@ def sarc_file(blob, want):
 
 
 def bntx_png():
+    exe = os.path.join(WORK, 'bntx_png.exe')                   # from the runtime package, or built by scripts/setup.py
+    if os.path.exists(exe):
+        return exe
     exe = os.path.join(WORK, 'tools', 'bntx_png.exe')
     if not os.path.exists(exe):
         os.makedirs(os.path.dirname(exe), exist_ok=True)
@@ -50,7 +54,10 @@ def bntx_png():
 
 
 def main():
+    global WORK
     game = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, 'build', 'dump')
+    if len(sys.argv) > 2:                                      # another build folder (the install location, scripts/setup.py)
+        WORK = os.path.join(sys.argv[2], 'work')
     path = os.path.join(game, ARCHIVE)
     if not os.path.exists(path):
         sys.exit('no %s: give the game folder (exefs/ and romfs/)' % path)

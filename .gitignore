@@ -4,3 +4,8 @@ tools/lifter/difftest_gen.c
 tools/lifter/difftest_*.json
 tools/lifter/eh_main_tables.json
 __pycache__/
+# made by the installer / the release script
+deps/
+dist/
+build_release/
+build_location.txt

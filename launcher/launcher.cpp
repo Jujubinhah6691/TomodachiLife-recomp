@@ -387,12 +387,27 @@ private:
     } layout_;
 
     bool exe_ok() const { return is_file(g_exe); }
-    bool game_ok() const { return is_file(game_dir_ / "exefs" / "main.elf") && is_dir(game_dir_ / "romfs"); }
+    // exefs\main.elf of the game folder; a dump made by the installer keeps only main (the console's format) and setup.py
+    // converts it into build\binaries\<version>\main.elf: the newest of those then.
+    // shortcut: that one is taken for any game folder without main.elf, matching or not; a folder check would need the NSO
+    fs::path main_elf() const {
+        fs::path p = game_dir_ / "exefs" / "main.elf", best;
+        if (is_file(p) || !is_file(game_dir_ / "exefs" / "main")) return p;
+        fs::file_time_type newest{};
+        std::error_code e;
+        for (auto it = fs::directory_iterator(g_build / "binaries", e); !e && it != fs::directory_iterator(); it.increment(e)) {
+            fs::path q = it->path() / "main.elf";
+            std::error_code e2;
+            if (is_file(q) && (best.empty() || fs::last_write_time(q, e2) > newest)) { best = q; newest = fs::last_write_time(q, e2); }
+        }
+        return best.empty() ? p : best;
+    }
+    bool game_ok() const { return is_file(main_elf()) && is_dir(game_dir_ / "romfs"); }
     // The game's version, told by the size of main's code (the first PT_LOAD of main.elf), as the exe's gamedll.c does
     std::string game_version() const {
         unsigned char h[64], ph[56];
         uint64_t phoff = 0, size = 0;
-        FILE* f = _wfopen((game_dir_ / "exefs" / "main.elf").wstring().c_str(), L"rb");
+        FILE* f = _wfopen(main_elf().wstring().c_str(), L"rb");
         if (!f) return "";
         if (fread(h, 1, 64, f) == 64) {
             memcpy(&phoff, h + 0x20, 8);
@@ -675,7 +690,7 @@ private:
         STARTUPINFOW si{};
         si.cb = sizeof si;
         if (log != INVALID_HANDLE_VALUE) { si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = log; si.hStdError = log; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); }
-        std::wstring cmd = L"\"" + g_play_exe.wstring() + L"\" \"" + (game_dir_ / "exefs" / "main.elf").wstring() + L"\"";
+        std::wstring cmd = L"\"" + g_play_exe.wstring() + L"\" \"" + main_elf().wstring() + L"\"";
         const BOOL ok = CreateProcessW(g_play_exe.wstring().c_str(), cmd.data(), nullptr, nullptr, log != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW, nullptr, g_work.wstring().c_str(), &si, &game_);
         if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
         if (!ok) { game_ = {}; launch_error_ = "Windows error " + std::to_string(GetLastError()); return; }
@@ -772,7 +787,7 @@ private:
             line = session_min_ >= 0 ? "Game ready. Last session: " + std::to_string(session_min_) + " min." : "Game ready.";
         } else {
             c = kBad; paint_.cross(ix, y - px * 0.7f, icon * 0.8f, H * 0.0035f, c);
-            line = !exe_ok() ? "The game is not built yet (tomodachi_native.exe)." : lini_.get("game", "").empty() ? "Choose the game folder." : "That folder is not Tomodachi Life (exefs\\main.elf and romfs\\).";
+            line = !exe_ok() ? "The game is not built yet (tomodachi_native.exe)." : lini_.get("game", "").empty() ? "Choose the game folder." : "That folder is not Tomodachi Life (exefs\\ and romfs\\).";
         }
         font_.draw(r_, x, y, fit(line, px, layout_.w * 0.6f), px, c);
         if (selected_ == kGame) detail = game_dir_.string();

@@ -13,7 +13,7 @@ SDL="$D/SDL3"
 OUT="$REPO/build/work/TomodachiLauncher.exe"
 OBJ="$REPO/build/work/obj_launcher"
 mkdir -p "$OBJ"
-VER="0.1.0 ($(git -C "$REPO" describe --always --dirty 2>/dev/null || echo dev))"
+VER="$(cat "$REPO/version.txt" 2>/dev/null || echo dev) ($(git -C "$REPO" describe --always --dirty 2>/dev/null || echo dev))"
 o="$OBJ/launcher.o"
 "$CLANG" -x c++ -std=c++17 -O2 -w -D_CRT_SECURE_NO_WARNINGS -DLAUNCHER_VERSION="\"$VER\"" -I"$(cygpath -w "$REPO/launcher")" -I"$(cygpath -w "$REPO/third_party/stb")" \
     -I"$(cygpath -w "$SDL/include")" -c "$(cygpath -w "$REPO/launcher/launcher.cpp")" -o "$(cygpath -w "$o")"

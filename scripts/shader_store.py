@@ -1,7 +1,7 @@
 """Every shader container of the game, taken out of its files, so that the runtime can compile all of them before the
 title (runtime/nvn_gl.c shader preparation) instead of when something first appears on screen.
 
-    python scripts/shader_store.py [game folder]      (default build/dump: exefs/ and romfs/)
+    python scripts/shader_store.py [game folder [build folder [main.elf]]]      (default build/dump: exefs/ and romfs/)
 
 The game keeps its Maxwell shader stages in "BNSH" containers: the shader archives under romfs/Shader (the main 3D
 archive GameUber.*.bfsha holds two), the effect files and the layout archives (a "__ArchiveShader" each). Files are opened
@@ -60,14 +60,18 @@ def variations(c):
 
 
 def main():
+    global OUT
     game = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, 'build', 'dump')
+    if len(sys.argv) > 2:                                      # another build folder (the install location, scripts/setup.py)
+        OUT = os.path.join(sys.argv[2], 'cache', 'shader_store')
     romfs = os.path.join(game, 'romfs')
     if not os.path.isdir(romfs):
         sys.exit('no %s: give the game folder (exefs/ and romfs/)' % romfs)
     os.makedirs(OUT, exist_ok=True)
     dz = zstandard.ZstdDecompressor()
     seen = {}
-    sources = [os.path.join(game, 'exefs', 'main.elf')]       # programs built into the executable
+    # programs built into the executable: main.elf (the converted main), beside main or as setup.py's third argument
+    sources = [sys.argv[3] if len(sys.argv) > 3 else os.path.join(game, 'exefs', 'main.elf')]
     for dp, _, fn in os.walk(romfs):
         sources += [os.path.join(dp, f) for f in fn if not any(s in f for s in SKIP)]
     for p in sources:
