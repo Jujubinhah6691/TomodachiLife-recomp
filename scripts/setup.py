@@ -724,6 +724,7 @@ def step_link(cx):
     for f in (EXE, 'SDL3.dll', GAME_DLL):
         if not os.path.exists(os.path.join(cx.work, f)):
             raise Fail('%s was not produced' % f)
+    launcher_game(cx)
     if os.path.exists(os.path.join(cx.work, 'title-logo.png')):    # exes copied again (a new package): the logo's icon back in
         import launcher_art
         try:
@@ -736,6 +737,22 @@ def step_link(cx):
     say('  %s, SDL3.dll%s %s%s; %s %.0f MB linked here%s' % (
         EXE, ', ' + LAUNCHER if os.path.exists(os.path.join(cx.work, LAUNCHER)) else '', how, ', ' + opus if opus else '',
         GAME_DLL, os.path.getsize(os.path.join(cx.work, GAME_DLL)) / 1048576.0, '; FFmpeg %d DLLs' % ff if ff else ''))
+
+
+def launcher_game(cx):
+    """build/config/launcher.ini game = the folder of the dump this build is made from, when it is not <build>/dump (the
+    launcher's default): a dump folder of the player's own is used where it is, and the launcher asked for it again."""
+    game = os.path.dirname(cx.state['dump']['romfs'])
+    ini = os.path.join(cx.build, 'config', 'launcher.ini')
+    if os.path.normcase(game) == os.path.normcase(os.path.join(cx.build, 'dump')) and not os.path.exists(ini):
+        return
+    lines = []
+    if os.path.exists(ini):
+        with open(ini, encoding='utf-8', errors='replace') as f:
+            lines = [l for l in f.read().splitlines() if l.split('=', 1)[0].strip().lower() != 'game']
+    os.makedirs(os.path.dirname(ini), exist_ok=True)
+    with open(ini, 'w', encoding='utf-8', newline='\r\n') as f:
+        f.write('\n'.join(['game = ' + game] + lines) + '\n')
 
 
 def build_launcher(cx):
