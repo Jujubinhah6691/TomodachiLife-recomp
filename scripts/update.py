@@ -38,7 +38,7 @@ import urllib.request
 import zipfile
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_REPO = 'Denkishi/TomodachiLife-recomp'
+DEFAULT_REPO = 'josiahg2502-glitch/TomodachiLife-recomp'
 DEFAULT_BRANCH = 'main'
 MANIFEST = os.path.join('build', 'update_manifest.json')
 BACKUP = os.path.join('build', 'update_backup')
