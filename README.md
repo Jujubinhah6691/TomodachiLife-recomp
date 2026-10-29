@@ -31,11 +31,14 @@ Both 1.0.0 and 1.0.4 run. Other updates are not supported yet.
 
 ## Install
 
-1. Download the release ZIP (Releases, on the right) and unpack it into a folder of its own, for example `C:\Games\TomodachiLife`.
+1. Download **`Tomodachi-Life-PC.zip`** from the [newest release](https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases)
+   and unpack it into a folder of its own, for example `C:\Games\TomodachiLife`. (GitHub's "Source code (zip)" holds the
+   same files. A zip named `tomodachi-runtime-...` is not the game: it is a part the installer downloads by itself.)
 2. Double-click **`Install Tomodachi Life.bat`**. It sets up a private copy of Python inside the folder (nothing is installed
    system-wide), then opens the installer window.
 3. The window looks for your game files and keys (Downloads, Desktop, Documents and emulator folders). Check what it
-   found, choose anything it missed, then press **Install**.
+   found, choose anything it missed, then press **Install**. A dump you already made (a folder with `exefs\` and
+   `romfs\` inside) works too: the base game row's **Folder...** button; no keys are needed then.
 4. Wait. The first install takes about 30 minutes to an hour: it unpacks your game, translates its code and compiles it.
    You can stop it and press **Resume** later; finished steps are not repeated.
 5. Start the game with the **Tomodachi Life** shortcut on your desktop, or `Play Tomodachi Life.bat`.

@@ -57,6 +57,7 @@ namespace {
 
 /* ------------------------------------------------------------------ paths */
 fs::path g_work, g_build, g_repo, g_ini, g_pads_ini, g_launcher_ini, g_userdata, g_saves, g_cache, g_exe, g_play_exe;
+const wchar_t* const kReleases = L"https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases";      // the player's download
 
 void paths_init() {
     wchar_t p[MAX_PATH];
@@ -355,7 +356,7 @@ public:
             const std::string& raw = list_[i].value;
             Color vc = raw.rfind("Found", 0) == 0 || raw == "On" || raw.rfind("Saved", 0) == 0 ? kGood
                      : raw == "Choose..." || raw == "Press again" ? kGold
-                     : raw == "Wrong folder" || raw == "Missing" ? kBad : kDim;
+                     : raw == "Wrong folder" || raw == "Not installed" ? kBad : kDim;
             vc.a = c.a;
             font_.draw(r_, vx, y - px * 0.04f, v, vpx, vc);
         }
@@ -387,6 +388,10 @@ private:
     } layout_;
 
     bool exe_ok() const { return is_file(g_exe); }
+    // the game DLL is built from the player's dump by the installer: the runtime package alone (its zip unpacked and the
+    // launcher started from there) has the exe but not this
+    bool installed() const { return exe_ok() && is_file(g_work / "tomodachi_game.dll"); }
+    fs::path installer() const { return g_repo / "Install Tomodachi Life.bat"; }
     // exefs\main.elf of the game folder; a dump made by the installer keeps only main (the console's format) and setup.py
     // converts it into build\binaries\<version>\main.elf: the newest of those then.
     // shortcut: that one is taken for any game folder without main.elf, matching or not; a folder check would need the NSO
@@ -417,7 +422,7 @@ private:
         fclose(f);
         return size == 0x25ce6a0 ? "1.0.0" : size == 0x256d250 ? "1.0.4" : "Unknown version";
     }
-    bool ready() const { return exe_ok() && game_ok(); }
+    bool ready() const { return installed() && game_ok(); }
 
     void refresh() {
         std::string g = lini_.get("game", "");
@@ -456,7 +461,7 @@ private:
         switch (screen_) {
         case Screen::kMain:
             list_ = {{"PLAY", game_running() ? "Running" : ""},
-                     {"GAME", !exe_ok() ? "Missing" : game_ok() ? game_version() : lini_.get("game", "").empty() ? "Choose..." : "Wrong folder"},
+                     {"GAME", !installed() ? "Not installed" : game_ok() ? game_version() : lini_.get("game", "").empty() ? "Choose..." : "Wrong folder"},
                      {"SETTINGS", ""},
                      {"SAVE DATA", save_size_ ? "Saved " + save_when_ : "New island"},
                      {"CONTROLS", pad_name_.empty() ? "Keyboard" : pad_name_},
@@ -667,7 +672,11 @@ private:
     void play() {
         if (game_running()) return;
         launch_error_.clear();
-        if (!exe_ok()) { launch_error_ = "the game is not built (tomodachi_native.exe is missing)"; return; }
+        if (!installed()) {      // the installer of this folder, else the release page with the download that has it
+            if (is_file(installer())) open_path(installer());
+            else ShellExecuteW(nullptr, L"open", kReleases, nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
         if (!game_ok()) { choose_game(true); return; }
         if (!CopyFileW(g_exe.wstring().c_str(), g_play_exe.wstring().c_str(), FALSE) && !is_file(g_play_exe)) { launch_error_ = "could not copy the game's exe"; return; }
         // the environment of scripts\play.ps1
@@ -787,10 +796,15 @@ private:
             line = session_min_ >= 0 ? "Game ready. Last session: " + std::to_string(session_min_) + " min." : "Game ready.";
         } else {
             c = kBad; paint_.cross(ix, y - px * 0.7f, icon * 0.8f, H * 0.0035f, c);
-            line = !exe_ok() ? "The game is not built yet (tomodachi_native.exe)." : lini_.get("game", "").empty() ? "Choose the game folder." : "That folder is not Tomodachi Life (exefs\\ and romfs\\).";
+            line = installed() ? (lini_.get("game", "").empty() ? "Choose the game folder." : "That folder is not Tomodachi Life (exefs\\ and romfs\\).")
+                 : is_file(installer()) ? "Not installed yet: press PLAY to run Install Tomodachi Life.bat."
+                 : is_file(g_build / "state.json") ? "The install is not complete: run Install Tomodachi Life.bat again."
+                 : "This folder is not the game, only a part its installer downloads.";
         }
         font_.draw(r_, x, y, fit(line, px, layout_.w * 0.6f), px, c);
-        if (selected_ == kGame) detail = game_dir_.string();
+        if (!installed() && !is_file(installer()) && !is_file(g_build / "state.json"))
+            detail = "Press PLAY, download Tomodachi-Life-PC.zip, run Install Tomodachi Life.bat.";
+        else if (selected_ == kGame) detail = game_dir_.string();
         else if (ready()) detail = std::string("Nintendo Switch \x7f Living the Dream \x7f ") + (save_size_ ? "Island saved " + save_when_ : std::string("New island")) +
                                    " \x7f " + (gfx_.get("resolution_scale", "1.0") == "2.0" ? "4K" : gfx_.get("resolution_scale", "1.0") == "1.0" ? "1080p" : gfx_.get("resolution_scale", "1.0") + "x");
         else detail = "Needs your own dump of the game: exefs\\ and romfs\\ in one folder";
