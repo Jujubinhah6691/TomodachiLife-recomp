@@ -74,7 +74,9 @@ def personal_patterns():
               git('config', 'user.email')]
     for w in words:                                   # each word of a name, and the whole name
         for part in [w] + w.split():
-            if len(part) >= 4 and part.lower() not in ('users', 'user', 'admin', 'administrator', 'workgroup'):
+            # generic names a PC may have (they are ordinary words of any licence text or program)
+            if len(part) >= 4 and part.lower() not in ('users', 'user', 'admin', 'administrator', 'workgroup', 'machine', 'desktop',
+                                                       'computer', 'laptop', 'owner', 'home'):
                 pats.append(b'(?i)' + re.escape(part.encode('utf-8', 'replace')))
     for whole in (REPO, os.path.dirname(REPO), os.environ.get('USERPROFILE', '')):
         if whole:
