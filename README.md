@@ -9,6 +9,14 @@ own code is translated to C and compiled for your PC: no emulator runs underneat
 **Nothing of the game is in this repository or in the release downloads.** You build it on your own PC from your own copy
 of the game, dumped from your own Switch, with your own console keys. Not affiliated with or endorsed by Nintendo.
 
+![The island](https://raw.githubusercontent.com/josiahg2502-glitch/TomodachiLife-recomp-files/main/screenshots/island.jpg)
+
+| | |
+|---|---|
+| ![The apartments](https://raw.githubusercontent.com/josiahg2502-glitch/TomodachiLife-recomp-files/main/screenshots/apartments.jpg) | ![The food mart](https://raw.githubusercontent.com/josiahg2502-glitch/TomodachiLife-recomp-files/main/screenshots/food-mart.jpg) |
+
+*Game 1.0.4, rendered at 4K in widescreen, shown at 1080p.*
+
 ## What you need
 
 - Windows 10 or 11, 64-bit; about 15 GB free on the drive you install to; 8 GB of RAM or more (16 GB recommended).
