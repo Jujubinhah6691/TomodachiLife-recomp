@@ -82,9 +82,9 @@ MSVC_WINGET = ('winget install --id Microsoft.VisualStudio.2022.BuildTools -e --
 PKGS = ['zstandard', 'Pillow', 'pycryptodome']
 # name -> (url, sha256 or None, folder in deps, file that proves the folder is complete). A None hash refuses the download
 # until the maintainer has checked the archive and written its hash here.
-# Third-party files this project hosts itself, as assets of its v0.1.0-beta release (keep that release): the same bytes as
+# Third-party files this project hosts itself, in the release installer-tools of its files repository (keep it): the same bytes as
 # their first source, checked by the same SHA-256 (LLVM, FFmpeg, libopus, two suyu source files)
-MIRROR = 'https://github.com/josiahg2502-glitch/TomodachiLife-recomp/releases/download/v0.1.0-beta/'
+MIRROR = 'https://github.com/josiahg2502-glitch/TomodachiLife-recomp-files/releases/download/installer-tools/'
 TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's installer has a good signature of the
             # LLVM release key B6C8 F982 82B9 44E3 B0D5 C253 0FC3 042E 345A D05D (LLVM-9.0.0-win64.exe.sig)
     'sdl3': ('https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-devel-3.4.18-VC.zip',
@@ -94,7 +94,7 @@ TOOLS = {   # checked 2026-10-19: SDL3 equals GitHub's own asset digest; LLVM's 
     # LLVM 9 as a plain zip (no installer: no administrator prompt, and nothing to uninstall when another LLVM is on the
     # PC, which made the official installer fail with "uninstall failed"): the files of the official LLVM-9.0.0-win64.exe
     # (SHA-256 71ed99a6...8863, signed) extracted with 7-Zip, unchanged, only what the build uses (README.txt inside); the
-    # zip of ssbu-recomp's release, kept on this project's own release (MIRROR) so the install never depends on another's
+    # zip of ssbu-recomp's release, kept on this project's files repository (MIRROR) so the install never depends on another's
     'llvm': (MIRROR + 'llvm-9.0.0-win64-portable.zip',
              '0e0c34046589a73efef3e2a4c06335815681afbc7c883b665cdbed98669a22e3', 'llvm', os.path.join('bin', 'clang.exe')),
     # Dear ImGui (MIT), optional: GitHub publishes no digest for tag archives, so this hash is the archive checked on
@@ -588,7 +588,7 @@ def step_dump(cx):
 
 # ------------------------------------------------------------------------------------------------------ 6. tools
 # the two files of a yuzu-family source tree that tools/lifter/gen_sdktest.py reads (default Miis for the self-test), from
-# suyu-emu/suyu-v0.0.4 commit c0dd2ff5 (MIT / GPL-3.0), mirrored by name on this project's release (MIRROR); hashes of the
+# suyu-emu/suyu-v0.0.4 commit c0dd2ff5 (MIT / GPL-3.0), mirrored by name in this project's files repository (MIRROR); hashes of the
 # files as GitHub served them (LF line ends)
 SUYU_FILES = {'src/core/hle/service/mii/types/raw_data.cpp': '0f5b10dcde4038024fffd6079d75cd4bad8d72486efcf1ffa06e6c779803c486',
               'src/core/hle/service/mii/mii_types.h': 'cf2e0c990b881c238f5b7fd823f33fe2c0a8d0846cdbf012ec6f702b1647f3e1'}
